@@ -304,7 +304,7 @@ ROUND_CONFIG = json.loads(r'''
   "proxy_val_images": 80,
   "candidates": [
     {
-      "node_id": "smoke3ch",
+      "node_id": "rtdetr3ch",
       "candidate": {
         "channels": {
           "mode": "pseudo_rgb",
@@ -318,10 +318,10 @@ ROUND_CONFIG = json.loads(r'''
           "per_image_norm": true
         },
         "train": {
-          "model": "yolo11n",
+          "model": "rtdetr-l",
           "imgsz": 640,
           "epochs": 5,
-          "batch": 8,
+          "batch": 4,
           "lr0": 0.01,
           "mosaic": 1.0,
           "close_mosaic": 4,
@@ -331,11 +331,13 @@ ROUND_CONFIG = json.loads(r'''
           "fliplr": 0.5,
           "scale": 0.5,
           "cos_lr": true,
-          "in_channels": 3
+          "in_channels": 3,
+          "amp": false,
+          "deterministic": false
         },
         "infer": {
           "conf": 0.001,
-          "iou": 0.7,
+          "iou": null,
           "max_det": 300,
           "tta": false,
           "multi_scale": []
@@ -344,7 +346,7 @@ ROUND_CONFIG = json.loads(r'''
       }
     },
     {
-      "node_id": "smoke16ch",
+      "node_id": "rtdetr16ch",
       "candidate": {
         "channels": {
           "mode": "band_stack",
@@ -371,10 +373,10 @@ ROUND_CONFIG = json.loads(r'''
           "per_image_norm": true
         },
         "train": {
-          "model": "yolo11n",
+          "model": "rtdetr-l",
           "imgsz": 640,
           "epochs": 5,
-          "batch": 8,
+          "batch": 4,
           "lr0": 0.01,
           "mosaic": 1.0,
           "close_mosaic": 4,
@@ -384,11 +386,13 @@ ROUND_CONFIG = json.loads(r'''
           "fliplr": 0.5,
           "scale": 0.5,
           "cos_lr": true,
-          "in_channels": 16
+          "in_channels": 16,
+          "amp": false,
+          "deterministic": false
         },
         "infer": {
           "conf": 0.001,
-          "iou": 0.7,
+          "iou": null,
           "max_det": 300,
           "tta": false,
           "multi_scale": []
@@ -598,6 +602,16 @@ def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
 
 
 # ------------------------------------------------------------ evaluate ------
+def predict_kwargs(cand):
+    """Inference arguments, omitting NMS IoU for detectors that have no NMS."""
+    inf = cand["infer"]
+    kw = {"conf": inf["conf"], "max_det": inf["max_det"],
+          "augment": inf["tta"], "verbose": False, "stream": False}
+    if inf.get("iou") is not None:
+        kw["iou"] = inf["iou"]
+    return kw
+
+
 def _rows(pid, result):
     """Flatten one ultralytics Result into submission-shaped tuples."""
     b = result.boxes
@@ -615,8 +629,14 @@ def frame_index(root, split, ids):
     return {pid: d / f"{pid}.png" for pid in ids}
 
 
+def build_model(name, weights=None):
+    """Instantiate the detector. RT-DETR has its own model class in ultralytics."""
+    from ultralytics import RTDETR, YOLO
+    cls = RTDETR if name.startswith("rtdetr") else YOLO
+    return cls(weights or f"{name}.pt")
+
+
 def run_candidate(cand, index, train_ids, val_ids, anns, tag):
-    from ultralytics import YOLO
 
     root = WORK / f"ds_{channels_key(cand['channels'])}"
     yaml = materialize(cand, index, train_ids, val_ids, anns, root)
@@ -626,7 +646,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     # not burn a GPU session on an argument ultralytics will reject.
     close_mosaic = min(tr.get("close_mosaic", 5), max(0, tr["epochs"] - 1))
 
-    model = YOLO(f"{tr['model']}.pt")
+    model = build_model(tr["model"])
     model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
         lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=close_mosaic,
@@ -634,6 +654,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
         fliplr=tr["fliplr"], scale=tr["scale"], cos_lr=tr.get("cos_lr", True),
         project=str(WORK / "runs"), name=tag, exist_ok=True,
         verbose=False, plots=False, val=False, seed=0,
+        amp=tr.get("amp", True), deterministic=tr.get("deterministic", True),
     )
 
     preds = []
@@ -642,9 +663,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     for lo in range(0, len(paths), PREDICT_BATCH):
         chunk = paths[lo:lo + PREDICT_BATCH]
         for pid, r in zip(val_ids[lo:lo + PREDICT_BATCH],
-                          model.predict(chunk, conf=inf["conf"], iou=inf["iou"],
-                                        max_det=inf["max_det"], augment=inf["tta"],
-                                        verbose=False, stream=False)):
+                          model.predict(chunk, **predict_kwargs(cand))):
             preds.extend(_rows(pid, r))
 
     scores = evaluate([anns[p] for p in val_ids], preds, per_class=True)
@@ -668,9 +687,7 @@ def predict_test(model, cand, test_dir, png_ids):
     for lo in range(0, len(png_ids), PREDICT_BATCH):
         ids = png_ids[lo:lo + PREDICT_BATCH]
         chunk = [str(staged[pid]) for pid in ids]
-        for pid, r in zip(ids, model.predict(chunk, conf=inf["conf"], iou=inf["iou"],
-                                             max_det=inf["max_det"], augment=inf["tta"],
-                                             verbose=False, stream=False)):
+        for pid, r in zip(ids, model.predict(chunk, **predict_kwargs(cand))):
             preds.extend(_rows(pid, r))
         log(f"  predicted {min(lo + PREDICT_BATCH, len(png_ids))}/{len(png_ids)}")
     return preds, sizes
@@ -697,7 +714,7 @@ def run_submission(round_cfg):
     scores, _, weights = run_candidate(cand, index, train_ids, val_ids, anns, "final")
     log(f"fit done; holdout mAP={scores['mAP']:.4f} (optimistic: seen in training)")
 
-    model = YOLO(weights)
+    model = build_model(cand["train"]["model"], weights)
     test_ids = require_ids(sorted(int(p.stem) for p in test_dir.glob("*.png")), test_dir)
     log(f"predicting {len(test_ids)} test images")
     preds, sizes = predict_test(model, cand, test_dir, test_ids)

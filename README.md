@@ -68,18 +68,24 @@ The organizers' clarifications in forum threads
 and [#729747](https://www.kaggle.com/competitions/hyperspectral-object-detection-challenge-2026/discussion/729747)
 govern the points below.
 
-**Declared pretrained weights.** The detector is initialised from
-**Ultralytics YOLO11 COCO-pretrained weights** (`yolo11n/s/m/l.pt`), from
+**Declared pretrained weights.** The detector is **RT-DETR**, a transformer
+detector (hybrid encoder, transformer decoder with IoU-aware query selection),
+initialised from **Ultralytics RT-DETR COCO-pretrained weights**
+(`rtdetr-l.pt`, `rtdetr-x.pt`, `rtdetr-resnet50/101`), from
 [github.com/ultralytics/ultralytics](https://github.com/ultralytics/ultralytics),
-licensed **AGPL-3.0**, pretrained on **COCO** (and ImageNet for the backbone).
-Organizers confirmed public ImageNet/COCO weights are "allowed and encouraged"
-provided they are declared here. No other external dataset is used for
-pretraining.
+licensed **AGPL-3.0**, pretrained on **COCO** (ImageNet for the ResNet
+backbones). Organizers confirmed public ImageNet/COCO weights are "allowed and
+encouraged" provided they are declared here. No other external dataset is used
+for pretraining. When the 16-band input is selected the stem cannot take COCO
+weights (shape mismatch) and trains from scratch; every other layer is
+pretrained.
 
 **Single model.** The submission comes from one checkpoint. Test-time
 augmentation and multi-scale inference are in the candidate space because
 organizers confirmed they "do not count as an ensemble"; combining outputs of
-different models does, and is not done anywhere in this pipeline.
+different models does, and is not done anywhere in this pipeline. RT-DETR is
+NMS-free -- top-k selection happens inside the decoder -- so the NMS IoU knob is
+omitted for it rather than searched.
 
 **Annotations.** Ground-truth XML files are used exactly as shipped. Nothing is
 hand-corrected, added or removed. Note that the training set is known to be

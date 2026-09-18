@@ -23,6 +23,16 @@ CHANNEL_MODES = [
     "rgb_plus_ratio",  # 3 bands + normalized band-ratio channels
 ]
 
+# Transformer detectors. RT-DETR is a hybrid-encoder DETR with IoU-aware query
+# selection; ultralytics builds it with ch=data["channels"], so the 16-band
+# input path works here exactly as it does for the CNN detectors.
+TRANSFORMER_MODELS = ["rtdetr-l", "rtdetr-x", "rtdetr-resnet50", "rtdetr-resnet101"]
+
+
+def is_transformer(model: str) -> bool:
+    return model.startswith("rtdetr")
+
+
 DEFAULT: dict = {
     "channels": {
         "mode": "pseudo_rgb",
@@ -32,7 +42,7 @@ DEFAULT: dict = {
         "per_image_norm": True,  # False = dataset-wide statistics
     },
     "train": {
-        "model": "yolo11s",
+        "model": "rtdetr-l",
         "imgsz": 640,
         "epochs": 30,
         "batch": 16,
@@ -48,7 +58,7 @@ DEFAULT: dict = {
     },
     "infer": {
         "conf": 0.001,           # mAP rewards deep recall, not a clean top-1
-        "iou": 0.7,
+        "iou": 0.7,              # NMS IoU; inert for RT-DETR, which is NMS-free
         "max_det": 300,
         "tta": False,            # allowed: single checkpoint, merged augmentations
         "multi_scale": [],
@@ -63,7 +73,7 @@ _MOVES: dict[str, list] = {
     "channels.stretch_lo": [0.0, 0.5, 1.0, 2.0],
     "channels.stretch_hi": [98.0, 99.0, 99.5, 100.0],
     "channels.per_image_norm": [True, False],
-    "train.model": ["yolo11s", "yolo11m", "yolo11l"],
+    "train.model": TRANSFORMER_MODELS,
     "train.imgsz": [640, 768, 896, 1024],
     "train.epochs": [20, 30, 45, 60],
     "train.lr0": [0.003, 0.005, 0.01, 0.02],
@@ -109,6 +119,16 @@ def normalize(cfg: dict) -> dict:
     # needs no patching -- but COCO weights cannot transfer into a 16-channel
     # stem, so that one layer trains from scratch while the rest is pretrained.
     cfg["train"]["in_channels"] = 16 if cfg["channels"]["mode"] == "band_stack" else 3
+    if is_transformer(cfg["train"]["model"]):
+        # Ultralytics warns that AMP can produce NaNs during RT-DETR's bipartite
+        # matching, and that grid_sample rejects deterministic mode.
+        cfg["train"]["amp"] = False
+        cfg["train"]["deterministic"] = False
+        # Top-k selection happens inside the decoder, so there is no NMS to tune.
+        cfg["infer"]["iou"] = None
+    else:
+        cfg["train"]["amp"] = True
+        cfg["train"]["deterministic"] = True
     if cfg["train"]["in_channels"] != 3:
         # Ultralytics skips HSV on non-3-channel input anyway; make it explicit.
         cfg["train"]["hsv_h"] = cfg["train"]["hsv_s"] = cfg["train"]["hsv_v"] = 0.0
@@ -165,7 +185,9 @@ class DiscoveryAgent:
             cfg = deepcopy(parent_candidate)
             picked = []
             for _ in range(n_moves):
-                path = self._rng.choice(list(_MOVES))
+                usable = [k for k in _MOVES
+                          if not (k == "infer.iou" and is_transformer(cfg["train"]["model"]))]
+                path = self._rng.choice(usable)
                 options = [o for o in _MOVES[path] if o != _get(cfg, path)]
                 if not options:
                     continue
