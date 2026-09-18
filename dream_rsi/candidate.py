@@ -9,7 +9,12 @@ here decides *what* that attempt tries.
 from __future__ import annotations
 
 import random
+import sys
 from copy import deepcopy
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from hod26.spectral import BEST_BANDS  # noqa: E402
 
 # Channel builders turn an (H, W, 16) cube into model input. "pseudo_rgb" is the
 # organizers' demo and the obvious default; the rest exist because the class list
@@ -21,6 +26,8 @@ CHANNEL_MODES = [
     "pca3",            # first 3 principal components over bands
     "band_stack",      # all 16 bands as input channels (multi-page TIFF)
     "rgb_plus_ratio",  # 3 bands + normalized band-ratio channels
+    "bandsel",         # the 3 bands most separable across material pairs
+    "lda3",            # 16 -> 3 discriminant projection, pretrained stem intact
 ]
 
 # Transformer detectors. RT-DETR is a hybrid-encoder DETR with IoU-aware query
@@ -91,6 +98,8 @@ _BANDS_FOR_MODE = {
     "pca3": list(range(16)),
     "band_stack": list(range(16)),
     "rgb_plus_ratio": [0, 7, 15],
+    "bandsel": list(BEST_BANDS),
+    "lda3": list(range(16)),
 }
 
 

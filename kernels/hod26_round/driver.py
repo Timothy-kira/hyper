@@ -111,6 +111,16 @@ def build_channels(cube, spec):
         z = cube[:, :, 15].astype(np.float32)
         nd = (z - a) / (z + a + 1e-6)          # normalized difference: material cue
         return np.dstack([stretch(a, lo, hi), stretch(z, lo, hi), stretch(nd, lo, hi)])
+    if mode == "lda3":
+        # 16 -> 3 discriminant projection; the pretrained stem is untouched.
+        flat = cube.reshape(-1, cube.shape[2]).astype(np.float32)
+        tot = flat.sum(1, keepdims=True)
+        flat = np.divide(flat, tot, out=np.zeros_like(flat), where=tot > 0)
+        proj = (flat @ np.asarray(LDA_16_TO_3, np.float32).T).reshape(
+            cube.shape[0], cube.shape[1], 3)
+        return np.dstack([stretch(proj[:, :, c], lo, hi) for c in range(3)])
+    if mode == "bandsel":
+        return np.dstack([stretch(cube[:, :, b], lo, hi) for b in BEST_BANDS])
     if mode == "band_stack":
         # Every band as its own input channel. Ultralytics reads this natively:
         # a multi-page TIFF is decoded with imdecodemulti and stacked on axis 2,
