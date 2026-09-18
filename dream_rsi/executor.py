@@ -58,11 +58,27 @@ class KaggleRoundExecutor:
                 return s
         return "unknown"
 
-    def wait(self) -> str:
+    TERMINAL = ("complete", "error", "cancelacknowledged")
+
+    def wait(self, start_timeout: int = 600) -> str:
+        """Block until this run reaches a terminal state.
+
+        Right after a push, Kaggle can still report the *previous* run's
+        terminal status. Returning on that would fetch the previous round's
+        results.json and write stale scores into the discovery tree, so the run
+        must first be observed queued or running.
+        """
+        started, deadline = False, time.time() + start_timeout
+        while not started and time.time() < deadline:
+            if self.status() not in self.TERMINAL:
+                started = True
+                break
+            time.sleep(min(self.poll_seconds, 15))
+
         deadline = time.time() + self.timeout_hours * 3600
         while time.time() < deadline:
             s = self.status()
-            if s in ("complete", "error", "cancelacknowledged"):
+            if s in self.TERMINAL:
                 return s
             time.sleep(self.poll_seconds)
         raise KernelError(f"kernel {self.slug} still {self.status()} after "
@@ -91,7 +107,17 @@ class KaggleRoundExecutor:
             if state == "complete":
                 raise
             return []
-        return payload.get("results", [])
+
+        results = payload.get("results", [])
+        # Second guard against a stale fetch: the results must be about the
+        # candidates this round actually scheduled.
+        wanted = {c["node_id"] for c in round_cfg["candidates"]}
+        got = {r.get("node_id") for r in results}
+        if results and not (got & wanted):
+            raise KernelError(
+                f"fetched results for {sorted(got)} but this round scheduled "
+                f"{sorted(wanted)}; refusing to score the tree from another run")
+        return [r for r in results if r.get("node_id") in wanted]
 
 
 class LocalMockExecutor:
