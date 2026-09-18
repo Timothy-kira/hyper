@@ -241,28 +241,36 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     close_mosaic = min(tr.get("close_mosaic", 5), max(0, tr["epochs"] - 1))
 
     model = build_model(tr["model"])
-    model.train(
+    results = model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
         lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=close_mosaic,
         hsv_h=tr["hsv_h"], hsv_s=tr["hsv_s"], hsv_v=tr["hsv_v"],
         fliplr=tr["fliplr"], scale=tr["scale"], cos_lr=tr.get("cos_lr", True),
         project=str(WORK / "runs"), name=tag, exist_ok=True,
-        verbose=False, plots=False, val=False, seed=0,
+        verbose=False, plots=False, val=True, seed=0,
         amp=tr.get("amp", True), deterministic=tr.get("deterministic", True),
     )
 
-    preds = []
-    ext = ".tiff" if cand["train"].get("in_channels", 3) > 3 else ".png"
-    paths = [str(root / "images" / "val" / f"{pid}{ext}") for pid in val_ids]
-    for lo in range(0, len(paths), PREDICT_BATCH):
-        chunk = paths[lo:lo + PREDICT_BATCH]
-        for pid, r in zip(val_ids[lo:lo + PREDICT_BATCH],
-                          model.predict(chunk, **predict_kwargs(cand))):
-            preds.extend(_rows(pid, r))
-
-    scores = evaluate([anns[p] for p in val_ids], preds, per_class=True)
+    # Score from the trainer's own validation pass rather than a second
+    # inference pass of our own. Three reasons, in order of weight:
+    #  - it is the only scorer that works at every channel count: ultralytics'
+    #    predict() loader hands a 3-channel array to a 16-channel model, so a
+    #    predict-based score cannot rank spectral candidates at all;
+    #  - it is free, the pass already ran as part of training;
+    #  - one scorer for every node keeps tree scores comparable, which is what
+    #    the replay simulator depends on.
+    # The pycocotools scorer still guards the final submission, where the
+    # official protocol matters and the candidate is known to be 3-channel.
+    box = results.box
+    scores = {
+        "mAP": float(box.map),          # mAP@[.5:.95], the competition's primary
+        "mAP50": float(box.map50),
+        "per_class": {CLASSES[int(c)]: float(a)
+                      for c, a in zip(results.box.ap_class_index, box.maps[box.ap_class_index])}
+        if getattr(box, "ap_class_index", None) is not None else {},
+    }
     weights = WORK / "runs" / tag / "weights" / "best.pt"
-    return scores, preds, (str(weights) if weights.exists() else None)
+    return scores, [], (str(weights) if weights.exists() else None)
 
 
 def predict_test(model, cand, test_dir, png_ids):
@@ -353,7 +361,7 @@ def main():
             scores, preds, weights = run_candidate(cand, index, train_ids, val_ids, anns, node_id)
             rec.update(score=scores["mAP"], diagnostics={
                 "mAP50": scores["mAP50"], "per_class": scores["per_class"],
-                "n_preds": len(preds), "weights": weights,
+                "weights": weights,
             })
             log(f"  -> mAP={scores['mAP']:.4f}  mAP50={scores['mAP50']:.4f}")
         except Exception:
