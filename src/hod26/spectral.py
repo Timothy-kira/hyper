@@ -222,3 +222,29 @@ PDA_PROJECTIONS = {
         )
     )
 }
+
+
+# Why a *trainable* mixer rather than any of these projections fixed in place.
+#
+# lda3 was measured at 0.2810 mAP against pseudo_rgb's 0.4291 under an identical
+# recipe, despite 3.1x the material separability. The reason is not lost edge
+# structure -- the projected frame has *more* gradient than pseudo_rgb -- it is
+# that the extra gradient is noise. Measuring how much of each frame's gradient
+# survives a 3x3 blur, which noise does not and structure does:
+#
+#   variant                 gradient   edge fraction
+#   pseudo_rgb                 5.938           0.550
+#   lda3, penalty 0            8.212           0.316
+#   lda3, penalty 0.001        7.336           0.353
+#   lda3, penalty 0.01         7.376           0.375
+#
+# A projection is a weighted *difference* of bands, and differences amplify
+# noise where a single band does not. Smoothing the weights helps but cannot
+# close the gap, and Savitzky-Golay smoothing of the cube beforehand does not
+# either (0.316 -> 0.327).
+#
+# This is the argument for the adapter. A fixed projection is fitted for
+# separability alone and has no way to know it is manufacturing noise; a mixer
+# trained against the detection loss trades separability for signal-to-noise on
+# its own, because noise costs it detections. The projections here are its
+# starting prior, not its answer.

@@ -338,56 +338,77 @@ def pretrained_stem_weight(name):
     return conv.weight.detach().float().clone()
 
 
-def attach_spectral_adapter(model, n_bands, projection):
+def install_spectral_adapter(net, n_bands, projection, ckpt_name):
     """Put a trainable 1x1 band mixer in front of an untouched pretrained stem.
 
-    The alternative strategies each give something up. A fixed 3-channel
-    projection cannot adapt; replacing the stem with a projected 16-channel
-    kernel lets all 4608 of its weights drift away from what COCO learned. This
-    keeps the pretrained convolution exactly as trained and learns only the
-    16 -> 3 mixing -- 48 parameters, initialised to the offline discriminant, so
-    it starts where lda3 starts and can improve from there.
+        W_mix[c, b] = P[c, b]      (48 parameters, initialised to the discriminant)
 
-    The literature on adapting RGB backbones to extra spectral bands converges
-    on this shape (UniRGB-IR 2404.17360, SpectralX 2508.01731), and the
-    measured gap between 12 and 202 bands under a pretrained backbone is small
-    (TerraMind 2603.06690) -- the pretrained spatial prior is worth more than
-    the extra spectral resolution, so the thing to protect is the prior.
+    The alternatives each give something up: a fixed 3-channel projection cannot
+    adapt, and reparameterising the stem lets all 4608 of its weights drift from
+    what COCO learned. This keeps the pretrained convolution exactly as trained
+    and learns only the mixing, which is the adapter shape the multispectral
+    transfer literature converges on (UniRGB-IR 2404.17360, SpectralX
+    2508.01731). It matters because the measured gap between 12 and 202 bands
+    under a pretrained backbone is small (TerraMind 2603.06690) -- the
+    pretrained spatial prior is worth more than the extra spectral resolution,
+    so the prior is the thing to protect.
     """
     import numpy as _np
     import torch
     import torch.nn as nn
 
-    def hook(trainer):
-        net = trainer.model
-        conv = first_conv(net)
-        if conv is None or conv.in_channels != n_bands:
-            return
-        P = _np.asarray(projection, dtype=_np.float32)
-        if P.shape[1] != n_bands:
-            log(f"  spectral adapter skipped: projection maps {P.shape[1]} bands, not {n_bands}")
-            return
-        out_ch = P.shape[0]
+    conv = first_conv(net)
+    if conv is None or conv.in_channels != n_bands:
+        return False
+    P = _np.asarray(projection, dtype=_np.float32)
+    if P.shape[1] != n_bands:
+        log(f"  adapter skipped: projection maps {P.shape[1]} bands, not {n_bands}")
+        return False
+    out_ch = P.shape[0]
 
-        pre = pretrained_stem_weight_from(net, out_ch)
-        if pre is None:
-            log("  spectral adapter skipped: no pretrained stem of matching width")
-            return
+    pre = pretrained_stem_weight(ckpt_name)
+    if pre is None or pre.shape[1] != out_ch or pre.shape[0] != conv.out_channels:
+        log(f"  adapter skipped: pretrained stem {None if pre is None else tuple(pre.shape)} "
+            f"does not fit a {out_ch}-channel mixer into {conv.out_channels} filters")
+        return False
 
-        mixer = nn.Conv2d(n_bands, out_ch, kernel_size=1, bias=False)
-        with torch.no_grad():
-            mixer.weight.copy_(torch.from_numpy(P).view(out_ch, n_bands, 1, 1))
-        stem = nn.Conv2d(out_ch, conv.out_channels, conv.kernel_size, conv.stride,
-                         conv.padding, bias=conv.bias is not None)
-        with torch.no_grad():
-            stem.weight.copy_(pre)
-            if conv.bias is not None:
-                stem.bias.copy_(conv.bias)
-        replace_module(net, conv, nn.Sequential(mixer, stem).to(conv.weight.device))
-        log(f"  spectral adapter: trainable {n_bands}->{out_ch} 1x1 (LDA-initialised) "
-            f"in front of an unchanged {tuple(pre.shape)} pretrained stem")
+    mixer = nn.Conv2d(n_bands, out_ch, kernel_size=1, bias=False)
+    stem = nn.Conv2d(out_ch, conv.out_channels, conv.kernel_size, conv.stride,
+                     conv.padding, bias=conv.bias is not None)
+    with torch.no_grad():
+        mixer.weight.copy_(torch.from_numpy(P).view(out_ch, n_bands, 1, 1))
+        stem.weight.copy_(pre)
+        if conv.bias is not None:
+            stem.bias.copy_(conv.bias)
+    dev = conv.weight.device
+    if not replace_module(net, conv, nn.Sequential(mixer, stem).to(dev)):
+        log("  adapter skipped: could not locate the stem in the module tree")
+        return False
+    log(f"  spectral adapter: trainable {n_bands}->{out_ch} 1x1 in front of an "
+        f"unchanged {tuple(pre.shape)} pretrained stem")
+    return True
 
-    model.add_callback("on_pretrain_routine_start", hook)
+
+def adapter_trainer(base_cls, n_bands, projection, ckpt_name):
+    """A trainer whose get_model returns a model that already has the adapter.
+
+    The adapter cannot be installed from a callback. ultralytics builds the
+    optimizer inside _setup_train, *before* on_pretrain_routine_end fires, so a
+    module swapped in from that callback leaves the optimizer holding the old
+    stem's parameters and the mixer's 48 new ones never receive an update -- it
+    would silently train as a fixed projection while reporting itself as the
+    adapter. on_pretrain_routine_start is earlier still, and trainer.model does
+    not exist yet there. Overriding get_model puts the adapter in place before
+    the optimizer is ever constructed.
+    """
+
+    class AdapterTrainer(base_cls):
+        def get_model(self, cfg=None, weights=None, verbose=True):
+            net = super().get_model(cfg=cfg, weights=weights, verbose=verbose)
+            install_spectral_adapter(net, n_bands, projection, ckpt_name)
+            return net
+
+    return AdapterTrainer
 
 
 def pretrained_stem_weight_from(net, want_in):
@@ -456,6 +477,15 @@ def attach_spectral_stem_init(model, name, n_bands, projection):
     model.add_callback("on_pretrain_routine_start", hook)
 
 
+def base_trainer(name):
+    """The trainer class ultralytics would have used for this model."""
+    if name.startswith("rtdetr"):
+        from ultralytics.models.rtdetr.train import RTDETRTrainer
+        return RTDETRTrainer
+    from ultralytics.models.yolo.detect import DetectionTrainer
+    return DetectionTrainer
+
+
 def build_model(name, weights=None):
     """Instantiate the detector. RT-DETR has its own model class in ultralytics."""
     from ultralytics import RTDETR, YOLO
@@ -474,6 +504,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     close_mosaic = min(tr.get("close_mosaic", 5), max(0, tr["epochs"] - 1))
 
     model = build_model(tr["model"])
+    trainer_cls = None
     if tr.get("in_channels", 3) > 3:
         # Remember which checkpoint this started from; the stem strategies need
         # to read its 3-channel kernel back after ultralytics rebuilds the model.
@@ -486,7 +517,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
         # is trainable, so this is a starting point, not a commitment.
         proj = PDA_PROJECTIONS.get(str(tr.get("adapter_penalty", "0")), LDA_16_TO_3)
         if tr.get("spectral_stem", "adapter") == "adapter":
-            attach_spectral_adapter(model, tr["in_channels"], proj)
+            trainer_cls = adapter_trainer(base_trainer(tr["model"]), tr["in_channels"],
+                                          proj, tr["model"])
         else:
             attach_spectral_stem_init(model, tr["model"], tr["in_channels"], proj)
     results = model.train(
@@ -497,6 +529,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
         project=str(WORK / "runs"), name=tag, exist_ok=True,
         verbose=False, plots=False, val=True, seed=0,
         amp=tr.get("amp", True), deterministic=tr.get("deterministic", True),
+        **({"trainer": trainer_cls} if trainer_cls else {}),
     )
 
     # Score from the trainer's own validation pass rather than a second

@@ -75,10 +75,12 @@ DEFAULT: dict = {
         # convolution untouched; "seed" reparameterises the stem itself, which
         # starts in the same place but lets all 4608 of its weights drift.
         "spectral_stem": "adapter",
-        # Roughness penalty of the projection the adapter starts from. 0 has the
-        # highest measured separability; the smoother starts exist because a
-        # trainable mixer may prefer a gentler prior than the sharpest fit.
-        "adapter_penalty": "0",
+        # Roughness penalty of the projection the adapter starts from. The
+        # sharpest fit separates materials best but renders the noisiest image
+        # (edge fraction 0.316 against pseudo_rgb's 0.550), and the smoothest
+        # renders cleanest but separates worst -- so the default sits between
+        # them and the search decides.
+        "adapter_penalty": "0.001",
     },
     "infer": {
         "conf": 0.001,           # mAP rewards deep recall, not a clean top-1
