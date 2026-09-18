@@ -143,7 +143,13 @@ def build_channels(cube, spec):
         # a multi-page TIFF is decoded with imdecodemulti and stacked on axis 2,
         # the model is built with ch=data["channels"], and the HSV augmentation
         # skips anything that is not 3-channel.
-        return np.dstack([stretch(cube[:, :, b], lo, hi) for b in range(cube.shape[2])])
+        #
+        # One stretch shared across all bands, not one per band: the stem is
+        # seeded from a projection fitted on relative band magnitudes, and
+        # rescaling each band independently would destroy exactly the
+        # relationship that seeding encodes.
+        flat = stretch(cube.reshape(cube.shape[0], -1), lo, hi)
+        return flat.reshape(cube.shape)
     bands = spec["bands"][:3]
     return np.dstack([stretch(cube[:, :, b], lo, hi) for b in bands])
 
@@ -302,6 +308,78 @@ def frame_index(root, split, ids):
     return {pid: d / f"{pid}.png" for pid in ids}
 
 
+def first_conv(net):
+    """The stem convolution -- the only layer whose shape depends on band count."""
+    import torch.nn as nn
+    for m in net.modules():
+        if isinstance(m, nn.Conv2d):
+            return m
+    return None
+
+
+def pretrained_stem_weight(name):
+    """The 3-channel stem kernel from the COCO checkpoint we start from."""
+    import torch
+    path = Path(f"{name}.pt")
+    if not path.exists():
+        return None
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    net = ckpt.get("model") if isinstance(ckpt, dict) else ckpt
+    if net is None:
+        return None
+    conv = first_conv(net)
+    if conv is None or conv.in_channels != 3:
+        return None
+    return conv.weight.detach().float().clone()
+
+
+def attach_spectral_stem_init(model, name, n_bands, projection):
+    """Seed a multi-band stem from the pretrained RGB stem via the projection.
+
+    A 16-channel stem cannot inherit COCO weights -- the shapes differ -- so it
+    starts from noise, and that cost 0.043 mAP against a 3-channel run in the
+    first GPU round. Composing the pretrained kernel with the discriminant
+    projection fixes the initialization instead of the architecture:
+
+        W16[o, b] = sum_c W3[o, c] * P[c, b]
+
+    makes the stem's initial response identical to the pretrained stem reading
+    P @ x, so training starts from a pretrained filter bank looking at the
+    spectral discriminant rather than from scratch, and is then free to move
+    beyond the three dimensions the projection can carry.
+
+    Runs on on_pretrain_routine_start: by then ultralytics has built the model
+    and transferred every tensor whose shape matched, so this fills the one that
+    could not without being overwritten afterwards.
+    """
+    import numpy as _np
+    import torch
+
+    def hook(trainer):
+        conv = first_conv(trainer.model)
+        if conv is None or conv.in_channels != n_bands:
+            return
+        w3 = pretrained_stem_weight(name)
+        if w3 is None or w3.shape[0] != conv.weight.shape[0]:
+            log("  spectral stem init skipped: no usable pretrained stem")
+            return
+        P = torch.from_numpy(_np.asarray(projection, dtype=_np.float32))
+        if P.shape != (w3.shape[1], n_bands):
+            log(f"  spectral stem init skipped: projection {tuple(P.shape)} does not "
+                f"map {n_bands} bands to {w3.shape[1]}")
+            return
+        w16 = torch.einsum("ocij,cb->obij", w3, P)
+        # Preserve the pretrained layer's output scale: the projection's rows are
+        # normalised for interpretability, not to keep activations in range.
+        w16 *= w3.std() / (w16.std() + 1e-12)
+        with torch.no_grad():
+            conv.weight.copy_(w16.to(conv.weight.dtype).to(conv.weight.device))
+        log(f"  spectral stem init: {tuple(conv.weight.shape)} seeded from the "
+            f"pretrained {tuple(w3.shape)} stem via the {P.shape[0]}x{P.shape[1]} projection")
+
+    model.add_callback("on_pretrain_routine_start", hook)
+
+
 def build_model(name, weights=None):
     """Instantiate the detector. RT-DETR has its own model class in ultralytics."""
     from ultralytics import RTDETR, YOLO
@@ -320,6 +398,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     close_mosaic = min(tr.get("close_mosaic", 5), max(0, tr["epochs"] - 1))
 
     model = build_model(tr["model"])
+    if tr.get("in_channels", 3) > 3:
+        attach_spectral_stem_init(model, tr["model"], tr["in_channels"], LDA_16_TO_3)
     results = model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
         lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=close_mosaic,
