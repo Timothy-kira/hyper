@@ -249,6 +249,26 @@ class DiscoveryAgent:
         best = max((h for h in history if h.get("score") is not None),
                    key=lambda h: h["score"], default=None)
 
+        # Covering channel modes cannot depend on the policy opening new
+        # branches: with the default two, a rollout measures two modes and then
+        # refines them forever, which structurally locks out the mode the
+        # bottleneck analysis points at. So an untried mode can also arrive as a
+        # child -- same training recipe, different channels. That is a
+        # controlled ablation, and a better comparison than pairing each mode
+        # with its own random hyperparameters.
+        seen_modes = {h["candidate"]["channels"]["mode"] for h in history}
+        untried = [m for m in CHANNEL_MODES if m not in seen_modes]
+        if untried and self._rng.random() < 0.6:
+            cfg = deepcopy(parent_candidate)
+            mode = self._rng.choice(untried)
+            _set(cfg, "channels.mode", mode)
+            cfg = self._pin_track(cfg)
+            if self._sig(cfg) not in tried:
+                why = f"channels.mode={mode!r} (untried; rest held from parent)"
+                if best is not None:
+                    why += f" (best measured so far {best['score']:.4f})"
+                return cfg, why
+
         for _ in range(192):
             cfg = deepcopy(parent_candidate)
             picked = []
