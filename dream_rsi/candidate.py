@@ -111,6 +111,10 @@ def normalize(cfg: dict) -> dict:
     if cfg["fidelity"] == "proxy":
         cfg["train"]["epochs"] = min(cfg["train"]["epochs"], 18)
         cfg["train"]["imgsz"] = min(cfg["train"]["imgsz"], 768)
+    # Ultralytics disables mosaic for the last close_mosaic epochs; that is
+    # meaningless once it exceeds the run length.
+    cfg["train"]["close_mosaic"] = min(cfg["train"]["close_mosaic"],
+                                       max(0, cfg["train"]["epochs"] - 1))
     return cfg
 
 

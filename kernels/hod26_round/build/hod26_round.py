@@ -342,6 +342,7 @@ COMP = "/kaggle/input/hyperspectral-object-detection-challenge-2026"
 WORK = Path("/kaggle/working")
 CACHE = WORK / "cache"
 VAL_FRACTION = 0.2
+PREDICT_BATCH = 32
 CACHE_SEED = 20260918
 
 
@@ -439,6 +440,17 @@ def materialize(cand, index, train_ids, val_ids, anns, root):
 
 
 # ------------------------------------------------------------ evaluate ------
+def _rows(pid, result):
+    """Flatten one ultralytics Result into submission-shaped tuples."""
+    b = result.boxes
+    if b is None or len(b) == 0:
+        return []
+    xyxy = b.xyxy.cpu().numpy()
+    return [(pid, int(c), float(s), float(x1), float(y1), float(x2), float(y2))
+            for (x1, y1, x2, y2), c, s in
+            zip(xyxy, b.cls.cpu().numpy(), b.conf.cpu().numpy())]
+
+
 def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     from ultralytics import YOLO
 
@@ -457,16 +469,14 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     )
 
     preds = []
-    for pid in val_ids:
-        r = model.predict(str(root / "images" / "val" / f"{pid}.png"),
-                          conf=inf["conf"], iou=inf["iou"], max_det=inf["max_det"],
-                          augment=inf["tta"], verbose=False)[0]
-        b = r.boxes
-        if b is None or len(b) == 0:
-            continue
-        xyxy = b.xyxy.cpu().numpy()
-        for (x1, y1, x2, y2), c, s in zip(xyxy, b.cls.cpu().numpy(), b.conf.cpu().numpy()):
-            preds.append((pid, int(c), float(s), float(x1), float(y1), float(x2), float(y2)))
+    paths = [str(root / "images" / "val" / f"{pid}.png") for pid in val_ids]
+    for lo in range(0, len(paths), PREDICT_BATCH):
+        chunk = paths[lo:lo + PREDICT_BATCH]
+        for pid, r in zip(val_ids[lo:lo + PREDICT_BATCH],
+                          model.predict(chunk, conf=inf["conf"], iou=inf["iou"],
+                                        max_det=inf["max_det"], augment=inf["tta"],
+                                        verbose=False, stream=False)):
+            preds.extend(_rows(pid, r))
 
     scores = evaluate([anns[p] for p in val_ids], preds, per_class=True)
     weights = WORK / "runs" / tag / "weights" / "best.pt"
@@ -483,19 +493,19 @@ def predict_test(model, cand, test_dir, png_ids):
     for n, pid in enumerate(png_ids):
         img = build_channels(load_cube(test_dir / f"{pid}.png"), cand["channels"])
         sizes[pid] = (img.shape[1], img.shape[0])
-        path = staging / f"{pid}.png"
-        if not cv2.imwrite(str(path), np.ascontiguousarray(img)):
-            raise RuntimeError(f"cv2.imwrite failed for {path}")
-        r = model.predict(str(path), conf=inf["conf"], iou=inf["iou"],
-                          max_det=inf["max_det"], augment=inf["tta"], verbose=False)[0]
-        path.unlink()
-        b = r.boxes
-        if b is not None and len(b):
-            xyxy = b.xyxy.cpu().numpy()
-            for (x1, y1, x2, y2), c, sc in zip(xyxy, b.cls.cpu().numpy(), b.conf.cpu().numpy()):
-                preds.append((pid, int(c), float(sc), float(x1), float(y1), float(x2), float(y2)))
-        if n % 200 == 0:
-            log(f"  predicted {n}/{len(png_ids)}")
+        if not cv2.imwrite(str(staging / f"{pid}.png"), np.ascontiguousarray(img)):
+            raise RuntimeError(f"cv2.imwrite failed for {pid}")
+        if n % 250 == 0:
+            log(f"  staged {n}/{len(png_ids)}")
+
+    for lo in range(0, len(png_ids), PREDICT_BATCH):
+        ids = png_ids[lo:lo + PREDICT_BATCH]
+        chunk = [str(staging / f"{pid}.png") for pid in ids]
+        for pid, r in zip(ids, model.predict(chunk, conf=inf["conf"], iou=inf["iou"],
+                                             max_det=inf["max_det"], augment=inf["tta"],
+                                             verbose=False, stream=False)):
+            preds.extend(_rows(pid, r))
+        log(f"  predicted {min(lo + PREDICT_BATCH, len(png_ids))}/{len(png_ids)}")
     return preds, sizes
 
 
