@@ -9,7 +9,7 @@ The hod26.* helpers above this docstring are injected verbatim from the repo by
 tools/build_kernel.py -- this file is the round-specific part only.
 """
 
-import hashlib, json, os, shutil, time, traceback
+import hashlib, json, os, shutil, time, traceback, zipfile
 from pathlib import Path
 
 import cv2
@@ -29,14 +29,41 @@ def log(*a):
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
 
 
+def _looks_like_dataset(p):
+    return (p / "train" / "annotations").is_dir()
+
+
 def data_root():
-    """Locate the planar dataset, tolerating Kaggle's nesting of uploads."""
-    for cand in (DATA, *sorted(Path("/kaggle/input").glob("*"))):
-        if (cand / "train" / "annotations").is_dir():
-            return cand
-        nested = cand / "hod26_planar"
-        if (nested / "train" / "annotations").is_dir():
-            return nested
+    """Locate the planar dataset.
+
+    Kaggle may serve an upload extracted, nested one level down, or still as the
+    archives the CLI produced -- accept all three rather than spend a kernel
+    session discovering which one happened.
+    """
+    candidates = [DATA]
+    if Path("/kaggle/input").exists():
+        candidates += sorted(Path("/kaggle/input").glob("*"))
+
+    for cand in candidates:
+        if not cand.exists():
+            continue
+        for probe in (cand, cand / "hod26_planar"):
+            if _looks_like_dataset(probe):
+                return probe
+
+    for cand in candidates:                       # fall back to archives
+        zips = sorted(cand.glob("*.zip")) if cand.is_dir() else []
+        if not zips:
+            continue
+        out = WORK / "unpacked"
+        out.mkdir(parents=True, exist_ok=True)
+        for z in zips:
+            log(f"  unpacking {z.name}")
+            with zipfile.ZipFile(z) as zf:
+                zf.extractall(out / z.stem if z.stem in ("train", "test") else out)
+        if _looks_like_dataset(out):
+            return out
+
     listing = sorted(p.name for p in Path("/kaggle/input").iterdir()) \
         if Path("/kaggle/input").exists() else "/kaggle/input does not exist"
     raise FileNotFoundError(f"planar dataset not attached. /kaggle/input holds: {listing}")
