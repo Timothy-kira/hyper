@@ -358,7 +358,7 @@ The hod26.* helpers above this docstring are injected verbatim from the repo by
 tools/build_kernel.py -- this file is the round-specific part only.
 """
 
-import json, os, shutil, time, traceback
+import hashlib, json, os, shutil, time, traceback
 from pathlib import Path
 
 import numpy as np
@@ -430,9 +430,23 @@ def build_channels(cube, spec):
     return np.dstack([stretch(cube[:, :, b], lo, hi) for b in bands])
 
 
+def channels_key(spec):
+    """Identity of a rendered dataset: candidates differing only in training or
+    inference parameters consume byte-identical images."""
+    return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:10]
+
+
 def materialize(cand, index, train_ids, val_ids, anns, root):
-    """Write the YOLO dataset this candidate trains on."""
+    """Write the YOLO dataset this candidate trains on, reusing it if rendered.
+
+    Rendering is keyed on the channel spec alone, so a round that varies only
+    imgsz, epochs or NMS settings encodes its images once instead of per
+    candidate.
+    """
     import cv2
+    if (root / "data.yaml").exists():
+        log(f"  reusing rendered dataset {root.name}")
+        return root / "data.yaml"
     if root.exists():
         shutil.rmtree(root)
     for split in ("train", "val"):
@@ -493,7 +507,7 @@ def frame_index(root, split, ids):
 def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     from ultralytics import YOLO
 
-    root = WORK / f"ds_{tag}"
+    root = WORK / f"ds_{channels_key(cand['channels'])}"
     yaml = materialize(cand, index, train_ids, val_ids, anns, root)
     tr, inf = cand["train"], cand["infer"]
 
@@ -624,8 +638,9 @@ def main():
         results.append(rec)
         (WORK / "results.json").write_text(json.dumps(
             {"round": round_cfg.get("round"), "results": results}, indent=2))
-        shutil.rmtree(WORK / f"ds_{node_id}", ignore_errors=True)
 
+    for d in WORK.glob("ds_*"):
+        shutil.rmtree(d, ignore_errors=True)
     log(f"round complete: {sum(r['score'] is not None for r in results)}/{len(results)} succeeded")
 
 
