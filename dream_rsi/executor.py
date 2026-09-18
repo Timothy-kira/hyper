@@ -51,7 +51,18 @@ class KaggleRoundExecutor:
         _kaggle("kernels", "push", "-p", str(BUILD))
 
     def status(self) -> str:
-        out = _kaggle("kernels", "status", self.slug).lower()
+        """Current session state, or "pending" if there is no session yet.
+
+        A kernel that has never run has no session, and the status endpoint
+        404s for it -- which is "not started", not a failure. Raising on it
+        killed a track on its very first push.
+        """
+        try:
+            out = _kaggle("kernels", "status", self.slug).lower()
+        except KernelError as e:
+            if "404" in str(e) or "not found" in str(e).lower():
+                return "pending"
+            raise
         for s in ("complete", "error", "cancelrequested", "cancelacknowledged",
                   "running", "queued"):
             if s in out:
@@ -70,7 +81,8 @@ class KaggleRoundExecutor:
         """
         started, deadline = False, time.time() + start_timeout
         while not started and time.time() < deadline:
-            if self.status() not in self.TERMINAL:
+            s = self.status()
+            if s != "pending" and s not in self.TERMINAL:
                 started = True
                 break
             time.sleep(min(self.poll_seconds, 15))
