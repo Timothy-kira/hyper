@@ -15,7 +15,7 @@ import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-MODULES = ["cube.py", "voc.py", "coco_eval.py"]   # order matters: voc feeds coco_eval
+MODULES = ["cube.py", "voc.py", "coco_eval.py", "submit.py"]   # order matters: voc feeds coco_eval
 DROP = re.compile(r"^\s*(from\s+\.|from\s+__future__\s+import)")
 
 

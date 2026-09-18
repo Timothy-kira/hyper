@@ -84,7 +84,13 @@ def materialize(cand, index, train_ids, val_ids, anns, root):
     for split, ids in (("train", train_ids), ("val", val_ids)):
         for pid in ids:
             img = build_channels(np.load(index[pid]), cand["channels"])
-            cv2.imwrite(str(root / "images" / split / f"{pid}.png"), img[:, :, ::-1])
+            # No BGR flip: these are spectral bands, not colour. What matters is
+            # that training and inference write and read them the same way.
+            # cv2.imwrite returns False (it does not raise) on a bad buffer, and
+            # a non-contiguous view is one -- hence the explicit check.
+            dst = root / "images" / split / f"{pid}.png"
+            if not cv2.imwrite(str(dst), np.ascontiguousarray(img)):
+                raise RuntimeError(f"cv2.imwrite failed for {dst}")
             a = anns[pid]
             lines = []
             for b in a.boxes:
@@ -94,6 +100,11 @@ def materialize(cand, index, train_ids, val_ids, anns, root):
                 bh = (b.y2 - b.y1) / a.height
                 lines.append(f"{b.cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
             (root / "labels" / split / f"{pid}.txt").write_text("\n".join(lines))
+
+    for split, ids in (("train", train_ids), ("val", val_ids)):
+        n = len(list((root / "images" / split).glob("*.png")))
+        if n != len(ids):
+            raise RuntimeError(f"{split}: wrote {n} images, expected {len(ids)}")
 
     yaml = root / "data.yaml"
     yaml.write_text(
@@ -138,9 +149,72 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     return scores, preds, (str(weights) if weights.exists() else None)
 
 
+def predict_test(model, cand, test_dir, png_ids):
+    """Run the trained model over the test set at cube resolution."""
+    import cv2
+    inf = cand["infer"]
+    preds, sizes = [], {}
+    staging = WORK / "test_images"
+    staging.mkdir(parents=True, exist_ok=True)
+    for n, pid in enumerate(png_ids):
+        img = build_channels(load_cube(test_dir / f"{pid}.png"), cand["channels"])
+        sizes[pid] = (img.shape[1], img.shape[0])
+        path = staging / f"{pid}.png"
+        if not cv2.imwrite(str(path), np.ascontiguousarray(img)):
+            raise RuntimeError(f"cv2.imwrite failed for {path}")
+        r = model.predict(str(path), conf=inf["conf"], iou=inf["iou"],
+                          max_det=inf["max_det"], augment=inf["tta"], verbose=False)[0]
+        path.unlink()
+        b = r.boxes
+        if b is not None and len(b):
+            xyxy = b.xyxy.cpu().numpy()
+            for (x1, y1, x2, y2), c, sc in zip(xyxy, b.cls.cpu().numpy(), b.conf.cpu().numpy()):
+                preds.append((pid, int(c), float(sc), float(x1), float(y1), float(x2), float(y2)))
+        if n % 200 == 0:
+            log(f"  predicted {n}/{len(png_ids)}")
+    return preds, sizes
+
+
+def run_submission(round_cfg):
+    """Train one candidate at full fidelity and write submission.csv."""
+    from ultralytics import YOLO
+
+    cand = round_cfg["submit"]["candidate"]
+    ann_dir = Path(COMP) / "data_train/data_train/Annotations/VIS"
+    png_dir = Path(COMP) / "data_train/data_train/VIS"
+    test_dir = Path(COMP) / "data_test/data_test/VIS"
+
+    ids = sorted(int(p.stem) for p in ann_dir.glob("*.xml"))
+    train_ids, val_ids = split_ids(ids)
+    if round_cfg["submit"].get("use_all_train", True):
+        # Config was already selected on val; refit on everything for the final run.
+        train_ids, val_ids = ids, val_ids[:60]   # a token val set keeps YOLO happy
+    log(f"submission fit: {len(train_ids)} train / {len(val_ids)} val")
+
+    anns = {pid: parse(ann_dir / f"{pid}.xml") for pid in set(train_ids) | set(val_ids)}
+    index = decode_all(png_dir, sorted(set(train_ids) | set(val_ids)), CACHE)
+    scores, _, weights = run_candidate(cand, index, train_ids, val_ids, anns, "final")
+    log(f"fit done; holdout mAP={scores['mAP']:.4f} (optimistic: seen in training)")
+
+    model = YOLO(weights)
+    test_ids = sorted(int(p.stem) for p in test_dir.glob("*.png"))
+    log(f"predicting {len(test_ids)} test images")
+    preds, sizes = predict_test(model, cand, test_dir, test_ids)
+
+    n = write(WORK / "submission.csv", preds, clip_to=sizes)
+    log(f"wrote submission.csv: {n} rows over {len({p[0] for p in preds})} images")
+    (WORK / "results.json").write_text(json.dumps({
+        "mode": "submit", "rows": n, "holdout": scores["mAP"],
+        "candidate": cand, "weights": weights,
+    }, indent=2))
+
+
 def main():
     round_cfg = json.loads(Path(__file__).with_name("round.json").read_text()) \
         if Path(__file__).with_name("round.json").exists() else ROUND_CONFIG
+
+    if round_cfg.get("submit"):
+        return run_submission(round_cfg)
 
     ann_dir = Path(COMP) / "data_train/data_train/Annotations/VIS"
     png_dir = Path(COMP) / "data_train/data_train/VIS"

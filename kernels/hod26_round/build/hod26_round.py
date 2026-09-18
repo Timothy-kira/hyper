@@ -231,14 +231,55 @@ def evaluate(anns, preds, per_class: bool = False) -> dict:
             out["per_class"][name] = float(np.mean(p)) if p.size else 0.0
     return out
 
+# ---- inlined from src/hod26/submit.py ------------------------------
+"""Submission writer for HOD26.
+
+Schema is the one the organizers declared authoritative (forum #729747):
+``id,image_id,class_id,confidence,x1,y1,x2,y2`` with ``id`` a unique
+0-based row counter. The bundled sample_submission.csv omits ``id`` and
+the organizers said to disregard it.
+"""
+
+
+import csv
+from pathlib import Path
+
+COLUMNS = ["id", "image_id", "class_id", "confidence", "x1", "y1", "x2", "y2"]
+
+
+def write(path, preds, clip_to: dict[int, tuple[int, int]] | None = None) -> int:
+    """Write predictions, dropping degenerate boxes. Returns rows written.
+
+    ``preds`` rows are ``(image_id, class_id, confidence, x1, y1, x2, y2)``.
+    ``clip_to`` optionally maps image_id -> (width, height) for clamping.
+    Coordinates are emitted as 0-indexed integer pixels, zero-area rows removed.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    n = 0
+    with path.open("w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(COLUMNS)
+        for image_id, cls_id, conf, x1, y1, x2, y2 in preds:
+            x1, y1, x2, y2 = (int(round(float(v))) for v in (x1, y1, x2, y2))
+            if clip_to and int(image_id) in clip_to:
+                W, H = clip_to[int(image_id)]
+                x1, x2 = max(0, min(W, x1)), max(0, min(W, x2))
+                y1, y2 = max(0, min(H, y1)), max(0, min(H, y2))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            w.writerow([n, int(image_id), int(cls_id), f"{float(conf):.6f}", x1, y1, x2, y2])
+            n += 1
+    return n
+
 ROUND_CONFIG = json.loads(r'''
 {
-  "round": 0,
-  "proxy_train_images": 600,
-  "proxy_val_images": 200,
+  "round": "smoke",
+  "proxy_train_images": 100,
+  "proxy_val_images": 40,
   "candidates": [
     {
-      "node_id": "smoke01",
+      "node_id": "smoke",
       "candidate": {
         "channels": {
           "mode": "pseudo_rgb",
@@ -252,10 +293,10 @@ ROUND_CONFIG = json.loads(r'''
           "per_image_norm": true
         },
         "train": {
-          "model": "yolo11s",
+          "model": "yolo11n",
           "imgsz": 640,
-          "epochs": 18,
-          "batch": 16,
+          "epochs": 3,
+          "batch": 8,
           "lr0": 0.01,
           "mosaic": 1.0,
           "close_mosaic": 5,
@@ -367,7 +408,13 @@ def materialize(cand, index, train_ids, val_ids, anns, root):
     for split, ids in (("train", train_ids), ("val", val_ids)):
         for pid in ids:
             img = build_channels(np.load(index[pid]), cand["channels"])
-            cv2.imwrite(str(root / "images" / split / f"{pid}.png"), img[:, :, ::-1])
+            # No BGR flip: these are spectral bands, not colour. What matters is
+            # that training and inference write and read them the same way.
+            # cv2.imwrite returns False (it does not raise) on a bad buffer, and
+            # a non-contiguous view is one -- hence the explicit check.
+            dst = root / "images" / split / f"{pid}.png"
+            if not cv2.imwrite(str(dst), np.ascontiguousarray(img)):
+                raise RuntimeError(f"cv2.imwrite failed for {dst}")
             a = anns[pid]
             lines = []
             for b in a.boxes:
@@ -377,6 +424,11 @@ def materialize(cand, index, train_ids, val_ids, anns, root):
                 bh = (b.y2 - b.y1) / a.height
                 lines.append(f"{b.cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
             (root / "labels" / split / f"{pid}.txt").write_text("\n".join(lines))
+
+    for split, ids in (("train", train_ids), ("val", val_ids)):
+        n = len(list((root / "images" / split).glob("*.png")))
+        if n != len(ids):
+            raise RuntimeError(f"{split}: wrote {n} images, expected {len(ids)}")
 
     yaml = root / "data.yaml"
     yaml.write_text(
@@ -421,9 +473,72 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     return scores, preds, (str(weights) if weights.exists() else None)
 
 
+def predict_test(model, cand, test_dir, png_ids):
+    """Run the trained model over the test set at cube resolution."""
+    import cv2
+    inf = cand["infer"]
+    preds, sizes = [], {}
+    staging = WORK / "test_images"
+    staging.mkdir(parents=True, exist_ok=True)
+    for n, pid in enumerate(png_ids):
+        img = build_channels(load_cube(test_dir / f"{pid}.png"), cand["channels"])
+        sizes[pid] = (img.shape[1], img.shape[0])
+        path = staging / f"{pid}.png"
+        if not cv2.imwrite(str(path), np.ascontiguousarray(img)):
+            raise RuntimeError(f"cv2.imwrite failed for {path}")
+        r = model.predict(str(path), conf=inf["conf"], iou=inf["iou"],
+                          max_det=inf["max_det"], augment=inf["tta"], verbose=False)[0]
+        path.unlink()
+        b = r.boxes
+        if b is not None and len(b):
+            xyxy = b.xyxy.cpu().numpy()
+            for (x1, y1, x2, y2), c, sc in zip(xyxy, b.cls.cpu().numpy(), b.conf.cpu().numpy()):
+                preds.append((pid, int(c), float(sc), float(x1), float(y1), float(x2), float(y2)))
+        if n % 200 == 0:
+            log(f"  predicted {n}/{len(png_ids)}")
+    return preds, sizes
+
+
+def run_submission(round_cfg):
+    """Train one candidate at full fidelity and write submission.csv."""
+    from ultralytics import YOLO
+
+    cand = round_cfg["submit"]["candidate"]
+    ann_dir = Path(COMP) / "data_train/data_train/Annotations/VIS"
+    png_dir = Path(COMP) / "data_train/data_train/VIS"
+    test_dir = Path(COMP) / "data_test/data_test/VIS"
+
+    ids = sorted(int(p.stem) for p in ann_dir.glob("*.xml"))
+    train_ids, val_ids = split_ids(ids)
+    if round_cfg["submit"].get("use_all_train", True):
+        # Config was already selected on val; refit on everything for the final run.
+        train_ids, val_ids = ids, val_ids[:60]   # a token val set keeps YOLO happy
+    log(f"submission fit: {len(train_ids)} train / {len(val_ids)} val")
+
+    anns = {pid: parse(ann_dir / f"{pid}.xml") for pid in set(train_ids) | set(val_ids)}
+    index = decode_all(png_dir, sorted(set(train_ids) | set(val_ids)), CACHE)
+    scores, _, weights = run_candidate(cand, index, train_ids, val_ids, anns, "final")
+    log(f"fit done; holdout mAP={scores['mAP']:.4f} (optimistic: seen in training)")
+
+    model = YOLO(weights)
+    test_ids = sorted(int(p.stem) for p in test_dir.glob("*.png"))
+    log(f"predicting {len(test_ids)} test images")
+    preds, sizes = predict_test(model, cand, test_dir, test_ids)
+
+    n = write(WORK / "submission.csv", preds, clip_to=sizes)
+    log(f"wrote submission.csv: {n} rows over {len({p[0] for p in preds})} images")
+    (WORK / "results.json").write_text(json.dumps({
+        "mode": "submit", "rows": n, "holdout": scores["mAP"],
+        "candidate": cand, "weights": weights,
+    }, indent=2))
+
+
 def main():
     round_cfg = json.loads(Path(__file__).with_name("round.json").read_text()) \
         if Path(__file__).with_name("round.json").exists() else ROUND_CONFIG
+
+    if round_cfg.get("submit"):
+        return run_submission(round_cfg)
 
     ann_dir = Path(COMP) / "data_train/data_train/Annotations/VIS"
     png_dir = Path(COMP) / "data_train/data_train/VIS"
