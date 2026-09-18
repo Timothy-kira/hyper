@@ -376,8 +376,6 @@ def predict_test(model, cand, test_dir, png_ids):
 
 def run_submission(round_cfg):
     """Train one candidate at full fidelity and write submission.csv."""
-    from ultralytics import YOLO
-
     cand = round_cfg["submit"]["candidate"]
     root = data_root()
     ann_dir = root / "train" / "annotations"
