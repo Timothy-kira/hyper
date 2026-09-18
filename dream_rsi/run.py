@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from .budget import estimate_round_hours, make_budget
-from .candidate import DiscoveryAgent
+from .candidate import TRACKS, DiscoveryAgent
 from .dream import dream
 from .executor import KaggleRoundExecutor, LocalMockExecutor
 from .policy import build as build_policy
@@ -111,7 +111,8 @@ def online_rollout(policy, agent, executor, *, workers: int, max_rounds: int,
 
 def iterate(*, iterations: int, workers: int, max_rounds: int, executor,
             state_dir: Path, round_base: dict, n_versions: int,
-            reserve_hours: float = 0.0, deadline=None, log=print) -> dict:
+            reserve_hours: float = 0.0, deadline=None, track: str | None = None,
+            log=print) -> dict:
     """Run the recursive self-improvement loop and return its final state."""
     state_dir.mkdir(parents=True, exist_ok=True)
     spec_path = state_dir / "policy.json"
@@ -136,7 +137,7 @@ def iterate(*, iterations: int, workers: int, max_rounds: int, executor,
     for t in range(1, iterations + 1):
         log(f"\n{'='*66}\nITERATION {t}: online explore  (policy={spec['params']})\n{'='*66}")
         tree = online_rollout(
-            build_policy(spec), DiscoveryAgent(seed=t), executor,
+            build_policy(spec), DiscoveryAgent(seed=t, track=track), executor,
             workers=workers, max_rounds=max_rounds, round_base=round_base,
             tree_meta={"iteration": t, "policy": spec}, budget=budget,
             save_to=state_dir, log=log)
@@ -174,6 +175,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Dream-RSI loop for HOD26")
     ap.add_argument("--executor", choices=["kaggle", "mock"], default="mock")
     ap.add_argument("--slug", default="xishengfeng/hod26-round")
+    ap.add_argument("--track", choices=sorted(TRACKS), default=None,
+                    help="pin the model family so tracks can be compared as tracks")
     ap.add_argument("--iterations", type=int, default=2)
     ap.add_argument("--workers", type=int, default=3,
                     help="attempts per decision round (one kernel session)")
@@ -195,7 +198,7 @@ def main() -> None:
         iterations=args.iterations, workers=args.workers, max_rounds=args.max_rounds,
         executor=executor, state_dir=args.state_dir, n_versions=args.versions,
         reserve_hours=args.reserve_hours,
-        deadline=dt.datetime.fromisoformat(args.deadline),
+        deadline=dt.datetime.fromisoformat(args.deadline), track=args.track,
         round_base={"proxy_train_images": args.proxy_train,
                     "proxy_val_images": args.proxy_val},
     )
@@ -205,6 +208,8 @@ def main() -> None:
               f"attempts={s['attempts']} gpu={s['gpu_hours']:.2f}h "
               f"dream_gain={s['dream_gain']:+.4f}")
     print("final policy:", out["policy"]["params"])
+    if args.track:
+        print("track:", args.track)
 
 
 if __name__ == "__main__":
