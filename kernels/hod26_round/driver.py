@@ -26,6 +26,16 @@ def log(*a):
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
 
 
+def require_ids(ids, where):
+    """A wrong data path must fail here, not as a confusing downstream error."""
+    if not ids:
+        listing = sorted(p.name for p in Path(COMP).iterdir()) if Path(COMP).exists() \
+            else f"{COMP} does not exist"
+        raise FileNotFoundError(
+            f"no files matched under {where}. /kaggle/input contents: {listing}")
+    return ids
+
+
 # ---------------------------------------------------------------- data ------
 def split_ids(all_ids):
     """Deterministic train/val split, stable across every candidate and round."""
@@ -104,7 +114,7 @@ def materialize(cand, index, train_ids, val_ids, anns, root):
 
     for split, ids in (("train", train_ids), ("val", val_ids)):
         n = len(list((root / "images" / split).glob("*.png")))
-        if n != len(ids):
+        if n == 0 or n != len(ids):
             raise RuntimeError(f"{split}: wrote {n} images, expected {len(ids)}")
 
     yaml = root / "data.yaml"
@@ -194,7 +204,7 @@ def run_submission(round_cfg):
     png_dir = Path(COMP) / "data_train/data_train/VIS"
     test_dir = Path(COMP) / "data_test/data_test/VIS"
 
-    ids = sorted(int(p.stem) for p in ann_dir.glob("*.xml"))
+    ids = require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
     train_ids, val_ids = split_ids(ids)
     if round_cfg["submit"].get("use_all_train", True):
         # Config was already selected on val; refit on everything for the final run.
@@ -207,7 +217,7 @@ def run_submission(round_cfg):
     log(f"fit done; holdout mAP={scores['mAP']:.4f} (optimistic: seen in training)")
 
     model = YOLO(weights)
-    test_ids = sorted(int(p.stem) for p in test_dir.glob("*.png"))
+    test_ids = require_ids(sorted(int(p.stem) for p in test_dir.glob("*.png")), test_dir)
     log(f"predicting {len(test_ids)} test images")
     preds, sizes = predict_test(model, cand, test_dir, test_ids)
 
@@ -228,7 +238,7 @@ def main():
 
     ann_dir = Path(COMP) / "data_train/data_train/Annotations/VIS"
     png_dir = Path(COMP) / "data_train/data_train/VIS"
-    ids = sorted(int(p.stem) for p in ann_dir.glob("*.xml"))
+    ids = require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
     train_ids, val_ids = split_ids(ids)
 
     limit = round_cfg.get("proxy_train_images")
