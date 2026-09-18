@@ -1,0 +1,15 @@
+{
+  "id": "xishengfeng/hod26-round",
+  "title": "HOD26 Round",
+  "code_file": "hod26_round.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "competition_sources": [
+    "hyperspectral-object-detection-challenge-2026"
+  ],
+  "dataset_sources": [],
+  "kernel_sources": []
+}
