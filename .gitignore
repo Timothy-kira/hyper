@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+# competition data + local experiment state (never committed)
+data/
+sample/
+runs/
+work/
+*.pt
+*.csv
+!src/**/*.csv
+# credentials must never enter the repo
+kaggle.json
+access_token*
