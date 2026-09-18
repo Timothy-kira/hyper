@@ -481,10 +481,14 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
             model.model._hod26_ckpt = tr["model"]
         except AttributeError:
             pass
+        # Which starting projection the adapter gets. Smoother starts trade
+        # measured separability for robustness to a spectral shift; the adapter
+        # is trainable, so this is a starting point, not a commitment.
+        proj = PDA_PROJECTIONS.get(str(tr.get("adapter_penalty", "0")), LDA_16_TO_3)
         if tr.get("spectral_stem", "adapter") == "adapter":
-            attach_spectral_adapter(model, tr["in_channels"], LDA_16_TO_3)
+            attach_spectral_adapter(model, tr["in_channels"], proj)
         else:
-            attach_spectral_stem_init(model, tr["model"], tr["in_channels"], LDA_16_TO_3)
+            attach_spectral_stem_init(model, tr["model"], tr["in_channels"], proj)
     results = model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
         lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=close_mosaic,

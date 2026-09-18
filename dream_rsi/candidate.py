@@ -75,6 +75,10 @@ DEFAULT: dict = {
         # convolution untouched; "seed" reparameterises the stem itself, which
         # starts in the same place but lets all 4608 of its weights drift.
         "spectral_stem": "adapter",
+        # Roughness penalty of the projection the adapter starts from. 0 has the
+        # highest measured separability; the smoother starts exist because a
+        # trainable mixer may prefer a gentler prior than the sharpest fit.
+        "adapter_penalty": "0",
     },
     "infer": {
         "conf": 0.001,           # mAP rewards deep recall, not a clean top-1
@@ -121,6 +125,7 @@ _MOVES: dict[str, list] = {
     "augment.cutmix_blocks": [16, 24, 40],
     "augment.copies": [0, 1, 2],
     "train.spectral_stem": ["adapter", "seed"],
+    "train.adapter_penalty": ["0", "0.001", "0.01"],
 }
 
 _BANDS_FOR_MODE = {
