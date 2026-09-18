@@ -14,6 +14,7 @@ import json
 import time
 from pathlib import Path
 
+from .budget import Budget, estimate_round_hours, read_quota
 from .candidate import DiscoveryAgent
 from .dream import dream
 from .executor import KaggleRoundExecutor, LocalMockExecutor
@@ -26,11 +27,20 @@ STATE = REPO / "runs"
 
 
 def online_rollout(policy, agent, executor, *, workers: int, max_rounds: int,
-                   round_base: dict, tree_meta: dict, log=print) -> DiscoveryTree:
+                   round_base: dict, tree_meta: dict, budget: Budget | None = None,
+                   log=print) -> DiscoveryTree:
     """One online rollout: the policy drives real GPU attempts into a new tree."""
     tree = DiscoveryTree(meta=tree_meta)
+    costs: list[float] = []
 
     for k in range(max_rounds):
+        if budget is not None:
+            need = estimate_round_hours(costs, workers)
+            if not budget.affords(need):
+                log(f"round {k}: stopping -- next round needs ~{need:.2f} GPU-h, "
+                    f"{budget.searchable_hours:.2f} h left outside the "
+                    f"{budget.reserve_hours:.1f} h submission reserve")
+                break
         view = TreeView(tree, set(tree.nodes), k, online=True)
         batch = policy.select(view, workers) or []
         batch = [n for n in batch if n in set(view.eligible())][:workers]
@@ -69,6 +79,14 @@ def online_rollout(policy, agent, executor, *, workers: int, max_rounds: int,
             else:
                 log(f"    {node_id}: FAILED")
 
+        costs.extend(tree.nodes[n].cost_seconds for _, n in scheduled
+                     if tree.nodes[n].cost_seconds)
+        if budget is not None:
+            spent = sum(tree.nodes[n].cost_seconds for _, n in scheduled) / 3600
+            budget = budget.spend(spent)
+            log(f"    round cost {spent:.2f} GPU-h | {budget.searchable_hours:.2f} h "
+                f"searchable remaining")
+
         produced = [(p, n) for p, n in scheduled if tree.nodes[n].ok]
         if hasattr(policy, "observe"):
             policy.observe(produced, TreeView(tree, set(tree.nodes), k, online=True))
@@ -80,12 +98,24 @@ def online_rollout(policy, agent, executor, *, workers: int, max_rounds: int,
 
 
 def iterate(*, iterations: int, workers: int, max_rounds: int, executor,
-            state_dir: Path, round_base: dict, n_versions: int, log=print) -> dict:
+            state_dir: Path, round_base: dict, n_versions: int,
+            reserve_hours: float = 0.0, log=print) -> dict:
     """Run the recursive self-improvement loop and return its final state."""
     state_dir.mkdir(parents=True, exist_ok=True)
     spec_path = state_dir / "policy.json"
     spec = (json.loads(spec_path.read_text()) if spec_path.exists()
             else {"kind": "parallel_refine", "params": {}})
+
+    budget = None
+    if reserve_hours > 0:
+        remaining = read_quota()
+        if remaining is None:
+            log("could not read the GPU quota; running without a budget guard")
+        else:
+            budget = Budget(remaining, reserve_hours)
+            log(f"GPU budget: {remaining:.2f} h remaining, {reserve_hours:.1f} h "
+                f"reserved for the submission fit, "
+                f"{budget.searchable_hours:.2f} h searchable")
 
     summary = []
     for t in range(1, iterations + 1):
@@ -93,7 +123,7 @@ def iterate(*, iterations: int, workers: int, max_rounds: int, executor,
         tree = online_rollout(
             build_policy(spec), DiscoveryAgent(seed=t), executor,
             workers=workers, max_rounds=max_rounds, round_base=round_base,
-            tree_meta={"iteration": t, "policy": spec}, log=log)
+            tree_meta={"iteration": t, "policy": spec}, budget=budget, log=log)
         tree.save(state_dir / f"tree_{int(time.time())}_{tree.id}.json")
 
         best = tree.best()
@@ -136,6 +166,8 @@ def main() -> None:
     ap.add_argument("--versions", type=int, default=40, help="policies per dream")
     ap.add_argument("--proxy-train", type=int, default=600)
     ap.add_argument("--proxy-val", type=int, default=200)
+    ap.add_argument("--reserve-hours", type=float, default=6.0,
+                    help="GPU hours withheld from the search for the final fit")
     ap.add_argument("--state-dir", type=Path, default=STATE / "rsi")
     args = ap.parse_args()
 
@@ -144,6 +176,7 @@ def main() -> None:
     out = iterate(
         iterations=args.iterations, workers=args.workers, max_rounds=args.max_rounds,
         executor=executor, state_dir=args.state_dir, n_versions=args.versions,
+        reserve_hours=args.reserve_hours,
         round_base={"proxy_train_images": args.proxy_train,
                     "proxy_val_images": args.proxy_val},
     )
