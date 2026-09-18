@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-BUILD = REPO / "kernels" / "hod26_round" / "build"
+BUILD_ROOT = REPO / "kernels" / "hod26_round" / "build"
 
 
 class KernelError(RuntimeError):
@@ -37,18 +37,24 @@ class KaggleRoundExecutor:
         self.poll_seconds = poll_seconds
         self.timeout_hours = timeout_hours
         self.out_dir = Path(out_dir or REPO / "runs" / "kernel_output")
+        # One build directory per kernel. Concurrent tracks previously generated
+        # into a shared directory, so whichever built last decided what both
+        # pushed -- one track could ship the other's source under the other's
+        # slug, silently crossing two experiments.
+        self.build_dir = BUILD_ROOT / slug.replace("/", "__")
 
     # -- lifecycle --------------------------------------------------------
     def push(self, round_cfg: dict) -> None:
-        cfg_path = BUILD.parent / "round_config.json"
-        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        self.build_dir.mkdir(parents=True, exist_ok=True)
+        cfg_path = self.build_dir / "round_config.json"
         cfg_path.write_text(json.dumps(round_cfg, indent=2))
         subprocess.run(
             ["python3", str(REPO / "tools" / "build_kernel.py"),
-             "--round-config", str(cfg_path), "--slug", self.slug],
+             "--round-config", str(cfg_path), "--slug", self.slug,
+             "--out-dir", str(self.build_dir)],
             check=True, capture_output=True, text=True,
         )
-        _kaggle("kernels", "push", "-p", str(BUILD))
+        _kaggle("kernels", "push", "-p", str(self.build_dir))
 
     def status(self) -> str:
         """Current session state, or "pending" if there is no session yet.
