@@ -104,21 +104,29 @@ def main() -> None:
         have = wait_for_quota(args.need_hours)
         print(f"proceeding with {have:.2f} GPU-h available")
 
-    results = {}
+    # Kaggle allows two concurrent GPU sessions, which is exactly the number of
+    # tracks -- so both fits are pushed first and then waited on together. Run
+    # sequentially they would cost the sum of their wall clocks; run together
+    # they cost the longer of the two.
+    pending = {}
     for track in args.tracks:
         state = REPO / "runs" / f"rsi_{track}"
         cand = full_candidate(track, mode, state, args.epochs, args.imgsz)
-        print(f"\n=== {track}: {cand['train']['model']} / {mode} / "
+        print(f"=== {track}: {cand['train']['model']} / {mode} / "
               f"{cand['train']['epochs']}ep / augment x{1 + cand['augment']['copies']} ===")
-
         ex = KaggleRoundExecutor(f"xishengfeng/hod26-final-{track}", timeout_hours=11.0,
                                  out_dir=REPO / "runs" / f"final_{track}")
         # Hold out the search's own validation split so the two tracks are
         # comparable; fitting on everything would score each on data it saw.
         ex.push({"round": f"final-{track}", "candidates": [],
                  "submit": {"candidate": cand, "use_all_train": False}})
+        print(f"  pushed {ex.slug}")
+        pending[track] = (ex, cand)
+
+    results = {}
+    for track, (ex, cand) in pending.items():
         state_str = ex.wait()
-        print(f"  kernel finished: {state_str}")
+        print(f"\n{track}: kernel finished: {state_str}")
         try:
             payload = ex.fetch()
         except Exception as e:                       # noqa: BLE001
