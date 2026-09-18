@@ -19,7 +19,7 @@ CHANNEL_MODES = [
     "pseudo_rgb",      # bands 0,1,2 -- the demo baseline
     "spread_rgb",      # bands 0,7,15 -- widest spectral spacing in 3 channels
     "pca3",            # first 3 principal components over bands
-    "band_stack",      # all 16 bands as input channels
+    "band_stack",      # all 16 bands as input channels (multi-page TIFF)
     "rgb_plus_ratio",  # 3 bands + normalized band-ratio channels
 ]
 
@@ -105,9 +105,13 @@ def normalize(cfg: dict) -> dict:
     cfg["channels"]["bands"] = _BANDS_FOR_MODE[cfg["channels"]["mode"]]
     if cfg["channels"]["stretch_hi"] <= cfg["channels"]["stretch_lo"]:
         cfg["channels"]["stretch_hi"] = 100.0
-    # band_stack needs 16 input channels, which rules out COCO-pretrained RGB
-    # weights unless the stem is re-inflated; flag it so the kernel handles it.
+    # Ultralytics builds the model with ch=data["channels"], so 16-band input
+    # needs no patching -- but COCO weights cannot transfer into a 16-channel
+    # stem, so that one layer trains from scratch while the rest is pretrained.
     cfg["train"]["in_channels"] = 16 if cfg["channels"]["mode"] == "band_stack" else 3
+    if cfg["train"]["in_channels"] != 3:
+        # Ultralytics skips HSV on non-3-channel input anyway; make it explicit.
+        cfg["train"]["hsv_h"] = cfg["train"]["hsv_s"] = cfg["train"]["hsv_v"] = 0.0
     if cfg["fidelity"] == "proxy":
         cfg["train"]["epochs"] = min(cfg["train"]["epochs"], 18)
         cfg["train"]["imgsz"] = min(cfg["train"]["imgsz"], 768)

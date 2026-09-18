@@ -89,16 +89,30 @@ def test_datapath(tmp_root: Path) -> None:
     anns = {p: k.parse(ann_dir / f"{p}.xml") for p in ids}
     index = k.frame_index(root, "train", ids)
 
-    for mode in [m for m in CHANNEL_MODES if m != "band_stack"]:
+    import cv2
+
+    for mode in CHANNEL_MODES:
         cand = seed_candidate(channels__mode=mode)
+        n_ch = cand["train"]["in_channels"]
+        ext = ".tiff" if n_ch > 3 else ".png"
         ds = k.WORK / f"ds_{k.channels_key(cand['channels'])}"
         yaml = k.materialize(cand, index, train_ids, val_ids, anns, ds)
         assert yaml.exists()
+        assert f"channels: {n_ch}" in yaml.read_text(), (mode, yaml.read_text())
+
         for split, split_ids in (("train", train_ids), ("val", val_ids)):
-            imgs = sorted((ds / "images" / split).glob("*.png"))
+            imgs = sorted((ds / "images" / split).glob(f"*{ext}"))
             assert len(imgs) == len(split_ids), (mode, split, len(imgs))
-            arr = np.array(Image.open(imgs[0]))
-            assert arr.ndim == 3 and arr.shape[2] == 3 and arr.dtype == np.uint8, arr.shape
+            # Read it exactly the way ultralytics.utils.patches.imread does, so
+            # the test fails here rather than on a GPU if that path changes.
+            buf = np.fromfile(imgs[0], np.uint8)
+            if ext == ".tiff":
+                ok, frames = cv2.imdecodemulti(buf, cv2.IMREAD_UNCHANGED)
+                assert ok and len(frames) == n_ch, (mode, len(frames) if ok else "decode failed")
+                arr = np.stack(frames, axis=2)
+            else:
+                arr = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+            assert arr.shape[2] == n_ch and arr.dtype == np.uint8, (mode, arr.shape, arr.dtype)
         # rendering twice must reuse, not rebuild
         assert k.materialize(cand, index, train_ids, val_ids, anns, ds) == yaml
 
@@ -125,7 +139,8 @@ def test_datapath(tmp_root: Path) -> None:
         raise AssertionError("data_root() accepted a missing dataset")
 
     print(f"OK: {len(ids)} ids, {len(train_ids)}/{len(val_ids)} split, "
-          f"{len(CHANNEL_MODES) - 1} channel modes, labels verified against XML")
+          f"{len(CHANNEL_MODES)} channel modes (incl. 16-band TIFF), "
+          f"labels verified against XML")
 
 
 if __name__ == "__main__":

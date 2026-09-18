@@ -361,6 +361,7 @@ tools/build_kernel.py -- this file is the round-specific part only.
 import hashlib, json, os, shutil, time, traceback
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 # The competition cannot be attached as a kernel source (Kaggle drops
@@ -426,8 +427,32 @@ def build_channels(cube, spec):
         z = cube[:, :, 15].astype(np.float32)
         nd = (z - a) / (z + a + 1e-6)          # normalized difference: material cue
         return np.dstack([stretch(a, lo, hi), stretch(z, lo, hi), stretch(nd, lo, hi)])
+    if mode == "band_stack":
+        # Every band as its own input channel. Ultralytics reads this natively:
+        # a multi-page TIFF is decoded with imdecodemulti and stacked on axis 2,
+        # the model is built with ch=data["channels"], and the HSV augmentation
+        # skips anything that is not 3-channel.
+        return np.dstack([stretch(cube[:, :, b], lo, hi) for b in range(cube.shape[2])])
     bands = spec["bands"][:3]
     return np.dstack([stretch(cube[:, :, b], lo, hi) for b in bands])
+
+
+def write_frame(path_stem, img):
+    """Persist a rendered frame; >3 channels need a multi-page TIFF.
+
+    cv2 cannot put 16 channels in a PNG, but ultralytics' reader decodes a
+    multi-page TIFF with imdecodemulti and stacks the pages into (H, W, N).
+    """
+    if img.shape[2] > 3:
+        path = path_stem.with_suffix(".tiff")
+        ok = cv2.imwritemulti(str(path), [np.ascontiguousarray(img[:, :, c])
+                                          for c in range(img.shape[2])])
+    else:
+        path = path_stem.with_suffix(".png")
+        ok = cv2.imwrite(str(path), np.ascontiguousarray(img))
+    if not ok:
+        raise RuntimeError(f"failed to write {path}")
+    return path
 
 
 def channels_key(spec):
@@ -436,14 +461,13 @@ def channels_key(spec):
     return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:10]
 
 
-def materialize(cand, index, train_ids, val_ids, anns, root):
+def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
     """Write the YOLO dataset this candidate trains on, reusing it if rendered.
 
     Rendering is keyed on the channel spec alone, so a round that varies only
     imgsz, epochs or NMS settings encodes its images once instead of per
     candidate.
     """
-    import cv2
     if (root / "data.yaml").exists():
         log(f"  reusing rendered dataset {root.name}")
         return root / "data.yaml"
@@ -460,9 +484,8 @@ def materialize(cand, index, train_ids, val_ids, anns, root):
             # that training and inference write and read them the same way.
             # cv2.imwrite returns False (it does not raise) on a bad buffer, and
             # a non-contiguous view is one -- hence the explicit check.
-            dst = root / "images" / split / f"{pid}.png"
-            if not cv2.imwrite(str(dst), np.ascontiguousarray(img)):
-                raise RuntimeError(f"cv2.imwrite failed for {dst}")
+            n_ch = img.shape[2]
+            write_frame(root / "images" / split / str(pid), img)
             a = anns[pid]
             lines = []
             for b in a.boxes:
@@ -474,13 +497,15 @@ def materialize(cand, index, train_ids, val_ids, anns, root):
             (root / "labels" / split / f"{pid}.txt").write_text("\n".join(lines))
 
     for split, ids in (("train", train_ids), ("val", val_ids)):
-        n = len(list((root / "images" / split).glob("*.png")))
+        n = len(list((root / "images" / split).glob("*.png"))) + \
+            len(list((root / "images" / split).glob("*.tiff")))
         if n == 0 or n != len(ids):
             raise RuntimeError(f"{split}: wrote {n} images, expected {len(ids)}")
 
     yaml = root / "data.yaml"
     yaml.write_text(
         f"path: {root}\ntrain: images/train\nval: images/val\n"
+        f"channels: {n_ch}\n"
         f"nc: {len(CLASSES)}\nnames: {json.dumps(CLASSES)}\n"
     )
     return yaml
@@ -522,7 +547,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     )
 
     preds = []
-    paths = [str(root / "images" / "val" / f"{pid}.png") for pid in val_ids]
+    ext = ".tiff" if cand["train"].get("in_channels", 3) > 3 else ".png"
+    paths = [str(root / "images" / "val" / f"{pid}{ext}") for pid in val_ids]
     for lo in range(0, len(paths), PREDICT_BATCH):
         chunk = paths[lo:lo + PREDICT_BATCH]
         for pid, r in zip(val_ids[lo:lo + PREDICT_BATCH],
@@ -538,22 +564,20 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
 
 def predict_test(model, cand, test_dir, png_ids):
     """Run the trained model over the test set at cube resolution."""
-    import cv2
     inf = cand["infer"]
-    preds, sizes = [], {}
+    preds, sizes, staged = [], {}, {}
     staging = WORK / "test_images"
     staging.mkdir(parents=True, exist_ok=True)
     for n, pid in enumerate(png_ids):
         img = build_channels(load_planar(test_dir / f"{pid}.png"), cand["channels"])
         sizes[pid] = (img.shape[1], img.shape[0])
-        if not cv2.imwrite(str(staging / f"{pid}.png"), np.ascontiguousarray(img)):
-            raise RuntimeError(f"cv2.imwrite failed for {pid}")
+        staged[pid] = write_frame(staging / str(pid), img)
         if n % 250 == 0:
             log(f"  staged {n}/{len(png_ids)}")
 
     for lo in range(0, len(png_ids), PREDICT_BATCH):
         ids = png_ids[lo:lo + PREDICT_BATCH]
-        chunk = [str(staging / f"{pid}.png") for pid in ids]
+        chunk = [str(staged[pid]) for pid in ids]
         for pid, r in zip(ids, model.predict(chunk, conf=inf["conf"], iou=inf["iou"],
                                              max_det=inf["max_det"], augment=inf["tta"],
                                              verbose=False, stream=False)):
