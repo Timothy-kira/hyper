@@ -1,0 +1,134 @@
+"""End-to-end check of the kernel's data path, without a GPU.
+
+Everything the round kernel does before it hands a dataset to ultralytics is
+exercised here against a miniature dataset built from the sample frames. The
+two smoke failures on Kaggle were both in this stretch of code, and each cost a
+push-and-wait cycle to discover; this catches that class of bug locally.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "src"))
+
+from hod26.cube import load_cube, to_planar  # noqa: E402
+from hod26.voc import CLASSES, parse  # noqa: E402
+
+SAMPLES = [10, 440, 558]
+
+
+def build_fake_dataset(dest: Path, n_train: int = 12, n_test: int = 4) -> Path:
+    """A planar dataset shaped like the real one, from the checked-in samples."""
+    if dest.exists():
+        shutil.rmtree(dest)
+    (dest / "train" / "images").mkdir(parents=True)
+    (dest / "train" / "annotations").mkdir(parents=True)
+    (dest / "test" / "images").mkdir(parents=True)
+
+    for i in range(n_train):
+        base = SAMPLES[i % len(SAMPLES)]
+        pid = 1000 + i
+        Image.fromarray(to_planar(load_cube(REPO / f"sample/img/{base}.png"))).save(
+            dest / "train" / "images" / f"{pid}.png", compress_level=1)
+        xml = (REPO / f"sample/ann/{base}.xml").read_text()
+        (dest / "train" / "annotations" / f"{pid}.xml").write_text(
+            xml.replace(f"<filename>{base}.png", f"<filename>{pid}.png"))
+
+    for i in range(n_test):
+        base = SAMPLES[i % len(SAMPLES)]
+        Image.fromarray(to_planar(load_cube(REPO / f"sample/img/{base}.png"))).save(
+            dest / "test" / "images" / f"{2000 + i}.png", compress_level=1)
+    return dest
+
+
+def load_kernel(work: Path, data: Path):
+    """Import the generated kernel with its pip bootstrap and paths neutralized."""
+    build = REPO / "kernels" / "hod26_round" / "build" / "hod26_round.py"
+    if not build.exists():
+        raise RuntimeError("run tools/build_kernel.py first")
+    spec = importlib.util.spec_from_file_location("hod26_kernel_under_test", build)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    real_run, subprocess.run = subprocess.run, lambda *a, **k: None
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        subprocess.run = real_run
+    mod.DATA, mod.WORK = data, work
+    work.mkdir(parents=True, exist_ok=True)
+    return mod
+
+
+def test_datapath(tmp_root: Path) -> None:
+    from dream_rsi.candidate import CHANNEL_MODES, seed_candidate
+
+    data = build_fake_dataset(tmp_root / "input" / "hod26-planar")
+    k = load_kernel(tmp_root / "work", data)
+
+    root = k.data_root()
+    assert root == data, root
+
+    ann_dir = root / "train" / "annotations"
+    ids = k.require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
+    train_ids, val_ids = k.split_ids(ids)
+    assert train_ids and val_ids and not set(train_ids) & set(val_ids)
+    # The split must not drift between candidates or rounds, or scores in the
+    # discovery tree stop being comparable.
+    assert (train_ids, val_ids) == k.split_ids(list(reversed(ids)))
+
+    anns = {p: k.parse(ann_dir / f"{p}.xml") for p in ids}
+    index = k.frame_index(root, "train", ids)
+
+    for mode in [m for m in CHANNEL_MODES if m != "band_stack"]:
+        cand = seed_candidate(channels__mode=mode)
+        ds = k.WORK / f"ds_{k.channels_key(cand['channels'])}"
+        yaml = k.materialize(cand, index, train_ids, val_ids, anns, ds)
+        assert yaml.exists()
+        for split, split_ids in (("train", train_ids), ("val", val_ids)):
+            imgs = sorted((ds / "images" / split).glob("*.png"))
+            assert len(imgs) == len(split_ids), (mode, split, len(imgs))
+            arr = np.array(Image.open(imgs[0]))
+            assert arr.ndim == 3 and arr.shape[2] == 3 and arr.dtype == np.uint8, arr.shape
+        # rendering twice must reuse, not rebuild
+        assert k.materialize(cand, index, train_ids, val_ids, anns, ds) == yaml
+
+    # labels must be YOLO-normalized and agree with the source XML
+    pid = train_ids[0]
+    ann = anns[pid]
+    ds = k.WORK / f"ds_{k.channels_key(seed_candidate()['channels'])}"
+    rows = (ds / "labels" / "train" / f"{pid}.txt").read_text().strip().splitlines()
+    assert len(rows) == len(ann.boxes)
+    for row, box in zip(rows, ann.boxes):
+        cls, cx, cy, bw, bh = row.split()
+        assert int(cls) == box.cls_id
+        assert abs(float(cx) - (box.x1 + box.x2) / 2 / ann.width) < 1e-6
+        assert abs(float(bh) - (box.y2 - box.y1) / ann.height) < 1e-6
+        assert 0 <= float(cx) <= 1 and 0 <= float(cy) <= 1
+
+    # a missing dataset must name what /kaggle/input actually holds
+    k.DATA = tmp_root / "nope"
+    try:
+        load_kernel(tmp_root / "work2", tmp_root / "nope").data_root()
+    except FileNotFoundError as e:
+        assert "/kaggle/input" in str(e)
+    else:
+        raise AssertionError("data_root() accepted a missing dataset")
+
+    print(f"OK: {len(ids)} ids, {len(train_ids)}/{len(val_ids)} split, "
+          f"{len(CHANNEL_MODES) - 1} channel modes, labels verified against XML")
+
+
+if __name__ == "__main__":
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        test_datapath(Path(td))
