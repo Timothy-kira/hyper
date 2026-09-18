@@ -34,45 +34,62 @@ def _looks_like_dataset(p):
 
 
 def data_root():
-    """Locate the planar dataset.
+    """Locate the planar dataset wherever Kaggle decided to mount it.
 
-    Kaggle may serve an upload extracted, nested one level down, or still as the
-    archives the CLI produced -- accept all three rather than spend a kernel
-    session discovering which one happened.
+    The mount layout is not stable between kernels: the same dataset has come up
+    at /kaggle/input/<slug>/ on one kernel and nested under
+    /kaggle/input/datasets/... on another, and an upload may also still be in the
+    archives the CLI produced. Guessing the shape cost a GPU session, so this
+    searches for the directory that actually holds the split instead, bounded in
+    depth so it cannot wander a large input tree.
     """
-    candidates = [DATA]
-    if Path("/kaggle/input").exists():
-        candidates += sorted(Path("/kaggle/input").glob("*"))
+    roots = [DATA, Path("/kaggle/input")]
 
-    for cand in candidates:
-        if not cand.exists():
-            continue
-        for probe in (cand, cand / "hod26_planar"):
-            if _looks_like_dataset(probe):
-                return probe
+    def search(base, depth=5):
+        if not base.exists():
+            return None
+        stack = [(base, 0)]
+        while stack:
+            d, k = stack.pop()
+            if _looks_like_dataset(d):
+                return d
+            if k >= depth:
+                continue
+            try:
+                stack.extend((c, k + 1) for c in sorted(d.iterdir()) if c.is_dir())
+            except OSError:
+                continue
+        return None
 
-    for cand in candidates:                       # fall back to archives
-        zips = sorted(cand.glob("*.zip")) if cand.is_dir() else []
-        if not zips:
-            continue
+    for base in roots:
+        hit = search(base)
+        if hit is not None:
+            return hit
+
+    # Nothing extracted: fall back to any archives found in the input tree.
+    zips = sorted(Path("/kaggle/input").rglob("*.zip")) if Path("/kaggle/input").exists() else []
+    if zips:
         out = WORK / "unpacked"
         out.mkdir(parents=True, exist_ok=True)
         for z in zips:
             log(f"  unpacking {z.name}")
             with zipfile.ZipFile(z) as zf:
                 zf.extractall(out / z.stem)
-        for extra in cand.glob("*.json"):
-            shutil.copy(extra, out / extra.name)
-        # Whether the CLI kept a "train/" prefix inside each archive is not
-        # knowable from here, so find the directory that actually holds the
-        # split rather than guessing the nesting.
-        for d in [out, *(p for p in out.rglob("*") if p.is_dir())]:
-            if _looks_like_dataset(d):
-                return d
+        hit = search(out)
+        if hit is not None:
+            return hit
 
-    listing = sorted(p.name for p in Path("/kaggle/input").iterdir()) \
-        if Path("/kaggle/input").exists() else "/kaggle/input does not exist"
-    raise FileNotFoundError(f"planar dataset not attached. /kaggle/input holds: {listing}")
+    listing = []
+    if Path("/kaggle/input").exists():
+        for d, _, files in os.walk("/kaggle/input"):
+            rel = Path(d).relative_to("/kaggle/input")
+            if len(rel.parts) <= 3:
+                listing.append(f"{rel}({len(files)} files)")
+            if len(listing) > 40:
+                break
+    raise FileNotFoundError(
+        "planar dataset not attached; nothing under /kaggle/input holds "
+        f"train/annotations. Tree: {listing}")
 
 
 def require_ids(ids, where):
