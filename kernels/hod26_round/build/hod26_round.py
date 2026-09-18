@@ -71,6 +71,31 @@ def pseudo_rgb(cube: np.ndarray, bands=(0, 1, 2), **kw) -> np.ndarray:
     """Per-band-stretched 3-channel composite — the organizers' demo default."""
     return np.dstack([stretch(cube[:, :, b], **kw) for b in bands])
 
+
+def to_planar(cube: np.ndarray) -> np.ndarray:
+    """Stack an (H, W, 16) cube's bands vertically into one (16H, W) frame.
+
+    Band-planar storage puts spatially adjacent pixels next to each other
+    instead of interleaving bands, which PNG compresses to roughly a third of
+    the shipped mosaic's size without loss.
+    """
+    h, w, b = cube.shape
+    return np.ascontiguousarray(cube.transpose(2, 0, 1).reshape(b * h, w))
+
+
+def from_planar(planar: np.ndarray, n_bands: int = N_BANDS) -> np.ndarray:
+    """Inverse of :func:`to_planar`."""
+    bh, w = planar.shape
+    if bh % n_bands:
+        raise ValueError(f"planar height {bh} not divisible by {n_bands} bands")
+    return planar.reshape(n_bands, bh // n_bands, w).transpose(1, 2, 0)
+
+
+def load_planar(path, n_bands: int = N_BANDS) -> np.ndarray:
+    """Read a band-planar PNG back to an (H, W, 16) cube."""
+    with Image.open(path) as im:
+        return from_planar(np.array(im), n_bands)
+
 # ---- inlined from src/hod26/voc.py ------------------------------
 """Pascal VOC annotation handling for HOD26.
 
@@ -338,9 +363,11 @@ from pathlib import Path
 
 import numpy as np
 
-COMP = "/kaggle/input/hyperspectral-object-detection-challenge-2026"
+# The competition cannot be attached as a kernel source (Kaggle drops
+# competition_sources on push), so the frames arrive via a private dataset
+# holding them band-planar and already de-mosaiced.
+DATA = Path("/kaggle/input/hod26-planar")
 WORK = Path("/kaggle/working")
-CACHE = WORK / "cache"
 VAL_FRACTION = 0.2
 PREDICT_BATCH = 32
 CACHE_SEED = 20260918
@@ -350,13 +377,23 @@ def log(*a):
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
 
 
+def data_root():
+    """Locate the planar dataset, tolerating Kaggle's nesting of uploads."""
+    for cand in (DATA, *sorted(Path("/kaggle/input").glob("*"))):
+        if (cand / "train" / "annotations").is_dir():
+            return cand
+        nested = cand / "hod26_planar"
+        if (nested / "train" / "annotations").is_dir():
+            return nested
+    listing = sorted(p.name for p in Path("/kaggle/input").iterdir()) \
+        if Path("/kaggle/input").exists() else "/kaggle/input does not exist"
+    raise FileNotFoundError(f"planar dataset not attached. /kaggle/input holds: {listing}")
+
+
 def require_ids(ids, where):
     """A wrong data path must fail here, not as a confusing downstream error."""
     if not ids:
-        listing = sorted(p.name for p in Path(COMP).iterdir()) if Path(COMP).exists() \
-            else f"{COMP} does not exist"
-        raise FileNotFoundError(
-            f"no files matched under {where}. /kaggle/input contents: {listing}")
+        raise FileNotFoundError(f"no files matched under {where}")
     return ids
 
 
@@ -369,20 +406,6 @@ def split_ids(all_ids):
     n_val = int(round(len(ids) * VAL_FRACTION))
     val = {ids[i] for i in perm[:n_val]}
     return [i for i in ids if i not in val], [i for i in ids if i in val]
-
-
-def decode_all(png_dir, ids, out_dir):
-    """Decode every mosaic PNG to a uint16 cube memmap, once per session."""
-    out_dir.mkdir(parents=True, exist_ok=True)
-    index = {}
-    for n, pid in enumerate(ids):
-        dst = out_dir / f"{pid}.npy"
-        if not dst.exists():
-            np.save(dst, load_cube(png_dir / f"{pid}.png"))
-        index[pid] = dst
-        if n % 250 == 0:
-            log(f"  decoded {n}/{len(ids)}")
-    return index
 
 
 def build_channels(cube, spec):
@@ -418,7 +441,7 @@ def materialize(cand, index, train_ids, val_ids, anns, root):
 
     for split, ids in (("train", train_ids), ("val", val_ids)):
         for pid in ids:
-            img = build_channels(np.load(index[pid]), cand["channels"])
+            img = build_channels(load_planar(index[pid]), cand["channels"])
             # No BGR flip: these are spectral bands, not colour. What matters is
             # that training and inference write and read them the same way.
             # cv2.imwrite returns False (it does not raise) on a bad buffer, and
@@ -461,6 +484,12 @@ def _rows(pid, result):
             zip(xyxy, b.cls.cpu().numpy(), b.conf.cpu().numpy())]
 
 
+def frame_index(root, split, ids):
+    """Map each id to its band-planar frame; no de-mosaicing needed at run time."""
+    d = root / split / "images"
+    return {pid: d / f"{pid}.png" for pid in ids}
+
+
 def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     from ultralytics import YOLO
 
@@ -501,7 +530,7 @@ def predict_test(model, cand, test_dir, png_ids):
     staging = WORK / "test_images"
     staging.mkdir(parents=True, exist_ok=True)
     for n, pid in enumerate(png_ids):
-        img = build_channels(load_cube(test_dir / f"{pid}.png"), cand["channels"])
+        img = build_channels(load_planar(test_dir / f"{pid}.png"), cand["channels"])
         sizes[pid] = (img.shape[1], img.shape[0])
         if not cv2.imwrite(str(staging / f"{pid}.png"), np.ascontiguousarray(img)):
             raise RuntimeError(f"cv2.imwrite failed for {pid}")
@@ -524,9 +553,9 @@ def run_submission(round_cfg):
     from ultralytics import YOLO
 
     cand = round_cfg["submit"]["candidate"]
-    ann_dir = Path(COMP) / "data_train/data_train/Annotations/VIS"
-    png_dir = Path(COMP) / "data_train/data_train/VIS"
-    test_dir = Path(COMP) / "data_test/data_test/VIS"
+    root = data_root()
+    ann_dir = root / "train" / "annotations"
+    test_dir = root / "test" / "images"
 
     ids = require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
     train_ids, val_ids = split_ids(ids)
@@ -536,7 +565,7 @@ def run_submission(round_cfg):
     log(f"submission fit: {len(train_ids)} train / {len(val_ids)} val")
 
     anns = {pid: parse(ann_dir / f"{pid}.xml") for pid in set(train_ids) | set(val_ids)}
-    index = decode_all(png_dir, sorted(set(train_ids) | set(val_ids)), CACHE)
+    index = frame_index(root, "train", sorted(set(train_ids) | set(val_ids)))
     scores, _, weights = run_candidate(cand, index, train_ids, val_ids, anns, "final")
     log(f"fit done; holdout mAP={scores['mAP']:.4f} (optimistic: seen in training)")
 
@@ -560,8 +589,8 @@ def main():
     if round_cfg.get("submit"):
         return run_submission(round_cfg)
 
-    ann_dir = Path(COMP) / "data_train/data_train/Annotations/VIS"
-    png_dir = Path(COMP) / "data_train/data_train/VIS"
+    root = data_root()
+    ann_dir = root / "train" / "annotations"
     ids = require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
     train_ids, val_ids = split_ids(ids)
 
@@ -572,8 +601,7 @@ def main():
     log(f"{len(train_ids)} train / {len(val_ids)} val images")
 
     anns = {pid: parse(ann_dir / f"{pid}.xml") for pid in train_ids + val_ids}
-    log("decoding cubes (once for the whole round)")
-    index = decode_all(png_dir, train_ids + val_ids, CACHE)
+    index = frame_index(root, "train", train_ids + val_ids)
 
     results = []
     for cand_entry in round_cfg["candidates"]:

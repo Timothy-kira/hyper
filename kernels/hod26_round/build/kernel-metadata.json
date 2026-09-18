@@ -7,9 +7,9 @@
   "is_private": true,
   "enable_gpu": true,
   "enable_internet": true,
-  "competition_sources": [
-    "hyperspectral-object-detection-challenge-2026"
+  "competition_sources": [],
+  "dataset_sources": [
+    "xishengfeng/hod26-planar"
   ],
-  "dataset_sources": [],
   "kernel_sources": []
 }

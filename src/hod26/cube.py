@@ -63,3 +63,28 @@ def stretch(band: np.ndarray, lo_pct: float = 0.0, hi_pct: float = 100.0) -> np.
 def pseudo_rgb(cube: np.ndarray, bands=(0, 1, 2), **kw) -> np.ndarray:
     """Per-band-stretched 3-channel composite — the organizers' demo default."""
     return np.dstack([stretch(cube[:, :, b], **kw) for b in bands])
+
+
+def to_planar(cube: np.ndarray) -> np.ndarray:
+    """Stack an (H, W, 16) cube's bands vertically into one (16H, W) frame.
+
+    Band-planar storage puts spatially adjacent pixels next to each other
+    instead of interleaving bands, which PNG compresses to roughly a third of
+    the shipped mosaic's size without loss.
+    """
+    h, w, b = cube.shape
+    return np.ascontiguousarray(cube.transpose(2, 0, 1).reshape(b * h, w))
+
+
+def from_planar(planar: np.ndarray, n_bands: int = N_BANDS) -> np.ndarray:
+    """Inverse of :func:`to_planar`."""
+    bh, w = planar.shape
+    if bh % n_bands:
+        raise ValueError(f"planar height {bh} not divisible by {n_bands} bands")
+    return planar.reshape(n_bands, bh // n_bands, w).transpose(1, 2, 0)
+
+
+def load_planar(path, n_bands: int = N_BANDS) -> np.ndarray:
+    """Read a band-planar PNG back to an (H, W, 16) cube."""
+    with Image.open(path) as im:
+        return from_planar(np.array(im), n_bands)

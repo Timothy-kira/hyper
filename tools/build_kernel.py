@@ -68,8 +68,8 @@ def main() -> None:
         "is_private": True,
         "enable_gpu": True,
         "enable_internet": True,
-        "competition_sources": ["hyperspectral-object-detection-challenge-2026"],
-        "dataset_sources": [],
+        "competition_sources": [],
+        "dataset_sources": ["xishengfeng/hod26-planar"],
         "kernel_sources": [],
     }, indent=2))
     print(f"wrote {script} ({script.stat().st_size} bytes)")
