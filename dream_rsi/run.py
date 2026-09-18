@@ -10,11 +10,12 @@ gain between iterations is attributable to exploration, not to a moving target.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import json
 import time
 from pathlib import Path
 
-from .budget import Budget, estimate_round_hours, read_quota
+from .budget import estimate_round_hours, make_budget
 from .candidate import DiscoveryAgent
 from .dream import dream
 from .executor import KaggleRoundExecutor, LocalMockExecutor
@@ -99,7 +100,7 @@ def online_rollout(policy, agent, executor, *, workers: int, max_rounds: int,
 
 def iterate(*, iterations: int, workers: int, max_rounds: int, executor,
             state_dir: Path, round_base: dict, n_versions: int,
-            reserve_hours: float = 0.0, log=print) -> dict:
+            reserve_hours: float = 0.0, deadline=None, log=print) -> dict:
     """Run the recursive self-improvement loop and return its final state."""
     state_dir.mkdir(parents=True, exist_ok=True)
     spec_path = state_dir / "policy.json"
@@ -108,13 +109,16 @@ def iterate(*, iterations: int, workers: int, max_rounds: int, executor,
 
     budget = None
     if reserve_hours > 0:
-        remaining = read_quota()
-        if remaining is None:
+        budget = make_budget(reserve_hours, needed_by=deadline)
+        if budget is None:
             log("could not read the GPU quota; running without a budget guard")
+        elif budget.expires_soon:
+            log(f"GPU budget: {budget.remaining_hours:.2f} h remaining, and the "
+                f"allowance refreshes before the submission is due -- spending all "
+                f"of it on the search, since unused hours are lost at the refresh")
         else:
-            budget = Budget(remaining, reserve_hours)
-            log(f"GPU budget: {remaining:.2f} h remaining, {reserve_hours:.1f} h "
-                f"reserved for the submission fit, "
+            log(f"GPU budget: {budget.remaining_hours:.2f} h remaining, "
+                f"{reserve_hours:.1f} h reserved for the submission fit, "
                 f"{budget.searchable_hours:.2f} h searchable")
 
     summary = []
@@ -166,8 +170,11 @@ def main() -> None:
     ap.add_argument("--versions", type=int, default=40, help="policies per dream")
     ap.add_argument("--proxy-train", type=int, default=600)
     ap.add_argument("--proxy-val", type=int, default=200)
-    ap.add_argument("--reserve-hours", type=float, default=6.0,
+    ap.add_argument("--reserve-hours", type=float, default=7.0,
                     help="GPU hours withheld from the search for the final fit")
+    ap.add_argument("--deadline", default="2026-09-24T16:00:00+00:00",
+                    help="competition deadline; a quota refresh before it means "
+                         "the current allowance is use-it-or-lose-it")
     ap.add_argument("--state-dir", type=Path, default=STATE / "rsi")
     args = ap.parse_args()
 
@@ -177,6 +184,7 @@ def main() -> None:
         iterations=args.iterations, workers=args.workers, max_rounds=args.max_rounds,
         executor=executor, state_dir=args.state_dir, n_versions=args.versions,
         reserve_hours=args.reserve_hours,
+        deadline=dt.datetime.fromisoformat(args.deadline),
         round_base={"proxy_train_images": args.proxy_train,
                     "proxy_val_images": args.proxy_val},
     )

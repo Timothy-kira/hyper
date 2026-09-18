@@ -299,12 +299,12 @@ def write(path, preds, clip_to: dict[int, tuple[int, int]] | None = None) -> int
 
 ROUND_CONFIG = json.loads(r'''
 {
-  "round": "smoke",
-  "proxy_train_images": 200,
-  "proxy_val_images": 80,
+  "round": "scorecheck",
+  "proxy_train_images": 150,
+  "proxy_val_images": 60,
   "candidates": [
     {
-      "node_id": "rtdetr3ch",
+      "node_id": "scorecheck",
       "candidate": {
         "channels": {
           "mode": "pseudo_rgb",
@@ -320,11 +320,11 @@ ROUND_CONFIG = json.loads(r'''
         "train": {
           "model": "rtdetr-l",
           "imgsz": 640,
-          "epochs": 5,
+          "epochs": 4,
           "batch": 4,
           "lr0": 0.01,
           "mosaic": 1.0,
-          "close_mosaic": 4,
+          "close_mosaic": 3,
           "hsv_h": 0.0,
           "hsv_s": 0.4,
           "hsv_v": 0.4,
@@ -332,61 +332,6 @@ ROUND_CONFIG = json.loads(r'''
           "scale": 0.5,
           "cos_lr": true,
           "in_channels": 3,
-          "amp": false,
-          "deterministic": false
-        },
-        "infer": {
-          "conf": 0.001,
-          "iou": null,
-          "max_det": 300,
-          "tta": false,
-          "multi_scale": []
-        },
-        "fidelity": "proxy"
-      }
-    },
-    {
-      "node_id": "rtdetr16ch",
-      "candidate": {
-        "channels": {
-          "mode": "band_stack",
-          "bands": [
-            0,
-            1,
-            2,
-            3,
-            4,
-            5,
-            6,
-            7,
-            8,
-            9,
-            10,
-            11,
-            12,
-            13,
-            14,
-            15
-          ],
-          "stretch_lo": 0.0,
-          "stretch_hi": 100.0,
-          "per_image_norm": true
-        },
-        "train": {
-          "model": "rtdetr-l",
-          "imgsz": 640,
-          "epochs": 5,
-          "batch": 4,
-          "lr0": 0.01,
-          "mosaic": 1.0,
-          "close_mosaic": 4,
-          "hsv_h": 0.0,
-          "hsv_s": 0.0,
-          "hsv_v": 0.0,
-          "fliplr": 0.5,
-          "scale": 0.5,
-          "cos_lr": true,
-          "in_channels": 16,
           "amp": false,
           "deterministic": false
         },
