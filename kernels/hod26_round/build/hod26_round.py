@@ -300,11 +300,11 @@ def write(path, preds, clip_to: dict[int, tuple[int, int]] | None = None) -> int
 ROUND_CONFIG = json.loads(r'''
 {
   "round": "smoke",
-  "proxy_train_images": 100,
-  "proxy_val_images": 40,
+  "proxy_train_images": 200,
+  "proxy_val_images": 80,
   "candidates": [
     {
-      "node_id": "smoke",
+      "node_id": "smoke3ch",
       "candidate": {
         "channels": {
           "mode": "pseudo_rgb",
@@ -320,11 +320,11 @@ ROUND_CONFIG = json.loads(r'''
         "train": {
           "model": "yolo11n",
           "imgsz": 640,
-          "epochs": 3,
+          "epochs": 5,
           "batch": 8,
           "lr0": 0.01,
           "mosaic": 1.0,
-          "close_mosaic": 5,
+          "close_mosaic": 4,
           "hsv_h": 0.0,
           "hsv_s": 0.4,
           "hsv_v": 0.4,
@@ -332,6 +332,59 @@ ROUND_CONFIG = json.loads(r'''
           "scale": 0.5,
           "cos_lr": true,
           "in_channels": 3
+        },
+        "infer": {
+          "conf": 0.001,
+          "iou": 0.7,
+          "max_det": 300,
+          "tta": false,
+          "multi_scale": []
+        },
+        "fidelity": "proxy"
+      }
+    },
+    {
+      "node_id": "smoke16ch",
+      "candidate": {
+        "channels": {
+          "mode": "band_stack",
+          "bands": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15
+          ],
+          "stretch_lo": 0.0,
+          "stretch_hi": 100.0,
+          "per_image_norm": true
+        },
+        "train": {
+          "model": "yolo11n",
+          "imgsz": 640,
+          "epochs": 5,
+          "batch": 8,
+          "lr0": 0.01,
+          "mosaic": 1.0,
+          "close_mosaic": 4,
+          "hsv_h": 0.0,
+          "hsv_s": 0.0,
+          "hsv_v": 0.0,
+          "fliplr": 0.5,
+          "scale": 0.5,
+          "cos_lr": true,
+          "in_channels": 16
         },
         "infer": {
           "conf": 0.001,
@@ -569,10 +622,14 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     yaml = materialize(cand, index, train_ids, val_ids, anns, root)
     tr, inf = cand["train"], cand["infer"]
 
+    # Defensive clamp: a candidate that reached here without normalization must
+    # not burn a GPU session on an argument ultralytics will reject.
+    close_mosaic = min(tr.get("close_mosaic", 5), max(0, tr["epochs"] - 1))
+
     model = YOLO(f"{tr['model']}.pt")
     model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
-        lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=tr.get("close_mosaic", 5),
+        lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=close_mosaic,
         hsv_h=tr["hsv_h"], hsv_s=tr["hsv_s"], hsv_v=tr["hsv_v"],
         fliplr=tr["fliplr"], scale=tr["scale"], cos_lr=tr.get("cos_lr", True),
         project=str(WORK / "runs"), name=tag, exist_ok=True,

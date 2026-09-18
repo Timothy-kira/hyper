@@ -220,10 +220,14 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     yaml = materialize(cand, index, train_ids, val_ids, anns, root)
     tr, inf = cand["train"], cand["infer"]
 
+    # Defensive clamp: a candidate that reached here without normalization must
+    # not burn a GPU session on an argument ultralytics will reject.
+    close_mosaic = min(tr.get("close_mosaic", 5), max(0, tr["epochs"] - 1))
+
     model = YOLO(f"{tr['model']}.pt")
     model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
-        lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=tr.get("close_mosaic", 5),
+        lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=close_mosaic,
         hsv_h=tr["hsv_h"], hsv_s=tr["hsv_s"], hsv_v=tr["hsv_v"],
         fliplr=tr["fliplr"], scale=tr["scale"], cos_lr=tr.get("cos_lr", True),
         project=str(WORK / "runs"), name=tag, exist_ok=True,
