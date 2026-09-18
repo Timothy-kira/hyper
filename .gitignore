@@ -12,3 +12,8 @@ work/
 # credentials must never enter the repo
 kaggle.json
 access_token*
+# Generated per round by tools/build_kernel.py from driver.py + the round config;
+# the loop rewrites them on every rollout, so tracking them would add a commit
+# of machine-generated churn per round.
+kernels/hod26_round/build/
+kernels/hod26_round/round_config.json
