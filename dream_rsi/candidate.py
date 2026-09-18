@@ -182,9 +182,24 @@ class DiscoveryAgent:
             # Expanding the root opens an *independent* workspace, so it must
             # land somewhere new. Only the very first attempt is the untouched
             # baseline -- that is the reading the tree measures every gain
-            # against. Later root expansions jump further to spread the search.
+            # against.
             if not history:
                 return seed_candidate(), "root: organizers' pseudo-RGB demo baseline"
+
+            # Channel construction is the axis the bottleneck analysis points at:
+            # the largest recoverable loss is material discrimination, which no
+            # amount of training-parameter tuning can address. One move in
+            # fourteen would reach a given mode about one time in a hundred, so
+            # a new branch covers an untried mode first and only then wanders.
+            seen_modes = {h["candidate"]["channels"]["mode"] for h in history}
+            untried = [m for m in CHANNEL_MODES if m not in seen_modes]
+            if untried:
+                mode = self._rng.choice(untried)
+                cfg = normalize(seed_candidate(channels__mode=mode))
+                if self._sig(cfg) not in tried:
+                    return cfg, (f"root: channel mode {mode!r}, untried "
+                                 f"({len(untried) - 1} modes still unexplored)")
+
             parent_candidate = seed_candidate()
             n_moves = max(n_moves, 2)
         best = max((h for h in history if h.get("score") is not None),
