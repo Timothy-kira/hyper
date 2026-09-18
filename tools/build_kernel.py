@@ -59,9 +59,13 @@ def main() -> None:
     script.write_text(build(cfg))
 
     slug = args.slug or "xishengfeng/hod26-round"
+    # Kaggle derives the kernel slug from the title and warns when it disagrees
+    # with the id, so the title has to spell the same slug or a push can land on
+    # a different kernel than intended.
+    title = slug.split("/")[-1].replace("-", " ").title()
     (args.out_dir / "kernel-metadata.json").write_text(json.dumps({
         "id": slug,
-        "title": "HOD26 Round",
+        "title": title,
         "code_file": "hod26_round.py",
         "language": "python",
         "kernel_type": "script",
