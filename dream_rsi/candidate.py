@@ -28,6 +28,8 @@ CHANNEL_MODES = [
     "rgb_plus_ratio",  # 3 bands + normalized band-ratio channels
     "bandsel",         # the 3 bands most separable across material pairs
     "lda3",            # 16 -> 3 discriminant projection, pretrained stem intact
+    "bandgroup3",      # 3 contiguous band groups averaged: reduction that also
+                       # raises SNR, unlike picking single bands
 ]
 
 # Transformer detectors. RT-DETR is a hybrid-encoder DETR with IoU-aware query
@@ -68,6 +70,11 @@ DEFAULT: dict = {
         "fliplr": 0.5,
         "scale": 0.5,
         "cos_lr": True,
+        # Only meaningful when the input is wider than the pretrained stem.
+        # "adapter" learns a 48-parameter 16->3 mixer and leaves the pretrained
+        # convolution untouched; "seed" reparameterises the stem itself, which
+        # starts in the same place but lets all 4608 of its weights drift.
+        "spectral_stem": "adapter",
     },
     "infer": {
         "conf": 0.001,           # mAP rewards deep recall, not a clean top-1
@@ -113,6 +120,7 @@ _MOVES: dict[str, list] = {
     "augment.cutmix_prob": [0.0, 0.3, 0.5],
     "augment.cutmix_blocks": [16, 24, 40],
     "augment.copies": [0, 1, 2],
+    "train.spectral_stem": ["adapter", "seed"],
 }
 
 _BANDS_FOR_MODE = {
@@ -123,6 +131,7 @@ _BANDS_FOR_MODE = {
     "rgb_plus_ratio": [0, 7, 15],
     "bandsel": list(BEST_BANDS),
     "lda3": list(range(16)),
+    "bandgroup3": list(range(16)),
 }
 
 

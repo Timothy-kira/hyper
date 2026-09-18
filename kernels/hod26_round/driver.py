@@ -136,6 +136,11 @@ def build_channels(cube, spec):
         proj = (flat @ np.asarray(LDA_16_TO_3, np.float32).T).reshape(
             cube.shape[0], cube.shape[1], 3)
         return np.dstack([stretch(proj[:, :, c], lo, hi) for c in range(3)])
+    if mode == "bandgroup3":
+        n = cube.shape[2]
+        edges = [0, n // 3, 2 * n // 3, n]
+        return np.dstack([stretch(cube[:, :, edges[i]:edges[i + 1]].mean(axis=2), lo, hi)
+                          for i in range(3)])
     if mode == "bandsel":
         return np.dstack([stretch(cube[:, :, b], lo, hi) for b in BEST_BANDS])
     if mode == "band_stack":
@@ -333,6 +338,77 @@ def pretrained_stem_weight(name):
     return conv.weight.detach().float().clone()
 
 
+def attach_spectral_adapter(model, n_bands, projection):
+    """Put a trainable 1x1 band mixer in front of an untouched pretrained stem.
+
+    The alternative strategies each give something up. A fixed 3-channel
+    projection cannot adapt; replacing the stem with a projected 16-channel
+    kernel lets all 4608 of its weights drift away from what COCO learned. This
+    keeps the pretrained convolution exactly as trained and learns only the
+    16 -> 3 mixing -- 48 parameters, initialised to the offline discriminant, so
+    it starts where lda3 starts and can improve from there.
+
+    The literature on adapting RGB backbones to extra spectral bands converges
+    on this shape (UniRGB-IR 2404.17360, SpectralX 2508.01731), and the
+    measured gap between 12 and 202 bands under a pretrained backbone is small
+    (TerraMind 2603.06690) -- the pretrained spatial prior is worth more than
+    the extra spectral resolution, so the thing to protect is the prior.
+    """
+    import numpy as _np
+    import torch
+    import torch.nn as nn
+
+    def hook(trainer):
+        net = trainer.model
+        conv = first_conv(net)
+        if conv is None or conv.in_channels != n_bands:
+            return
+        P = _np.asarray(projection, dtype=_np.float32)
+        if P.shape[1] != n_bands:
+            log(f"  spectral adapter skipped: projection maps {P.shape[1]} bands, not {n_bands}")
+            return
+        out_ch = P.shape[0]
+
+        pre = pretrained_stem_weight_from(net, out_ch)
+        if pre is None:
+            log("  spectral adapter skipped: no pretrained stem of matching width")
+            return
+
+        mixer = nn.Conv2d(n_bands, out_ch, kernel_size=1, bias=False)
+        with torch.no_grad():
+            mixer.weight.copy_(torch.from_numpy(P).view(out_ch, n_bands, 1, 1))
+        stem = nn.Conv2d(out_ch, conv.out_channels, conv.kernel_size, conv.stride,
+                         conv.padding, bias=conv.bias is not None)
+        with torch.no_grad():
+            stem.weight.copy_(pre)
+            if conv.bias is not None:
+                stem.bias.copy_(conv.bias)
+        replace_module(net, conv, nn.Sequential(mixer, stem).to(conv.weight.device))
+        log(f"  spectral adapter: trainable {n_bands}->{out_ch} 1x1 (LDA-initialised) "
+            f"in front of an unchanged {tuple(pre.shape)} pretrained stem")
+
+    model.add_callback("on_pretrain_routine_start", hook)
+
+
+def pretrained_stem_weight_from(net, want_in):
+    """The COCO stem kernel, read back from the checkpoint the run started from."""
+    name = getattr(net, "_hod26_ckpt", None)
+    w = pretrained_stem_weight(name) if name else None
+    if w is not None and w.shape[1] == want_in:
+        return w
+    return None
+
+
+def replace_module(net, target, replacement):
+    """Swap one module in place, wherever it sits in the tree."""
+    for parent in net.modules():
+        for attr, child in list(vars(parent).get("_modules", {}).items()):
+            if child is target:
+                parent._modules[attr] = replacement
+                return True
+    return False
+
+
 def attach_spectral_stem_init(model, name, n_bands, projection):
     """Seed a multi-band stem from the pretrained RGB stem via the projection.
 
@@ -399,7 +475,16 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
 
     model = build_model(tr["model"])
     if tr.get("in_channels", 3) > 3:
-        attach_spectral_stem_init(model, tr["model"], tr["in_channels"], LDA_16_TO_3)
+        # Remember which checkpoint this started from; the stem strategies need
+        # to read its 3-channel kernel back after ultralytics rebuilds the model.
+        try:
+            model.model._hod26_ckpt = tr["model"]
+        except AttributeError:
+            pass
+        if tr.get("spectral_stem", "adapter") == "adapter":
+            attach_spectral_adapter(model, tr["in_channels"], LDA_16_TO_3)
+        else:
+            attach_spectral_stem_init(model, tr["model"], tr["in_channels"], LDA_16_TO_3)
     results = model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
         lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=close_mosaic,

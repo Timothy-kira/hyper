@@ -1,19 +1,19 @@
-__pycache__/
+!src/**/*.csv
+# Generated per round by tools/build_kernel.py from driver.py + the round config;
+# competition data + local experiment state (never committed)
+# credentials must never enter the repo
+# of machine-generated churn per round.
+# the loop rewrites them on every rollout, so tracking them would add a commit
+*.csv
+*.pt
 *.pyc
 .venv/
-# competition data + local experiment state (never committed)
-data/
-sample/
-runs/
-work/
-*.pt
-*.csv
-!src/**/*.csv
-# credentials must never enter the repo
-kaggle.json
+__pycache__/
 access_token*
-# Generated per round by tools/build_kernel.py from driver.py + the round config;
-# the loop rewrites them on every rollout, so tracking them would add a commit
-# of machine-generated churn per round.
+data/
+kaggle.json
 kernels/hod26_round/build/
 kernels/hod26_round/round_config.json
+runs/
+sample/
+work/

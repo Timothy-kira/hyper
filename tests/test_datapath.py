@@ -52,10 +52,21 @@ def build_fake_dataset(dest: Path, n_train: int = 12, n_test: int = 4) -> Path:
 
 
 def load_kernel(work: Path, data: Path):
-    """Import the generated kernel with its pip bootstrap and paths neutralized."""
-    build = REPO / "kernels" / "hod26_round" / "build" / "hod26_round.py"
-    if not build.exists():
-        raise RuntimeError("run tools/build_kernel.py first")
+    """Import the generated kernel with its pip bootstrap and paths neutralized.
+
+    Builds it first so the test always exercises the current driver rather than
+    whatever a previous run happened to leave behind.
+    """
+    out = REPO / "kernels" / "hod26_round" / "build" / "_test"
+    build = out / "hod26_round.py"
+    cfg = out / "round_config.json"
+    out.mkdir(parents=True, exist_ok=True)
+    cfg.write_text('{"round": "test", "candidates": []}')
+    subprocess.run(
+        [sys.executable, str(REPO / "tools" / "build_kernel.py"),
+         "--round-config", str(cfg), "--out-dir", str(out)],
+        check=True, capture_output=True, text=True,
+    )
     spec = importlib.util.spec_from_file_location("hod26_kernel_under_test", build)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
