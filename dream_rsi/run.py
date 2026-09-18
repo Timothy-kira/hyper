@@ -29,10 +29,16 @@ STATE = REPO / "runs"
 
 def online_rollout(policy, agent, executor, *, workers: int, max_rounds: int,
                    round_base: dict, tree_meta: dict, budget: Budget | None = None,
-                   log=print) -> DiscoveryTree:
-    """One online rollout: the policy drives real GPU attempts into a new tree."""
+                   save_to: Path | None = None, log=print) -> DiscoveryTree:
+    """One online rollout: the policy drives real GPU attempts into a new tree.
+
+    The tree is persisted after every round, not at the end. A rollout costs
+    hours of GPU time, and an interruption -- a crash, a restart to pick up a
+    changed search space -- should cost the round in flight, not all of them.
+    """
     tree = DiscoveryTree(meta=tree_meta)
     costs: list[float] = []
+    path = (Path(save_to) / f"tree_{int(time.time())}_{tree.id}.json") if save_to else None
 
     for k in range(max_rounds):
         if budget is not None:
@@ -92,9 +98,14 @@ def online_rollout(policy, agent, executor, *, workers: int, max_rounds: int,
         if hasattr(policy, "observe"):
             policy.observe(produced, TreeView(tree, set(tree.nodes), k, online=True))
 
+        if path is not None:
+            tree.save(path)
+
         best = tree.best()
         log(f"    best so far: {best.score:.4f}" if best else "    nothing scored yet")
 
+    if path is not None and not tree.nodes:
+        path.unlink(missing_ok=True)      # an empty rollout is not a replay world
     return tree
 
 
@@ -127,8 +138,8 @@ def iterate(*, iterations: int, workers: int, max_rounds: int, executor,
         tree = online_rollout(
             build_policy(spec), DiscoveryAgent(seed=t), executor,
             workers=workers, max_rounds=max_rounds, round_base=round_base,
-            tree_meta={"iteration": t, "policy": spec}, budget=budget, log=log)
-        tree.save(state_dir / f"tree_{int(time.time())}_{tree.id}.json")
+            tree_meta={"iteration": t, "policy": spec}, budget=budget,
+            save_to=state_dir, log=log)
 
         best = tree.best()
         log(f"\nrollout: {tree.n_attempts} attempts, "
