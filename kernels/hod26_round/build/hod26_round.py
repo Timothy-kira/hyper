@@ -299,12 +299,12 @@ def write(path, preds, clip_to: dict[int, tuple[int, int]] | None = None) -> int
 
 ROUND_CONFIG = json.loads(r'''
 {
-  "round": "scorecheck",
-  "proxy_train_images": 150,
-  "proxy_val_images": 60,
+  "proxy_train_images": 300,
+  "proxy_val_images": 120,
+  "round": 0,
   "candidates": [
     {
-      "node_id": "scorecheck",
+      "node_id": "06ff3976",
       "candidate": {
         "channels": {
           "mode": "pseudo_rgb",
@@ -320,11 +320,11 @@ ROUND_CONFIG = json.loads(r'''
         "train": {
           "model": "rtdetr-l",
           "imgsz": 640,
-          "epochs": 4,
-          "batch": 4,
+          "epochs": 10,
+          "batch": 16,
           "lr0": 0.01,
           "mosaic": 1.0,
-          "close_mosaic": 3,
+          "close_mosaic": 5,
           "hsv_h": 0.0,
           "hsv_s": 0.4,
           "hsv_v": 0.4,
@@ -341,6 +341,52 @@ ROUND_CONFIG = json.loads(r'''
           "max_det": 300,
           "tta": false,
           "multi_scale": []
+        },
+        "fidelity": "proxy"
+      }
+    },
+    {
+      "node_id": "a29446a8",
+      "candidate": {
+        "channels": {
+          "mode": "pseudo_rgb",
+          "bands": [
+            0,
+            1,
+            2
+          ],
+          "stretch_lo": 0.0,
+          "stretch_hi": 99.5,
+          "per_image_norm": true
+        },
+        "train": {
+          "model": "rtdetr-l",
+          "imgsz": 640,
+          "epochs": 10,
+          "batch": 16,
+          "lr0": 0.01,
+          "mosaic": 1.0,
+          "close_mosaic": 5,
+          "hsv_h": 0.0,
+          "hsv_s": 0.4,
+          "hsv_v": 0.4,
+          "fliplr": 0.5,
+          "scale": 0.5,
+          "cos_lr": true,
+          "in_channels": 3,
+          "amp": false,
+          "deterministic": false
+        },
+        "infer": {
+          "conf": 0.001,
+          "iou": null,
+          "max_det": 300,
+          "tta": false,
+          "multi_scale": [
+            0.8,
+            1.0,
+            1.25
+          ]
         },
         "fidelity": "proxy"
       }

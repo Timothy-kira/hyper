@@ -44,7 +44,7 @@ DEFAULT: dict = {
     "train": {
         "model": "rtdetr-l",
         "imgsz": 640,
-        "epochs": 30,
+        "epochs": 10,
         "batch": 16,
         "lr0": 0.01,
         "mosaic": 1.0,
@@ -75,7 +75,7 @@ _MOVES: dict[str, list] = {
     "channels.per_image_norm": [True, False],
     "train.model": TRANSFORMER_MODELS,
     "train.imgsz": [640, 768, 896, 1024],
-    "train.epochs": [20, 30, 45, 60],
+    "train.epochs": [6, 10, 14, 20],
     "train.lr0": [0.003, 0.005, 0.01, 0.02],
     "train.mosaic": [0.0, 0.5, 1.0],
     "train.scale": [0.3, 0.5, 0.7],
@@ -133,7 +133,7 @@ def normalize(cfg: dict) -> dict:
         # Ultralytics skips HSV on non-3-channel input anyway; make it explicit.
         cfg["train"]["hsv_h"] = cfg["train"]["hsv_s"] = cfg["train"]["hsv_v"] = 0.0
     if cfg["fidelity"] == "proxy":
-        cfg["train"]["epochs"] = min(cfg["train"]["epochs"], 18)
+        cfg["train"]["epochs"] = min(cfg["train"]["epochs"], 12)
         cfg["train"]["imgsz"] = min(cfg["train"]["imgsz"], 768)
     # Ultralytics disables mosaic for the last close_mosaic epochs; that is
     # meaningless once it exceeds the run length.
