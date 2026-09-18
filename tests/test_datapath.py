@@ -95,7 +95,7 @@ def test_datapath(tmp_root: Path) -> None:
         cand = seed_candidate(channels__mode=mode)
         n_ch = cand["train"]["in_channels"]
         ext = ".tiff" if n_ch > 3 else ".png"
-        ds = k.WORK / f"ds_{k.channels_key(cand['channels'])}"
+        ds = k.WORK / f"ds_{k.channels_key(cand)}"
         yaml = k.materialize(cand, index, train_ids, val_ids, anns, ds)
         assert yaml.exists()
         assert f"channels: {n_ch}" in yaml.read_text(), (mode, yaml.read_text())
@@ -119,7 +119,7 @@ def test_datapath(tmp_root: Path) -> None:
     # labels must be YOLO-normalized and agree with the source XML
     pid = train_ids[0]
     ann = anns[pid]
-    ds = k.WORK / f"ds_{k.channels_key(seed_candidate()['channels'])}"
+    ds = k.WORK / f"ds_{k.channels_key(seed_candidate())}"
     rows = (ds / "labels" / "train" / f"{pid}.txt").read_text().strip().splitlines()
     assert len(rows) == len(ann.boxes)
     for row, box in zip(rows, ann.boxes):
@@ -128,6 +128,28 @@ def test_datapath(tmp_root: Path) -> None:
         assert abs(float(cx) - (box.x1 + box.x2) / 2 / ann.width) < 1e-6
         assert abs(float(bh) - (box.y2 - box.y1) / ann.height) < 1e-6
         assert 0 <= float(cx) <= 1 and 0 <= float(cy) <= 1
+
+    # Augmentation must add copies to train only, leave val at the real
+    # distribution, and keep every label describing what is under it.
+    aug = seed_candidate()
+    aug["augment"].update(sg_window=5, sg_polyorder=2, smote_alpha=0.3,
+                          cutmix_prob=0.4, cutmix_blocks=16, copies=2)
+    from dream_rsi.candidate import normalize
+    aug = normalize(aug)
+    assert aug["augment"]["copies"] == 2, aug["augment"]
+    ds_aug = k.WORK / f"ds_{k.channels_key(aug)}"
+    assert ds_aug != ds, "augmentation must not reuse the unaugmented render"
+    k.materialize(aug, index, train_ids, val_ids, anns, ds_aug)
+    n_train = len(list((ds_aug / "images" / "train").glob("*.png")))
+    n_val = len(list((ds_aug / "images" / "val").glob("*.png")))
+    assert n_train == len(train_ids) * 3, (n_train, len(train_ids))
+    assert n_val == len(val_ids), (n_val, len(val_ids))
+    for lbl in (ds_aug / "labels" / "train").glob("*_a*.txt"):
+        for row in lbl.read_text().split("\n"):
+            if not row:
+                continue
+            cls, cx, cy, bw, bh = row.split()
+            assert 0 <= int(cls) <= 17 and all(0 <= float(v) <= 1 for v in (cx, cy, bw, bh)), row
 
     # a missing dataset must name what /kaggle/input actually holds
     k.DATA = tmp_root / "nope"
@@ -140,7 +162,7 @@ def test_datapath(tmp_root: Path) -> None:
 
     print(f"OK: {len(ids)} ids, {len(train_ids)}/{len(val_ids)} split, "
           f"{len(CHANNEL_MODES)} channel modes (incl. 16-band TIFF), "
-          f"labels verified against XML")
+          f"labels verified against XML; augmented train x3, val untouched")
 
 
 if __name__ == "__main__":

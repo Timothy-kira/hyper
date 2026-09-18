@@ -35,6 +35,12 @@ CHANNEL_MODES = [
 # input path works here exactly as it does for the CNN detectors.
 TRANSFORMER_MODELS = ["rtdetr-l", "rtdetr-x", "rtdetr-resnet50", "rtdetr-resnet101"]
 
+# Control track. yolo26-p2 carries an extra high-resolution head, which is the
+# variant that matters here: 69.8% of the annotated objects are COCO-small.
+YOLO_MODELS = ["yolo26s", "yolo26m", "yolo26-p2", "yolo26l"]
+
+TRACKS = {"transformer": TRANSFORMER_MODELS, "yolo26": YOLO_MODELS}
+
 
 def is_transformer(model: str) -> bool:
     return model.startswith("rtdetr")
@@ -70,6 +76,17 @@ DEFAULT: dict = {
         "tta": False,            # allowed: single checkpoint, merged augmentations
         "multi_scale": [],
     },
+    # The pipeline is searched alongside the model: these operate on the cube,
+    # before projection, because the measured bottleneck is spectral and an
+    # augmentation applied after projection can only perturb what survived it.
+    "augment": {
+        "sg_window": 0,          # 0 = off; Savitzky-Golay window along the bands
+        "sg_polyorder": 2,
+        "smote_alpha": 0.0,      # same-class spectral interpolation strength
+        "cutmix_prob": 0.0,      # per-superpixel paste probability
+        "cutmix_blocks": 24,
+        "copies": 0,             # extra augmented copies per training frame
+    },
     "fidelity": "proxy",         # proxy = subsampled/short; full = the real run
 }
 
@@ -80,7 +97,7 @@ _MOVES: dict[str, list] = {
     "channels.stretch_lo": [0.0, 0.5, 1.0, 2.0],
     "channels.stretch_hi": [98.0, 99.0, 99.5, 100.0],
     "channels.per_image_norm": [True, False],
-    "train.model": TRANSFORMER_MODELS,
+    "train.model": TRANSFORMER_MODELS + YOLO_MODELS,
     "train.imgsz": [640, 768, 896, 1024],
     "train.epochs": [6, 10, 14, 20],
     "train.lr0": [0.003, 0.005, 0.01, 0.02],
@@ -90,6 +107,12 @@ _MOVES: dict[str, list] = {
     "infer.iou": [0.6, 0.7, 0.8],
     "infer.tta": [True, False],
     "infer.multi_scale": [[], [0.8, 1.0, 1.25]],
+    "augment.sg_window": [0, 5, 7, 9],
+    "augment.sg_polyorder": [2, 3],
+    "augment.smote_alpha": [0.0, 0.3, 0.5],
+    "augment.cutmix_prob": [0.0, 0.3, 0.5],
+    "augment.cutmix_blocks": [16, 24, 40],
+    "augment.copies": [0, 1, 2],
 }
 
 _BANDS_FOR_MODE = {
@@ -121,6 +144,17 @@ def _set(cfg: dict, path: str, value) -> None:
 def normalize(cfg: dict) -> dict:
     """Repair a candidate into a runnable state after mutation."""
     cfg = deepcopy(cfg)
+    aug = cfg.setdefault("augment", deepcopy(DEFAULT["augment"]))
+    # Savitzky-Golay needs an odd window strictly greater than the polynomial
+    # order, or the least-squares fit is not determined.
+    if aug["sg_window"]:
+        aug["sg_window"] = max(3, aug["sg_window"] | 1)
+        # Order must stay below the window, but an order near it fits the window
+        # exactly and smooths nothing -- cap it where the filter still filters.
+        aug["sg_polyorder"] = max(1, min(aug["sg_polyorder"], aug["sg_window"] - 2, 4))
+    # Copies only pay for themselves if something actually varies between them.
+    if not (aug["sg_window"] or aug["smote_alpha"] or aug["cutmix_prob"]):
+        aug["copies"] = 0
     cfg["channels"]["bands"] = _BANDS_FOR_MODE[cfg["channels"]["mode"]]
     if cfg["channels"]["stretch_hi"] <= cfg["channels"]["stretch_lo"]:
         cfg["channels"]["stretch_hi"] = 100.0
@@ -166,8 +200,17 @@ class DiscoveryAgent:
     branch does not re-try a move a neighbour already measured as bad.
     """
 
-    def __init__(self, seed: int = 0):
+    def __init__(self, seed: int = 0, track: str | None = None):
         self._rng = random.Random(seed)
+        # A track pins the model family so the two can be compared as tracks
+        # rather than letting one crowd the other out of a shared search.
+        self._models = TRACKS.get(track) if track else None
+
+    def _pin_track(self, cfg: dict) -> dict:
+        """Keep a candidate inside this agent's model family."""
+        if self._models and cfg["train"]["model"] not in self._models:
+            cfg["train"]["model"] = self._models[0]
+        return normalize(cfg)
 
     def propose(self, parent_candidate: dict | None, history: list[dict],
                 n_moves: int = 1) -> tuple[dict, str]:
@@ -184,7 +227,8 @@ class DiscoveryAgent:
             # baseline -- that is the reading the tree measures every gain
             # against.
             if not history:
-                return seed_candidate(), "root: organizers' pseudo-RGB demo baseline"
+                return (self._pin_track(seed_candidate()),
+                        "root: organizers' pseudo-RGB demo baseline")
 
             # Channel construction is the axis the bottleneck analysis points at:
             # the largest recoverable loss is material discrimination, which no
@@ -195,12 +239,12 @@ class DiscoveryAgent:
             untried = [m for m in CHANNEL_MODES if m not in seen_modes]
             if untried:
                 mode = self._rng.choice(untried)
-                cfg = normalize(seed_candidate(channels__mode=mode))
+                cfg = self._pin_track(seed_candidate(channels__mode=mode))
                 if self._sig(cfg) not in tried:
                     return cfg, (f"root: channel mode {mode!r}, untried "
                                  f"({len(untried) - 1} modes still unexplored)")
 
-            parent_candidate = seed_candidate()
+            parent_candidate = self._pin_track(seed_candidate())
             n_moves = max(n_moves, 2)
         best = max((h for h in history if h.get("score") is not None),
                    key=lambda h: h["score"], default=None)
@@ -212,13 +256,15 @@ class DiscoveryAgent:
                 usable = [k for k in _MOVES
                           if not (k == "infer.iou" and is_transformer(cfg["train"]["model"]))]
                 path = self._rng.choice(usable)
-                options = [o for o in _MOVES[path] if o != _get(cfg, path)]
+                choices = self._models if (path == "train.model" and self._models) \
+                    else _MOVES[path]
+                options = [o for o in choices if o != _get(cfg, path)]
                 if not options:
                     continue
                 val = self._rng.choice(options)
                 _set(cfg, path, val)
                 picked.append(f"{path}={val!r}")
-            cfg = normalize(cfg)
+            cfg = self._pin_track(cfg)
             if not picked or self._sig(cfg) in tried:
                 continue
             why = "; ".join(picked)
@@ -226,12 +272,12 @@ class DiscoveryAgent:
                 why += f" (best measured so far {best['score']:.4f})"
             return cfg, why
 
-        return normalize(deepcopy(parent_candidate)), "exhausted: repeating parent"
+        return self._pin_track(deepcopy(parent_candidate)), "exhausted: repeating parent"
 
     @staticmethod
     def _sig(cfg: dict) -> tuple:
         flat = []
-        for section in ("channels", "train", "infer"):
+        for section in ("channels", "train", "infer", "augment"):
             for k in sorted(cfg.get(section, {})):
                 v = cfg[section][k]
                 flat.append((f"{section}.{k}", tuple(v) if isinstance(v, list) else v))

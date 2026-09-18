@@ -149,10 +149,43 @@ def write_frame(path_stem, img):
     return path
 
 
-def channels_key(spec):
-    """Identity of a rendered dataset: candidates differing only in training or
-    inference parameters consume byte-identical images."""
+def channels_key(cand):
+    """Identity of a rendered dataset.
+
+    Keyed on channel construction *and* augmentation: candidates differing only
+    in training or inference parameters consume byte-identical images, but a
+    different augmentation setting produces a different dataset entirely.
+    """
+    spec = {"channels": cand["channels"], "augment": cand.get("augment", {})}
     return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()[:10]
+
+
+def class_donors(index, anns, ids, limit=200):
+    """One mean spectrum per class, for same-class spectral interpolation."""
+    acc, n = {}, {}
+    for pid in ids[:limit]:
+        cube = load_planar(index[pid])
+        for b in anns[pid].boxes:
+            patch = cube[b.y1:b.y2, b.x1:b.x2, :]
+            if patch.size == 0:
+                continue
+            m = patch.reshape(-1, cube.shape[2]).mean(0)
+            acc[b.cls_id] = acc.get(b.cls_id, 0) + m
+            n[b.cls_id] = n.get(b.cls_id, 0) + 1
+    return {c: acc[c] / n[c] for c in acc}
+
+
+def augment_cube(cube, boxes, aug, donors, pool, rng):
+    """Apply the spectral and spatial operators a candidate asked for."""
+    if aug.get("sg_window"):
+        cube = savgol_spectral(cube, aug["sg_window"], aug["sg_polyorder"])
+    if aug.get("smote_alpha"):
+        cube = spectral_smote(cube, boxes, donors, aug["smote_alpha"], rng)
+    if aug.get("cutmix_prob") and pool:
+        other = load_planar(pool[int(rng.integers(0, len(pool)))])
+        cube, boxes = superpixel_cutmix(cube, boxes, other, aug["cutmix_prob"],
+                                        aug["cutmix_blocks"], rng)
+    return cube, boxes
 
 
 def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
@@ -171,30 +204,49 @@ def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
         (root / "images" / split).mkdir(parents=True, exist_ok=True)
         (root / "labels" / split).mkdir(parents=True, exist_ok=True)
 
+    aug = cand.get("augment", {})
+    copies = int(aug.get("copies", 0))
+    wants_aug = bool(aug.get("sg_window") or aug.get("smote_alpha") or aug.get("cutmix_prob"))
+    donors = class_donors(index, anns, train_ids) if aug.get("smote_alpha") else {}
+    pool = [index[p] for p in train_ids] if aug.get("cutmix_prob") else []
+    rng = np.random.default_rng(0)
+
+    def emit(root, split, stem, img, boxes, a):
+        n = write_frame(root / "images" / split / stem, img)
+        lines = []
+        for b in boxes:
+            cx = (b.x1 + b.x2) / 2 / a.width
+            cy = (b.y1 + b.y2) / 2 / a.height
+            bw = (b.x2 - b.x1) / a.width
+            bh = (b.y2 - b.y1) / a.height
+            lines.append(f"{b.cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+        (root / "labels" / split / f"{stem}.txt").write_text("\n".join(lines))
+        return n
+
+    n_ch = 3
     for split, ids in (("train", train_ids), ("val", val_ids)):
         for pid in ids:
-            img = build_channels(load_planar(index[pid]), cand["channels"])
-            # No BGR flip: these are spectral bands, not colour. What matters is
-            # that training and inference write and read them the same way.
-            # cv2.imwrite returns False (it does not raise) on a bad buffer, and
-            # a non-contiguous view is one -- hence the explicit check.
-            n_ch = img.shape[2]
-            write_frame(root / "images" / split / str(pid), img)
+            cube = load_planar(index[pid])
             a = anns[pid]
-            lines = []
-            for b in a.boxes:
-                cx = (b.x1 + b.x2) / 2 / a.width
-                cy = (b.y1 + b.y2) / 2 / a.height
-                bw = (b.x2 - b.x1) / a.width
-                bh = (b.y2 - b.y1) / a.height
-                lines.append(f"{b.cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
-            (root / "labels" / split / f"{pid}.txt").write_text("\n".join(lines))
+            # The unaugmented frame is always written; validation is never
+            # augmented, so the score keeps measuring the real distribution.
+            img = build_channels(cube, cand["channels"])
+            n_ch = img.shape[2]
+            emit(root, split, str(pid), img, a.boxes, a)
+
+            if split == "train" and wants_aug:
+                for k in range(copies):
+                    c2, b2 = augment_cube(cube, list(a.boxes), aug, donors, pool, rng)
+                    emit(root, split, f"{pid}_a{k}", build_channels(c2, cand["channels"]), b2, a)
 
     for split, ids in (("train", train_ids), ("val", val_ids)):
         n = len(list((root / "images" / split).glob("*.png"))) + \
             len(list((root / "images" / split).glob("*.tiff")))
-        if n == 0 or n != len(ids):
-            raise RuntimeError(f"{split}: wrote {n} images, expected {len(ids)}")
+        expect = len(ids) * (1 + copies if split == "train" and wants_aug else 1)
+        if n == 0 or n != expect:
+            raise RuntimeError(f"{split}: wrote {n} images, expected {expect}")
+    log(f"  rendered {cand['channels']['mode']}"
+        + (f" +{copies} augmented copies/frame" if wants_aug and copies else ""))
 
     yaml = root / "data.yaml"
     yaml.write_text(
@@ -242,7 +294,7 @@ def build_model(name, weights=None):
 
 def run_candidate(cand, index, train_ids, val_ids, anns, tag):
 
-    root = WORK / f"ds_{channels_key(cand['channels'])}"
+    root = WORK / f"ds_{channels_key(cand)}"
     yaml = materialize(cand, index, train_ids, val_ids, anns, root)
     tr, inf = cand["train"], cand["infer"]
 
