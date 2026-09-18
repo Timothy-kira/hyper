@@ -25,8 +25,12 @@ class TreeView:
     policy's own choices.
     """
 
-    def __init__(self, tree: DiscoveryTree, revealed: set[str], round_: int):
+    def __init__(self, tree: DiscoveryTree, revealed: set[str], round_: int,
+                 online: bool = False):
         self._t, self._revealed, self.round = tree, revealed, round_
+        # Online, the discovery agent can always produce another child, so every
+        # revealed leaf stays extendable. In replay only recorded children exist.
+        self._online = online
 
     def eligible(self) -> list[str]:
         """Root, plus revealed nodes that can still yield a new attempt."""
@@ -40,7 +44,8 @@ class TreeView:
         return not any(c in self._revealed for c in self._t.children(nid))
 
     def _can_extend(self, nid: str) -> bool:
-        # In replay only recorded children can be revealed; online, always true.
+        if self._online:
+            return True
         return any(c not in self._revealed for c in self._t.children(nid))
 
     def node(self, nid: str) -> Node | None:

@@ -139,14 +139,21 @@ class DiscoveryAgent:
         ``history`` holds ``{"candidate": ..., "score": ...}`` for attempts
         already measured anywhere in the tree.
         """
-        if parent_candidate is None:
-            return seed_candidate(), "root: organizers' pseudo-RGB demo baseline"
-
         tried = {self._sig(h["candidate"]) for h in history}
+
+        if parent_candidate is None:
+            # Expanding the root opens an *independent* workspace, so it must
+            # land somewhere new. Only the very first attempt is the untouched
+            # baseline -- that is the reading the tree measures every gain
+            # against. Later root expansions jump further to spread the search.
+            if not history:
+                return seed_candidate(), "root: organizers' pseudo-RGB demo baseline"
+            parent_candidate = seed_candidate()
+            n_moves = max(n_moves, 2)
         best = max((h for h in history if h.get("score") is not None),
                    key=lambda h: h["score"], default=None)
 
-        for _ in range(96):
+        for _ in range(192):
             cfg = deepcopy(parent_candidate)
             picked = []
             for _ in range(n_moves):
