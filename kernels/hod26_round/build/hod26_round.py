@@ -409,9 +409,15 @@ def data_root():
         for z in zips:
             log(f"  unpacking {z.name}")
             with zipfile.ZipFile(z) as zf:
-                zf.extractall(out / z.stem if z.stem in ("train", "test") else out)
-        if _looks_like_dataset(out):
-            return out
+                zf.extractall(out / z.stem)
+        for extra in cand.glob("*.json"):
+            shutil.copy(extra, out / extra.name)
+        # Whether the CLI kept a "train/" prefix inside each archive is not
+        # knowable from here, so find the directory that actually holds the
+        # split rather than guessing the nesting.
+        for d in [out, *(p for p in out.rglob("*") if p.is_dir())]:
+            if _looks_like_dataset(d):
+                return d
 
     listing = sorted(p.name for p in Path("/kaggle/input").iterdir()) \
         if Path("/kaggle/input").exists() else "/kaggle/input does not exist"
