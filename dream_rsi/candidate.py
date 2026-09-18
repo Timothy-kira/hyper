@@ -171,6 +171,14 @@ def normalize(cfg: dict) -> dict:
     # needs no patching -- but COCO weights cannot transfer into a 16-channel
     # stem, so that one layer trains from scratch while the rest is pretrained.
     cfg["train"]["in_channels"] = 16 if cfg["channels"]["mode"] == "band_stack" else 3
+    # The adapter is a 16 -> 3 mixer in front of the pretrained stem, so it only
+    # exists when the input is wider than the stem. Asking for it with a
+    # 3-channel mode is a contradiction: the mode has already collapsed the
+    # bands, and the adapter would silently never attach.
+    if cfg["train"]["in_channels"] == 3:
+        cfg["train"]["spectral_stem"] = "none"
+    elif cfg["train"].get("spectral_stem", "adapter") == "none":
+        cfg["train"]["spectral_stem"] = "adapter"
     if is_transformer(cfg["train"]["model"]):
         # Ultralytics warns that AMP can produce NaNs during RT-DETR's bipartite
         # matching, and that grid_sample rejects deterministic mode.

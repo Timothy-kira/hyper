@@ -30,20 +30,27 @@ from dream_rsi.executor import KaggleRoundExecutor  # noqa: E402
 from dream_rsi.tree import load_pool  # noqa: E402
 
 TRACK_MODEL = {"transformer": "rtdetr-l", "yolo26": "yolo26m"}
+
+# The trainable adapter is a 16 -> 3 mixer sitting in front of an untouched
+# pretrained stem, so the model has to be fed all sixteen bands for it to exist
+# at all. A 3-channel mode such as lda3 has already collapsed the spectrum
+# itself: the projection is then fixed and the adapter never attaches. Feeding
+# band_stack is what makes the mixer the thing being trained.
+BASE_MODE = "band_stack"
 AUGMENT = {"sg_window": 7, "sg_polyorder": 2, "smote_alpha": 0.3,
            "cutmix_prob": 0.4, "cutmix_blocks": 24, "copies": 2}
 
 
-def best_channel_mode(ablation: Path) -> str:
-    """The channel construction that won the controlled ablation."""
+def ablation_summary(ablation: Path) -> str:
+    """What the controlled ablation measured, for the record."""
     if not ablation.exists():
-        return "lda3"
+        return "ablation not available"
     rows = json.loads(ablation.read_text()).get("results", [])
-    scored = [(r["score"], r["candidate"]["channels"]["mode"])
-              for r in rows if r.get("score") is not None]
+    scored = sorted(((r["score"], r["candidate"]["channels"]["mode"])
+                     for r in rows if r.get("score") is not None), reverse=True)
     if not scored:
-        return "lda3"
-    return max(scored)[1]
+        return "ablation produced no scores"
+    return ", ".join(f"{m} {s:.4f}" for s, m in scored)
 
 
 def best_train_params(state_dir: Path) -> dict:
@@ -94,11 +101,15 @@ def main() -> None:
     ap.add_argument("--need-hours", type=float, default=16.0)
     ap.add_argument("--ablation", type=Path,
                     default=REPO / "runs" / "ablation" / "results.json")
+    ap.add_argument("--mode", default=BASE_MODE,
+                    help="channel construction; band_stack is what gives the "
+                         "trainable adapter something to adapt")
     ap.add_argument("--no-wait", action="store_true")
     args = ap.parse_args()
 
-    mode = best_channel_mode(args.ablation)
-    print(f"channel mode from the ablation: {mode}")
+    mode = args.mode
+    print(f"ablation measured: {ablation_summary(args.ablation)}")
+    print(f"running on: {mode} + trainable spectral adapter")
 
     if not args.no_wait:
         have = wait_for_quota(args.need_hours)
