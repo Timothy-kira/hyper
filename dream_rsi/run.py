@@ -27,9 +27,23 @@ REPO = Path(__file__).resolve().parent.parent
 STATE = REPO / "runs"
 
 
+def prior_history(pool) -> list[dict]:
+    """Every outcome already measured, across all recorded trees.
+
+    The paper gives the exploration policy access to the completed discovery
+    history as context while keeping it separate from the tree being built.
+    Without it a fresh rollout starts blind and re-buys measurements earlier
+    trees already paid for -- observed live: pca3 was re-measured in a new tree
+    after two previous trees had already scored it worst of all modes.
+    """
+    return [{"candidate": n.candidate, "score": n.score}
+            for tree in pool for n in tree.nodes.values() if n.candidate]
+
+
 def online_rollout(policy, agent, executor, *, workers: int, max_rounds: int,
                    round_base: dict, tree_meta: dict, budget: Budget | None = None,
-                   save_to: Path | None = None, log=print) -> DiscoveryTree:
+                   save_to: Path | None = None, prior: list[dict] | None = None,
+                   log=print) -> DiscoveryTree:
     """One online rollout: the policy drives real GPU attempts into a new tree.
 
     The tree is persisted after every round, not at the end. A rollout costs
@@ -55,8 +69,11 @@ def online_rollout(policy, agent, executor, *, workers: int, max_rounds: int,
             log(f"round {k}: policy stopped")
             break
 
-        history = [{"candidate": n.candidate, "score": n.score}
-                   for n in tree.nodes.values()]
+        # Accumulated history informs what to avoid and what is still untried;
+        # only this rollout's own attempts join the tree being built.
+        history = list(prior or [])
+        history += [{"candidate": n.candidate, "score": n.score}
+                    for n in tree.nodes.values()]
         entries, scheduled = [], []
         for parent in batch:
             parent_cand = None if parent == ROOT else tree.nodes[parent].candidate
@@ -135,12 +152,15 @@ def iterate(*, iterations: int, workers: int, max_rounds: int, executor,
 
     summary = []
     for t in range(1, iterations + 1):
-        log(f"\n{'='*66}\nITERATION {t}: online explore  (policy={spec['params']})\n{'='*66}")
+        pool_before = load_pool(state_dir)
+        prior = prior_history(pool_before)
+        log(f"\n{'='*66}\nITERATION {t}: online explore  (policy={spec['params']})")
+        log(f"carrying {len(prior)} previously measured outcomes as context\n{'='*66}")
         tree = online_rollout(
             build_policy(spec), DiscoveryAgent(seed=t, track=track), executor,
             workers=workers, max_rounds=max_rounds, round_base=round_base,
             tree_meta={"iteration": t, "policy": spec}, budget=budget,
-            save_to=state_dir, log=log)
+            save_to=state_dir, prior=prior, log=log)
 
         best = tree.best()
         log(f"\nrollout: {tree.n_attempts} attempts, "
