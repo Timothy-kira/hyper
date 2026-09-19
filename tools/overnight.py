@@ -36,10 +36,13 @@ STATE = REPO / "runs" / "overnight_state.json"
 STREET = ["people", "car", "e-bike", "stone_block"]
 # Round one on the street subset. DIoU is the base round two builds on.
 DIOU_BASE = 0.4197
-# A single seed over 104 frames moves the per-class numbers by about 0.02, so
-# the macro of four classes is good to roughly 0.01. Anything inside that is
-# not a result, and the base stands.
-NOISE = 0.010
+# Round two measured the noise rather than assuming it. Its four arms all share
+# the DIoU base and differ only in loss details, yet they spread 0.0149 -- wider
+# than DIoU's own 0.0091 lead over GIoU in round one. So a single seed over 104
+# frames is good to about 0.015, not the 0.010 first guessed, and DIoU's lead is
+# not a result either. Nothing on this subset earns a change unless it clears
+# this.
+NOISE = 0.015
 
 
 def log(*a):
@@ -88,7 +91,10 @@ def pick_winner(slug: str) -> dict:
     Otherwise the base stands -- a coin flip dressed as a result is worse than
     no change, because it would also be carried into the final model.
     """
-    base = {"train.bbox_loss": "DIoU"}
+    # The base is the objective the 27 epochs were actually trained under.
+    # Switching it on a within-noise lead would be the coin flip this rule
+    # exists to refuse -- and it would ride into the final model.
+    base: dict = {}
     arms = {"logl1": {"train.log_size_l1": True},
             "sharpen": {"train.bbox_alpha": 3.0, "train.vfl_beta": 0.5},
             "both": {"train.log_size_l1": True, "train.bbox_alpha": 3.0,
@@ -116,10 +122,12 @@ def pick_winner(slug: str) -> dict:
     best = max(scored.values(), key=lambda r: r["score"])
     gain = best["score"] - DIOU_BASE
     if gain <= NOISE:
-        log(f"  best arm {best['node_id']} is +{gain:.4f} over DIoU, inside the "
-            f"{NOISE} noise floor; keeping the DIoU base")
+        verdict = "below it" if gain < 0 else "inside it"
+        log(f"  best arm {best['node_id']} is {gain:+.4f} against the DIoU "
+            f"reference and the noise floor is {NOISE} -- {verdict}. Keeping "
+            f"the loss the earlier sessions trained under.")
         return base
-    log(f"  winner {best['node_id']}: +{gain:.4f} over DIoU, clears the floor")
+    log(f"  winner {best['node_id']}: {gain:+.4f} over DIoU, clears the floor")
     return {**base, **arms.get(best["node_id"], {})}
 
 
