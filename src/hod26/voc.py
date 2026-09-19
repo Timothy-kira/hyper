@@ -81,3 +81,46 @@ def parse(path) -> Annotation:
                 bool(int(obj.findtext("difficult") or 0)))
         )
     return Annotation(int(path.stem), w, h, depth, tuple(boxes))
+
+
+# Which COCO class each HOD26 class should inherit detector-head weights from.
+#
+# Ultralytics carries pretrained head rows over by exact class-name match, which
+# reaches only four of these eighteen: apple, banana, car, orange. `people`
+# misses for the sole reason that COCO spells it `person`. Naming an explicit
+# source lifts that to twelve and, since several HOD26 classes may share one
+# COCO source, covers the pairs a name match structurally cannot.
+#
+# The plastic and toy variants are the point. A plastic apple *looks* like an
+# apple -- same shape, same size, same texture; the spectrum is the only thing
+# that differs, and supplying that is the front end's job. So COCO's learned
+# appearance prior for "apple" is exactly the right starting point for
+# apple_plastic, which currently begins from noise and scores 0.013 AP against
+# the real fruit's 0.238.
+#
+# This only sets an initialisation. The model still predicts the 18 HOD26
+# classes, and training moves these rows wherever the data takes them.
+COCO_PRIOR = {
+    "apple": "apple",
+    "apple_plastic": "apple",
+    "banana": "banana",
+    "banana_plastic": "banana",
+    "orange": "orange",
+    "orange_plastic": "orange",
+    "car": "car",
+    "car_toy": "car",
+    "people": "person",
+    "e-bike": "motorcycle",
+    "badminton": "sports ball",
+    "table_tennis": "sports ball",
+    # No sensible COCO counterpart: charger_head, egg, egg_plastic, egg_wood,
+    # rubik, stone_block. Those keep their random initialisation.
+}
+
+# Classes that are not the first HOD26 class to claim their COCO source. Copying
+# one row into several destinations leaves them numerically identical, and
+# identical rows receive near-identical gradients, so they can stay entangled
+# exactly where they most need to separate. These get a small perturbation.
+COCO_PRIOR_DERIVED = frozenset({
+    "apple_plastic", "banana_plastic", "orange_plastic", "car_toy", "table_tennis",
+})
