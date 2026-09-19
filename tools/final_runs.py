@@ -77,9 +77,25 @@ AUGMENT = {"sg_window": 7, "sg_polyorder": 2, "smote_alpha": 0.3,
            "cutmix_prob": 0.4, "cutmix_blocks": 24, "copies": 1}
 
 
-def full_candidate(track: str, epochs: int) -> dict:
+CLOSE_MOSAIC = 5
+
+
+def full_candidate(track: str, epochs: int, total: int | None = None) -> dict:
+    """One session's candidate: trains to ``epochs`` of a ``total``-epoch run.
+
+    Two settings have to be expressed in whole-run terms or a split run stops
+    behaving like the run it is meant to be. The LR curve is shaped over the
+    total, so the sessions join where an uninterrupted run would have been
+    rather than decaying to lrf and restarting near half the peak. And mosaic
+    closes at the *global* epoch total - CLOSE_MOSAIC, which for an early
+    session means not closing at all -- ultralytics compares against this
+    session's own epoch count, so the value it is given has to be shifted.
+    """
+    total = total or epochs
     cand = seed_candidate(**DESIGN)
-    cand["train"].update(model=TRACK_MODEL[track], epochs=epochs)
+    cand["train"].update(model=TRACK_MODEL[track], epochs=epochs,
+                         schedule_epochs=total,
+                         close_mosaic=max(0, epochs - (total - CLOSE_MOSAIC)))
     cand["augment"].update(AUGMENT)
     return normalize(cand)
 
@@ -112,7 +128,7 @@ def session_plan(total_epochs: int, chunks: int) -> list[int]:
 
 def run_track(track: str, epochs: int, chunks: int, use_all_train: bool,
               timeout_hours: float) -> dict:
-    cand_final = full_candidate(track, epochs)
+    cand_final = full_candidate(track, epochs, epochs)
     print(f"=== {track}: {cand_final['train']['model']} / "
           f"{cand_final['channels']['mode']} + srf{cand_final['train']['srf_k']} "
           f"adapter / {epochs}ep @ {cand_final['train']['imgsz']} / "
@@ -121,7 +137,7 @@ def run_track(track: str, epochs: int, chunks: int, use_all_train: bool,
     previous, payload = None, {}
     for i, target in enumerate(session_plan(epochs, chunks)):
         slug = f"xishengfeng/hod26-final-{track}-s{i + 1}"
-        cand = full_candidate(track, target)
+        cand = full_candidate(track, target, epochs)
         ex = KaggleRoundExecutor(slug, timeout_hours=timeout_hours,
                                  out_dir=REPO / "runs" / f"final_{track}_s{i + 1}",
                                  kernel_sources=[previous] if previous else [])

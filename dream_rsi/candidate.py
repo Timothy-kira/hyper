@@ -100,6 +100,9 @@ DEFAULT: dict = {
         # parameters that require grad, so anything unfrozen later would receive
         # gradients with no optimizer state behind them.
         "warmup_epochs": 3.0,
+        # The length the LR curve is shaped over, when a run is split across
+        # sessions. 0 means this session is the whole run.
+        "schedule_epochs": 0,
         # COCO pretraining was at 640; training at 1024 pulls the backbone away
         # from the scale statistics it knows, and covering a range is gentler
         # than jumping to one new scale.
@@ -237,6 +240,7 @@ def normalize(cfg: dict) -> dict:
     else:
         cfg["train"]["srf_k"] = max(0, min(int(cfg["train"].get("srf_k", 0)),
                                            cfg["train"]["in_channels"]))
+    cfg["train"]["schedule_epochs"] = max(0, int(cfg["train"].get("schedule_epochs", 0)))
     if cfg["fidelity"] == "proxy":
         cfg["train"]["epochs"] = min(cfg["train"]["epochs"], 12)
         # imgsz is not capped. Resolution is the one design choice the proxy

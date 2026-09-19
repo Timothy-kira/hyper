@@ -571,7 +571,7 @@ def restore_state(net, src):
     return len(ok)
 
 
-def hod26_trainer(base_cls, adapter=None, coco_prior=True):
+def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0):
     """A trainer that seeds the head from COCO by name and installs the adapter.
 
     Both have to happen inside get_model, and for the same reason: ultralytics
@@ -593,6 +593,24 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True):
     """
 
     class HOD26Trainer(base_cls):
+        def _setup_scheduler(self):
+            """Shape the LR curve over the whole run, not over this session.
+
+            A chunked run stops each session at its own epoch count, and
+            ultralytics builds the schedule from that count -- so a first
+            session of 9 out of 18 would decay all the way to lrf by its last
+            epoch and the second would restart near half the peak. Building the
+            curve over the full length instead makes the two halves join where
+            a single uninterrupted run would have been.
+            """
+            real = self.epochs
+            if schedule_epochs and schedule_epochs > real:
+                self.epochs = schedule_epochs
+            try:
+                super()._setup_scheduler()
+            finally:
+                self.epochs = real
+
         def check_resume(self, overrides):
             super().check_resume(overrides)
             # check_resume replaces args wholesale with the checkpoint's, and
@@ -903,7 +921,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
         else:
             attach_spectral_stem_init(model, tr["model"], tr["in_channels"], proj)
     trainer_cls = hod26_trainer(base_trainer(tr["model"]), adapter=adapter,
-                                coco_prior=tr.get("coco_prior", True))
+                                coco_prior=tr.get("coco_prior", True),
+                                schedule_epochs=int(tr.get("schedule_epochs", 0)))
     log_state = attach_epoch_log(model, tag)
     results = model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
