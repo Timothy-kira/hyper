@@ -203,9 +203,15 @@ def main() -> None:
     ex = KaggleRoundExecutor(s3, timeout_hours=11.9,
                              out_dir=REPO / "runs" / "final_transformer_s3",
                              kernel_sources=[s2])
+    # The session's own clock budget has to fit the quota, not just Kaggle's
+    # 12-hour cap: a session that outruns the allowance is cut off mid-epoch and
+    # its /kaggle/working is lost, which costs the checkpoint as well as the
+    # hours. Leave 1.5 h for the prediction kernel and a margin.
+    budget = max(3.0, min(9.0, have - 1.5))
+    log(f"  session clock budget {budget:.1f} h against {have:.1f} GPU-h left")
     ex.push({"round": "final-transformer-s3", "candidates": [],
              "submit": {"candidate": cand, "use_all_train": False,
-                        "predict": False, "session_hours": 9.0}})
+                        "predict": False, "session_hours": budget}})
     log(f"  pushed {s3}")
     save(session3_pushed=True, session3_total=total)
     log(f"  {s3}: {wait_for(s3)}")
