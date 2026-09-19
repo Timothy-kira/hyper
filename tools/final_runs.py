@@ -54,9 +54,13 @@ DESIGN = {
     # A T4 has 16 GB and RT-DETR trains without AMP; at 1024 that is what fits.
     # nbs is 64 either way, so the optimizer still steps on an effective 64.
     "train.batch": 4,
-    # COCO pretraining was at 640, so training at 1024 pulls the backbone off
-    # the scale statistics it knows; covering a range is gentler than jumping.
-    "train.multi_scale": True,
+    # multi_scale is off, and this was measured rather than chosen: ultralytics
+    # samples roughly 0.5x to 1.5x of imgsz, which at 1024 reaches 1984 px. The
+    # first Phase A push OOM'd on a T4 at that size, ultralytics halved the
+    # batch twice trying to recover, and BatchNorm then failed on a batch of
+    # one -- both arms lost. The scale-drift argument for it is real but it
+    # cannot be had at this resolution on this hardware.
+    "train.multi_scale": False,
     # Large early gradients from a fresh head and mixer reach every pretrained
     # layer behind them. A longer ramp is the lever that does not also freeze.
     "train.warmup_epochs": 5.0,
