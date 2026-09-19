@@ -349,7 +349,7 @@ def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
             # augmented, so the score keeps measuring the real distribution.
             img = build_channels(cube, cand["channels"])
             n_ch = img.shape[2]
-            emit(root, split, str(pid), img, a.boxes, a)
+            frame = emit(root, split, str(pid), img, a.boxes, a)
 
             if split == "train":
                 # Augmented copies are re-rendered; repeats are file copies.
@@ -362,7 +362,7 @@ def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
                     c2, b2 = augment_cube(cube, list(a.boxes), aug, donors, pool, rng)
                     emit(root, split, f"{pid}_a{k}", build_channels(c2, cand["channels"]), b2, a)
                 for k in range(reps[pid] - 1):
-                    for src, dst in ((n, n.with_name(f"{pid}_r{k}{n.suffix}")),
+                    for src, dst in ((frame, frame.with_name(f"{pid}_r{k}{frame.suffix}")),
                                      (root / "labels" / split / f"{pid}.txt",
                                       root / "labels" / split / f"{pid}_r{k}.txt")):
                         shutil.copyfile(src, dst)
@@ -470,6 +470,47 @@ if _nn is not None:
 else:                                                # pragma: no cover
     SpectralFront = None
 
+try:
+    import torch as _torch
+    import torch.nn.functional as _F
+    from ultralytics.models.utils.loss import RTDETRDetectionLoss as _RTDETRLoss
+    from ultralytics.utils.metrics import bbox_iou as _bbox_iou
+except ImportError:                                  # pragma: no cover
+    _RTDETRLoss = None
+
+if _RTDETRLoss is not None:
+    class IoUKindDETRLoss(_RTDETRLoss):
+        """RT-DETR's loss with the overlap term made selectable.
+
+        Its box loss is L1 on the coordinates plus 1 - GIoU. The error
+        decomposition says what is left of the score is box tightness on
+        elongated objects -- median matched IoU 0.864, and AP correlates with
+        a class's median aspect ratio at r = -0.65 net of frequency. CIoU is
+        GIoU plus a centre-distance and an aspect-ratio consistency penalty,
+        which is that failure written down; DIoU is the same without the
+        aspect term, which is how to tell which half is doing the work.
+
+        Defined at module level because the model is pickled into every
+        checkpoint and pickle cannot name a class built inside a function.
+        """
+
+        iou_flag: dict = {"GIoU": True}
+
+        def _get_loss_bbox(self, pred_bboxes, gt_bboxes, postfix=""):
+            name_bbox, name_giou = f"loss_bbox{postfix}", f"loss_giou{postfix}"
+            if not len(gt_bboxes):
+                z = _torch.tensor(0.0, device=self.device)
+                return {name_bbox: z, name_giou: z.clone()}
+            n = len(gt_bboxes)
+            iou = _bbox_iou(pred_bboxes, gt_bboxes, xywh=True, **self.iou_flag)
+            return {
+                name_bbox: (self.loss_gain["bbox"]
+                            * _F.l1_loss(pred_bboxes, gt_bboxes, reduction="sum") / n).squeeze(),
+                name_giou: (self.loss_gain["giou"] * (1.0 - iou).sum() / n).squeeze(),
+            }
+else:                                                # pragma: no cover
+    IoUKindDETRLoss = None
+
 if SpectralFront is not None:
     # The trained model is pickled into every checkpoint, and pickle stores the
     # class by module *name*. This script is __main__ on Kaggle but not
@@ -482,6 +523,9 @@ if SpectralFront is not None:
     _mod = _sys.modules.setdefault("hod26_kernel", _types.ModuleType("hod26_kernel"))
     _mod.SpectralFront = SpectralFront
     SpectralFront.__module__ = "hod26_kernel"
+    if IoUKindDETRLoss is not None:
+        _mod.IoUKindDETRLoss = IoUKindDETRLoss
+        IoUKindDETRLoss.__module__ = "hod26_kernel"
 
 
 def install_spectral_adapter(net, n_bands, projection=None, ckpt_name=None,
@@ -640,51 +684,23 @@ def perturb_derived_rows(net, names, scale=0.05):
     return touched
 
 
-def install_bbox_loss(net, kind: str, loss_gain: dict | None = None):
-    """Swap the box-overlap term RT-DETR regresses against.
+def install_bbox_loss(net, kind: str, nc: int, loss_gain: dict | None = None):
+    """Swap the overlap term RT-DETR regresses against.
 
-    The error decomposition says the score is almost entirely a box-tightness
-    problem -- 96.6% of held-out ground truth is found at IoU >= 0.5 and only
-    0.1% is given the wrong class, so what is left is the distance from a
-    median matched IoU of 0.864 up to the thresholds above it. And the classes
-    that fall short are the elongated ones: people at median aspect 2.13, car
-    1.68, stone_block 1.50, against 1.0-1.2 for the tabletop objects that score
-    0.65-0.80.
-
-    CIoU is the term with an aspect-ratio consistency penalty on top of DIoU's
-    centre distance, which is exactly the failure being measured. ultralytics'
-    bbox_iou already implements it, so the change is which flag is passed.
+    ultralytics' bbox_iou already implements every variant, so the change is
+    which flag it is passed. nc comes from the caller because the model does
+    not carry it yet -- set_model_attributes attaches it after get_model runs.
     """
-    import torch
-    import torch.nn.functional as F
-    from ultralytics.models.utils.loss import RTDETRDetectionLoss
-    from ultralytics.utils.metrics import bbox_iou
-
-    kinds = {"GIoU": {"GIoU": True}, "DIoU": {"DIoU": True}, "CIoU": {"CIoU": True},
-             "IoU": {}}
+    kinds = {"GIoU": {"GIoU": True}, "DIoU": {"DIoU": True},
+             "CIoU": {"CIoU": True}, "IoU": {}}
     if kind not in kinds:
         raise ValueError(f"unknown bbox loss {kind!r}; have {sorted(kinds)}")
-    flag = kinds[kind]
 
-    class Loss(RTDETRDetectionLoss):
-        def _get_loss_bbox(self, pred_bboxes, gt_bboxes, postfix=""):
-            name_bbox, name_giou = f"loss_bbox{postfix}", f"loss_giou{postfix}"
-            if not len(gt_bboxes):
-                z = torch.tensor(0.0, device=self.device)
-                return {name_bbox: z, name_giou: z.clone()}
-            loss = {}
-            loss[name_bbox] = self.loss_gain["bbox"] * F.l1_loss(
-                pred_bboxes, gt_bboxes, reduction="sum") / len(gt_bboxes)
-            iou = bbox_iou(pred_bboxes, gt_bboxes, xywh=True, **flag)
-            giou = (1.0 - iou).sum() / len(gt_bboxes)
-            loss[name_giou] = self.loss_gain["giou"] * giou
-            return {k: v.squeeze() for k, v in loss.items()}
-
-    crit = Loss(nc=net.nc, use_vfl=True)
+    crit = IoUKindDETRLoss(nc=int(nc), use_vfl=True)
+    crit.iou_flag = kinds[kind]
     if loss_gain:
         crit.loss_gain.update(loss_gain)
-    net.init_criterion = lambda: crit
-    net.criterion = None            # force a rebuild through the override
+    net.criterion = crit
     log(f"  box loss: {kind}" + (f", gains {loss_gain}" if loss_gain else ""))
     return True
 
@@ -714,7 +730,7 @@ def restore_state(net, src):
 
 
 def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
-                  bbox_loss="GIoU", loss_gain=None):
+                  bbox_loss="GIoU", loss_gain=None, is_rtdetr=True):
     """A trainer that seeds the head from COCO by name and installs the adapter.
 
     Both have to happen inside get_model, and for the same reason: ultralytics
@@ -799,10 +815,11 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
             if real is not None:
                 net.names = real
                 perturb_derived_rows(net, real)
-            if bbox_loss and bbox_loss != "GIoU":
-                install_bbox_loss(net, bbox_loss, loss_gain)
-            elif loss_gain:
-                install_bbox_loss(net, "GIoU", loss_gain)
+            # RTDETRDetectionLoss only: the YOLO head computes its box loss
+            # somewhere else entirely, so this override would silently miss.
+            if is_rtdetr and (bbox_loss not in ("", "GIoU") or loss_gain):
+                install_bbox_loss(net, bbox_loss or "GIoU",
+                                  self.data["nc"], loss_gain)
             if adapter:
                 install_spectral_adapter(net, **adapter)
                 # Resuming rebuilds the model from its yaml, which has no
@@ -1113,7 +1130,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                                 coco_prior=tr.get("coco_prior", True),
                                 schedule_epochs=int(tr.get("schedule_epochs", 0)),
                                 bbox_loss=tr.get("bbox_loss", "GIoU"),
-                                loss_gain=tr.get("loss_gain") or None)
+                                loss_gain=tr.get("loss_gain") or None,
+                                is_rtdetr=tr["model"].startswith("rtdetr"))
     log_state = attach_epoch_log(model, tag, budget_seconds, reserve_seconds)
     results = model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
