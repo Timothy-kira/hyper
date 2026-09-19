@@ -145,7 +145,8 @@ def reached_epoch(payload: dict, default: int = 0) -> int:
 
 def run_track(track: str, total: int, use_all_train: bool, session_hours: float,
               timeout_hours: float, max_sessions: int,
-              continue_from: str | None, no_submit: bool = False) -> dict:
+              continue_from: str | None, no_submit: bool = False,
+              known_reached: int = 0) -> dict:
     cand = full_candidate(track, total)
     print(f"=== {track}: {cand['train']['model']} / {cand['channels']['mode']} + "
           f"srf{cand['train']['srf_k']} adapter / {total}ep @ "
@@ -155,13 +156,21 @@ def run_track(track: str, total: int, use_all_train: bool, session_hours: float,
     previous, reached, payload, i = continue_from, 0, {}, 0
     scores: list[dict] = []
     if previous:
-        ex = KaggleRoundExecutor(previous, timeout_hours=timeout_hours,
-                                 out_dir=REPO / "runs" / f"final_{track}_s0")
-        print(f"  waiting on {previous} (already pushed): {ex.wait()}")
-        payload = ex.fetch()
-        reached = reached_epoch(payload, total)
         i = int(previous.rsplit("-s", 1)[-1]) if "-s" in previous else 0
-        print(f"  it reached epoch {reached}/{total}, holdout {payload.get('holdout')}")
+        if known_reached:
+            # Told where it got to, so there is nothing to fetch. That matters
+            # for the sessions pushed before scratch was kept out of the
+            # output: fetching one downloads the 6.6 GB of rendered frames it
+            # uploaded along with its checkpoint.
+            reached = known_reached
+            print(f"  continuing from {previous} at epoch {reached}/{total}")
+        else:
+            ex = KaggleRoundExecutor(previous, timeout_hours=timeout_hours,
+                                     out_dir=REPO / "runs" / f"final_{track}_s0")
+            print(f"  waiting on {previous} (already pushed): {ex.wait()}")
+            payload = ex.fetch()
+            reached = reached_epoch(payload, total)
+            print(f"  it reached epoch {reached}/{total}, holdout {payload.get('holdout')}")
 
     while reached < total and i < max_sessions:
         i += 1
@@ -228,6 +237,9 @@ def main() -> None:
     ap.add_argument("--max-sessions", type=int, default=4)
     ap.add_argument("--continue-from", default=None,
                     help="a session already pushed; wait for it and carry on")
+    ap.add_argument("--reached", type=int, default=0,
+                    help="epochs the --continue-from session finished, when "
+                         "known; skips fetching its (possibly huge) output")
     ap.add_argument("--auto-continue", action="store_true",
                     help="find the latest session already pushed and carry on "
                          "from it; how a restarted orchestrator rejoins a run")
@@ -245,7 +257,8 @@ def main() -> None:
             print(f"rejoining {t} at {cont or 'the beginning'}")
         results[t] = run_track(t, args.epochs, args.use_all_train,
                                args.session_hours, args.timeout_hours,
-                               args.max_sessions, cont, args.no_submit)
+                               args.max_sessions, cont, args.no_submit,
+                               args.reached)
     out = REPO / "runs" / "final_comparison.json"
     out.write_text(json.dumps(results, indent=2))
     print(f"\nwrote {out}")
