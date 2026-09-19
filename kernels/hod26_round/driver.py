@@ -1082,89 +1082,132 @@ def find_weights(name):
     return None
 
 
-def run_predict_only(round_cfg):
-    """Predict the test set from a checkpoint another kernel already trained.
+def score_val_split(model, cand, root):
+    """Score the held-out split with pycocotools, per class.
 
-    This exists to buy the one number the project has never had: how a score on
-    our own held-out split translates to the leaderboard. Every design decision
-    so far has been made against a local validator that has never been checked
-    against the competition's scorer, and the gap between them is unknown in
-    both size and sign. Reusing a checkpoint that already exists makes that
-    calibration cost a few GPU-minutes instead of a training run.
+    This is the honest diagnostic. Training already validates every epoch, but
+    with ultralytics' own metric, which measures 0.048 above the competition's
+    on the very same frames -- and the bottleneck ranking is built from
+    *per-class* AP, so a ruler that disagrees on the total can reorder what
+    looks worst. Scoring the same way the leaderboard does keeps the thing we
+    steer by and the thing we are scored on in the same units.
     """
-    cand = round_cfg["submit"]["candidate"]
-    name = round_cfg["submit"]["weights_from"]
-    w = find_weights(name)
-    if w is None:
-        raise RuntimeError(f"no {name} under {INPUT}; attached kernels: "
-                           f"{[p.name for p in sorted(INPUT.glob('*'))]}")
-    log(f"predict-only from {w} ({w.stat().st_size / 1e6:.0f} MB)")
+    ann_dir = root / "train" / "annotations"
+    ids = require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
+    _, val_ids = split_ids(ids)
+    # parse() takes image_id from the filename, the same id predict_test tags
+    # its rows with.
+    anns = [parse(ann_dir / f"{pid}.xml") for pid in val_ids]
 
-    root = data_root()
+    preds, _ = predict_test(model, cand, root / "train" / "images", val_ids)
+    shutil.rmtree(SCRATCH / "test_images", ignore_errors=True)
+    scored = evaluate(anns, preds, per_class=True)
+    wide = evaluate(anns, preds, max_dets=300)
+    log(f"held-out split, {len(val_ids)} frames, {len(preds)} boxes:")
+    log(f"  maxDets=100 (what COCOeval reports): mAP={scored['mAP']:.4f} "
+        f"mAP50={scored['mAP50']:.4f}")
+    log(f"  maxDets=300 (what ultralytics counts): mAP={wide['mAP']:.4f} "
+        f"mAP50={wide['mAP50']:.4f}")
+    for name, ap in sorted(scored["per_class"].items(), key=lambda kv: kv[1]):
+        log(f"    {name:16s} {ap:.4f}")
+    # Keep the raw predictions: every question asked of them afterwards is then
+    # a CPU question, not another GPU session.
+    (WORK / "val_predictions.json").write_text(json.dumps(
+        [[int(r[0]), int(r[1]), round(float(r[2]), 5)] + [round(float(x), 2) for x in r[3:]]
+         for r in preds]))
+    return {"frames": len(val_ids), "boxes": len(preds), **scored,
+            "mAP_maxdet300": wide["mAP"], "mAP50_maxdet300": wide["mAP50"]}
+
+
+def sweep_inference(model, cand, root, variants):
+    """Measure the submission path itself, one inference setting at a time.
+
+    The held-out score through this path (0.4076) sits 0.048 below what
+    ultralytics' validator reported for the same checkpoint on the same frames
+    (0.4556). That is either two metrics disagreeing, in which case nothing is
+    lost, or this path producing worse boxes than the validator's, in which
+    case 0.048 is being left on the table at every submission -- more than the
+    whole distance between first place and fifteenth. Rather than reason about
+    which, each setting is measured against the scorer that counts.
+
+    The frames are staged once and reused, so each extra variant costs only its
+    own forward pass.
+    """
+    ann_dir = root / "train" / "annotations"
+    ids = require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
+    _, val_ids = split_ids(ids)
+    anns = [parse(ann_dir / f"{pid}.xml") for pid in val_ids]
+
+    staging = SCRATCH / "test_images"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=True)
+    of_path = {}
+    for n, pid in enumerate(val_ids):
+        img = build_channels(load_planar(root / "train" / "images" / f"{pid}.png"),
+                             cand["channels"])
+        of_path[str(write_frame(staging / str(pid), img))] = pid
+        if n % 250 == 0:
+            log(f"  staged {n}/{len(val_ids)}")
+
+    out = {}
+    for name, extra in variants.items():
+        kw = {**predict_kwargs(cand), **extra}
+        t0 = time.time()
+        preds = []
+        for r in model.predict(str(staging), **kw):
+            pid = of_path.get(str(Path(r.path).resolve()), of_path.get(str(r.path)))
+            preds.extend(_rows(pid, r))
+        scored = evaluate(anns, preds, per_class=True)
+        out[name] = {**scored, "boxes": len(preds),
+                     "seconds": round(time.time() - t0, 1), "kwargs": {
+                         k: v for k, v in extra.items()}}
+        log(f"  {name:22s} mAP={scored['mAP']:.4f} mAP50={scored['mAP50']:.4f} "
+            f"({len(preds)} boxes, {out[name]['seconds']:.0f}s)")
+    shutil.rmtree(staging, ignore_errors=True)
+    return out
+
+
+def predict_test_set(model, cand, root):
+    """Predict the competition's test frames and write submission.csv."""
     test_dir = root / "test" / "images"
-    model = build_model(cand["train"]["model"], str(w))
     test_ids = require_ids(sorted(int(p.stem) for p in test_dir.glob("*.png")), test_dir)
     log(f"predicting {len(test_ids)} test images")
     preds, sizes = predict_test(model, cand, test_dir, test_ids)
     shutil.rmtree(SCRATCH / "test_images", ignore_errors=True)
     n = write(WORK / "submission.csv", preds, clip_to=sizes)
     log(f"wrote submission.csv: {n} rows over {len({p[0] for p in preds})} images")
-    (WORK / "results.json").write_text(json.dumps({
-        "mode": "predict_only", "rows": n, "weights": str(w),
-        "candidate": cand, "predicted": True,
-    }, indent=2))
+    return {"rows": n, "images": len({p[0] for p in preds})}
 
 
-def run_score_val(round_cfg):
-    """Score an existing checkpoint on the held-out split, through the real path.
+def run_from_checkpoint(round_cfg):
+    """Evaluate and/or submit a checkpoint another kernel already trained.
 
-    The calibration submission put a checkpoint whose local score is known
-    exactly (0.4556, ultralytics' validator) on the leaderboard at 0.40249. That
-    0.053 is either the two scorers and two inference paths disagreeing, or the
-    test set being harder than our split -- and the two call for opposite
-    responses. Running the *prediction* path over the *validation* frames and
-    scoring with pycocotools isolates it: land near 0.4556 and the pipeline is
-    consistent, so the gap is the test set; land near 0.40 and the gap is ours
-    to fix, and it is worth 0.05 on the submission that counts.
+    Kept out of the training sessions on purpose. A training session that also
+    predicted would spend part of its clock budget on inference and would only
+    ever report its own metric; running this afterwards on the second GPU slot
+    costs no wall clock and gives both numbers that matter -- the leaderboard's,
+    and a per-class breakdown measured the same way -- after every session
+    rather than once at the end.
     """
-    cand = round_cfg["submit"]["candidate"]
-    name = round_cfg["submit"]["weights_from"]
-    w = find_weights(name)
+    sub = round_cfg["submit"]
+    cand = sub["candidate"]
+    w = find_weights(sub["weights_from"])
     if w is None:
-        raise RuntimeError(f"no {name} under {INPUT}")
-    log(f"scoring {w} on the held-out split")
+        raise RuntimeError(f"no {sub['weights_from']} under {INPUT}; attached: "
+                           f"{[p.name for p in sorted(INPUT.glob('*'))]}")
+    log(f"from checkpoint {w} ({w.stat().st_size / 1e6:.0f} MB)")
 
     root = data_root()
-    ann_dir = root / "train" / "annotations"
-    ids = require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
-    _, val_ids = split_ids(ids)
-    # parse() already takes image_id from the filename, which is the same id
-    # predict_test tags its rows with.
-    anns = [parse(ann_dir / f"{pid}.xml") for pid in val_ids]
-
     model = build_model(cand["train"]["model"], str(w))
-    preds, _ = predict_test(model, cand, root / "train" / "images", val_ids)
-    shutil.rmtree(SCRATCH / "test_images", ignore_errors=True)
-    # predict_test rows are (image_id, class, conf, x1, y1, x2, y2), which is
-    # the shape evaluate() takes.
-    scored = evaluate(anns, preds, per_class=True)
-    wide = evaluate(anns, preds, max_dets=300)
-    log(f"pycocotools on the held-out split, {len(val_ids)} frames, "
-        f"{len(preds)} boxes:")
-    log(f"  maxDets=100 (what COCOeval reports): mAP={scored['mAP']:.4f} "
-        f"mAP50={scored['mAP50']:.4f}")
-    log(f"  maxDets=300 (what ultralytics counts): mAP={wide['mAP']:.4f} "
-        f"mAP50={wide['mAP50']:.4f}")
-    # Keep the raw predictions: every question asked of them afterwards is then
-    # a CPU question, not another GPU session.
-    (WORK / "val_predictions.json").write_text(json.dumps(
-        [[int(r[0]), int(r[1]), round(float(r[2]), 5)] + [round(float(x), 2) for x in r[3:]]
-         for r in preds]))
-    (WORK / "results.json").write_text(json.dumps({
-        "mode": "score_val", "frames": len(val_ids), "boxes": len(preds),
-        "weights": str(w), "candidate": cand, **scored,
-        "mAP_maxdet300": wide["mAP"], "mAP50_maxdet300": wide["mAP50"],
-    }, indent=2))
+    out = {"mode": "checkpoint", "weights": str(w), "candidate": cand}
+    if sub.get("sweep"):
+        out["sweep"] = sweep_inference(model, cand, root, sub["sweep"])
+    if sub.get("score_val", True):
+        out["val"] = score_val_split(model, cand, root)
+    if sub.get("predict_test", True):
+        out.update(predict_test_set(model, cand, root))
+        out["predicted"] = True
+    (WORK / "results.json").write_text(json.dumps(out, indent=2))
 
 
 def run_submission(round_cfg):
@@ -1233,9 +1276,7 @@ def main():
 
     if round_cfg.get("submit"):
         if round_cfg["submit"].get("weights_from"):
-            if round_cfg["submit"].get("score_val"):
-                return run_score_val(round_cfg)
-            return run_predict_only(round_cfg)
+            return run_from_checkpoint(round_cfg)
         return run_submission(round_cfg)
 
     root = data_root()

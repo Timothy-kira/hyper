@@ -33,10 +33,17 @@ def predict_and_submit(source: str, cand: dict, slug: str, message: str,
     ex = KaggleRoundExecutor(slug, timeout_hours=timeout_hours, out_dir=out_dir,
                              kernel_sources=[source])
     ex.push({"round": "predict", "candidates": [],
-             "submit": {"candidate": cand, "weights_from": weights}})
-    log(f"  predict kernel {slug} pushed (reads {weights} from {source})")
+             "submit": {"candidate": cand, "weights_from": weights,
+                        "score_val": True, "predict_test": True}})
+    log(f"  eval kernel {slug} pushed (reads {weights} from {source})")
     state = ex.wait()
     payload = ex.fetch()
+    val = payload.get("val") or {}
+    if val:
+        log(f"  held-out, scored the way the leaderboard scores: "
+            f"mAP {val['mAP']:.4f} mAP50 {val['mAP50']:.4f} "
+            f"(ultralytics' own ruler reads ~0.05 higher)")
+        log(bottlenecks(val))
     sub = out_dir / "submission.csv"
     if not sub.exists():
         return {"error": f"{slug} finished {state} with no submission.csv"}
@@ -44,7 +51,8 @@ def predict_and_submit(source: str, cand: dict, slug: str, message: str,
     stats = check(sub)
     log(f"  {stats['rows']} rows over {stats['images']} frames, validator ok")
     if not submit:
-        return {"rows": stats["rows"], "images": stats["images"], "submitted": False}
+        return {"rows": stats["rows"], "images": stats["images"],
+                "submitted": False, "val": val}
 
     r = subprocess.run(["kaggle", "competitions", "submit", "-c", COMPETITION,
                         "-f", str(sub), "-m", message],
@@ -56,8 +64,22 @@ def predict_and_submit(source: str, cand: dict, slug: str, message: str,
         log(f"  submission refused: {out.strip()[:200]}")
         return {"rows": stats["rows"], "submitted": False, "reason": out.strip()[:200]}
     log(f"  submitted: {message}")
-    return {"rows": stats["rows"], "submitted": True,
+    return {"rows": stats["rows"], "submitted": True, "val": val,
             "score": poll_score(message, log=log)}
+
+
+def bottlenecks(val: dict) -> str:
+    """Rank what is costing the macro average, from the per-class AP just measured.
+
+    The ranking has been re-derived at every fidelity so far and it has
+    reordered every time -- material discrimination led at one scale and
+    localization at the next -- so it is worth recomputing after each session
+    rather than carrying forward the last one's conclusion.
+    """
+    from dream_rsi.diagnose import analyse, dataset_stats, report
+    stats = dataset_stats(REPO / "data" / "hod26_planar" / "train" / "annotations")
+    return report(analyse(val.get("per_class", {}), stats,
+                          val.get("mAP", 0.0), val.get("mAP50", 0.0)))
 
 
 def poll_score(message: str, tries: int = 40, wait: int = 30, log=print):
