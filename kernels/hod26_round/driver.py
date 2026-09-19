@@ -352,19 +352,26 @@ def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
             emit(root, split, str(pid), img, a.boxes, a)
 
             if split == "train":
-                # Repeats are augmented copies rather than duplicates: the same
-                # frame written twice teaches nothing the first copy did not.
-                n_extra = copies if wants_aug else 0
-                n_extra += (reps[pid] - 1) if wants_aug else 0
-                for k in range(n_extra):
+                # Augmented copies are re-rendered; repeats are file copies.
+                # A repeat is not a wasted duplicate: ultralytics augments at
+                # load time -- mosaic, flip, scale, HSV -- so the same frame
+                # listed twice trains on two different images. Re-rendering it
+                # would only add our own spectral augmentation on top, which is
+                # what the copies setting is for and is separate from balance.
+                for k in range(copies if wants_aug else 0):
                     c2, b2 = augment_cube(cube, list(a.boxes), aug, donors, pool, rng)
                     emit(root, split, f"{pid}_a{k}", build_channels(c2, cand["channels"]), b2, a)
+                for k in range(reps[pid] - 1):
+                    for src, dst in ((n, n.with_name(f"{pid}_r{k}{n.suffix}")),
+                                     (root / "labels" / split / f"{pid}.txt",
+                                      root / "labels" / split / f"{pid}_r{k}.txt")):
+                        shutil.copyfile(src, dst)
 
     for split, ids in (("train", train_ids), ("val", val_ids)):
         n = len(list((root / "images" / split).glob("*.png"))) + \
             len(list((root / "images" / split).glob("*.tiff")))
-        expect = (sum(reps[p] + copies for p in ids) if split == "train" and wants_aug
-                  else len(ids))
+        expect = (sum(reps[p] + (copies if wants_aug else 0) for p in ids)
+                  if split == "train" else len(ids))
         if n == 0 or n != expect:
             raise RuntimeError(f"{split}: wrote {n} images, expected {expect}")
     log(f"  rendered {cand['channels']['mode']}"
