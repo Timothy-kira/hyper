@@ -39,10 +39,28 @@ def main() -> None:
 
     # The GIoU baseline is already measured -- mAP 0.4106, people 0.386,
     # car 0.562, e-bike 0.408, stone_block 0.286 -- so only the treatments run.
+    # Round one, measured: giou 0.4106, ciou 0.4107, diou 0.4197. DIoU is
+    # nominally ahead and CIoU -- DIoU plus an aspect-ratio penalty -- gives
+    # the gain straight back, so the aspect term is not earning its place in
+    # the overlap function. Round two keeps DIoU and attacks the same aspect
+    # problem from the other side, where the error is absolute rather than
+    # relative. Margins here are a single seed over 104 frames, so 0.01 is
+    # about the noise floor; the per-class pattern matters more than the total.
     all_arms = {
         "giou": {},
         "ciou": {"train.bbox_loss": "CIoU"},
         "diou": {"train.bbox_loss": "DIoU"},
+        # L1 on width and height in log space: relative error, not absolute.
+        "logl1": {"train.bbox_loss": "DIoU", "train.log_size_l1": True},
+        # 1 - IoU^3, plus a floor under Varifocal's positive weight.
+        "sharpen": {"train.bbox_loss": "DIoU", "train.bbox_alpha": 3.0,
+                    "train.vfl_beta": 0.5},
+        "both": {"train.bbox_loss": "DIoU", "train.log_size_l1": True,
+                 "train.bbox_alpha": 3.0, "train.vfl_beta": 0.5},
+        # The blunt version of logl1: L1 is the term with the scale bias and
+        # GIoU is already scale-relative, so shift the weight between them.
+        "gains": {"train.bbox_loss": "DIoU",
+                  "train.loss_gain": {"bbox": 2, "giou": 5}},
     }
     cands = [(n, arm(**{"train.model": "rtdetr-l", **kw}))
              for n, kw in all_arms.items() if n in args.arms]

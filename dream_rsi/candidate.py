@@ -109,8 +109,21 @@ DEFAULT: dict = {
         # aspect-ratio penalty -- the two things that failure is made of.
         "bbox_loss": "GIoU",
         # DETRLoss weights: {"bbox": 5, "giou": 2, "class": 1, ...}. Raising
-        # giou against bbox moves capacity from L1 on coordinates to overlap.
+        # giou against bbox moves capacity from L1 on coordinates to overlap --
+        # the blunt version of log_size_l1, since L1 is the term with the
+        # scale bias and GIoU is already scale-relative.
         "loss_gain": {},
+        # 1 - IoU becomes 1 - IoU^alpha, so the pull grows as a box closes on
+        # its target. 1.0 is the stock loss.
+        "bbox_alpha": 1.0,
+        # Floor under Varifocal's positive weight, which is otherwise the
+        # pair's own IoU -- so the near-misses get the least gradient. 0 is
+        # the stock loss, 1 weights every positive alike.
+        "vfl_beta": 0.0,
+        # L1 on width and height in log space, making the error relative
+        # rather than absolute. An absolute L1 charges the same for a 24% and
+        # a 5.7% relative error on the two sides of one elongated box.
+        "log_size_l1": False,
         # Frames holding a class that appears in few frames are repeated, so a
         # macro-averaged metric is not decided by how often a class was
         # photographed. 0 disables it.
@@ -174,6 +187,9 @@ _MOVES: dict[str, list] = {
     "train.warmup_epochs": [3.0, 5.0],
     "train.multi_scale": [True, False],
     "train.bbox_loss": ["GIoU", "DIoU", "CIoU"],
+    "train.bbox_alpha": [1.0, 2.0, 3.0],
+    "train.vfl_beta": [0.0, 0.5, 1.0],
+    "train.log_size_l1": [True, False],
     "train.repeat_threshold": [0.0, 0.05, 0.1],
 }
 

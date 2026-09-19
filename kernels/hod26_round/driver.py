@@ -473,28 +473,89 @@ else:                                                # pragma: no cover
 try:
     import torch as _torch
     import torch.nn.functional as _F
+    from ultralytics.utils.torch_utils import autocast as _autocast
     from ultralytics.models.utils.loss import RTDETRDetectionLoss as _RTDETRLoss
+    from ultralytics.utils.loss import VarifocalLoss as _VFL
     from ultralytics.utils.metrics import bbox_iou as _bbox_iou
 except ImportError:                                  # pragma: no cover
     _RTDETRLoss = None
 
 if _RTDETRLoss is not None:
-    class IoUKindDETRLoss(_RTDETRLoss):
-        """RT-DETR's loss with the overlap term made selectable.
+    class IoUKindVFL(_VFL):
+        """Varifocal loss with a floor under the weight it gives a positive.
 
-        Its box loss is L1 on the coordinates plus 1 - GIoU. The error
-        decomposition says what is left of the score is box tightness on
-        elongated objects -- median matched IoU 0.864, and AP correlates with
-        a class's median aspect ratio at r = -0.65 net of frequency. CIoU is
-        GIoU plus a centre-distance and an aspect-ratio consistency penalty,
-        which is that failure written down; DIoU is the same without the
-        aspect term, which is how to tell which half is doing the work.
+        VFL weights a matched query by its own IoU with the ground truth
+        (models/utils/loss.py sets gt_score to exactly that), so a pair at IoU
+        0.6 receives two thirds the classification gradient of one at 0.9. That
+        is deliberate -- it is how the predicted score comes to mean
+        localization quality -- but it means training leans away from the
+        near-misses, and within the four classes carrying our deficit, half the
+        boxes sit in that discounted band.
+
+        beta lifts the floor: 0 is VFL unchanged, 1 weights every positive
+        alike, 0.5 halves the discount without flattening the quality signal.
+        """
+
+        beta: float = 0.0
+
+        def forward(self, pred_score, gt_score, label):
+            if not self.beta:
+                return super().forward(pred_score, gt_score, label)
+            pos = gt_score + self.beta * (1.0 - gt_score)
+            weight = (self.alpha * pred_score.sigmoid().pow(self.gamma) * (1 - label)
+                      + pos * label)
+            with _autocast(enabled=False, device=pred_score.device.type):
+                return (_F.binary_cross_entropy_with_logits(
+                    pred_score.float(), gt_score.float(), reduction="none")
+                    * weight).mean(1).sum()
+
+    class IoUKindDETRLoss(_RTDETRLoss):
+        """RT-DETR's box and class losses, conditioned on how good a match is.
+
+        The error decomposition leaves one thing to fix: 96.6% of held-out
+        ground truth is found at IoU >= 0.5 and 0.1% is given the wrong class,
+        so the score is the distance from a median matched IoU of 0.864 up to
+        the thresholds above it. Across the eighteen classes, AP tracks median
+        aspect ratio at r = -0.65 net of frequency. Three knobs, each defaulting
+        to the stock loss exactly:
+
+        iou_flag   which overlap term. CIoU is GIoU plus a centre-distance and
+                   an aspect-ratio penalty, which is that failure written down;
+                   DIoU is the same without the aspect term, which separates
+                   which half does the work.
+        alpha      1 - IoU becomes 1 - IoU^alpha, so d/dIoU = -alpha*IoU^(a-1)
+                   grows as a box closes on its target: found, now sharpen it
+                   (alpha-IoU, He et al. 2021). The power form keeps gradient
+                   everywhere, unlike a clamped interval, so the loose tail is
+                   not abandoned.
+        log_size   L1 on width and height in log space. DETR scales boxes to
+                   [0,1] and takes an absolute L1, so an error of 0.01 costs
+                   the same on a side of 0.041 as on one of 0.174 -- 24%
+                   against 5.7% in the terms IoU actually charges. The
+                   gradient between the two sides of one box is misallocated
+                   about fourfold, and worse the flatter the box. Log space
+                   makes it relative (arXiv 2410.22638: +2.2 AP, +2.9 small).
 
         Defined at module level because the model is pickled into every
         checkpoint and pickle cannot name a class built inside a function.
         """
 
         iou_flag: dict = {"GIoU": True}
+        alpha_iou: float = 1.0
+        log_size: bool = False
+        EPS = 1e-4
+
+        def _l1(self, pred_bboxes, gt_bboxes):
+            if not self.log_size:
+                return _F.l1_loss(pred_bboxes, gt_bboxes, reduction="sum")
+            # Centres stay linear; only the sizes move to log space. Sizes come
+            # out of a sigmoid, so a width near zero would send log to -inf --
+            # the clamp is what keeps that from surfacing as a NaN epochs later.
+            ctr = _F.l1_loss(pred_bboxes[..., :2], gt_bboxes[..., :2], reduction="sum")
+            wh = _F.l1_loss(pred_bboxes[..., 2:].clamp_min(self.EPS).log(),
+                            gt_bboxes[..., 2:].clamp_min(self.EPS).log(),
+                            reduction="sum")
+            return ctr + wh
 
         def _get_loss_bbox(self, pred_bboxes, gt_bboxes, postfix=""):
             name_bbox, name_giou = f"loss_bbox{postfix}", f"loss_giou{postfix}"
@@ -502,14 +563,22 @@ if _RTDETRLoss is not None:
                 z = _torch.tensor(0.0, device=self.device)
                 return {name_bbox: z, name_giou: z.clone()}
             n = len(gt_bboxes)
-            iou = _bbox_iou(pred_bboxes, gt_bboxes, xywh=True, **self.iou_flag)
+            variant = _bbox_iou(pred_bboxes, gt_bboxes, xywh=True, **self.iou_flag)
+            if self.alpha_iou == 1.0:
+                overlap = 1.0 - variant
+            else:
+                # Power the IoU, keep the variant's geometric penalty linear --
+                # alpha-IoU's form. The penalty is (iou - variant) by
+                # construction, whatever the variant.
+                plain = _bbox_iou(pred_bboxes, gt_bboxes, xywh=True)
+                overlap = (1.0 - plain.clamp_min(0).pow(self.alpha_iou)) + (plain - variant)
             return {
-                name_bbox: (self.loss_gain["bbox"]
-                            * _F.l1_loss(pred_bboxes, gt_bboxes, reduction="sum") / n).squeeze(),
-                name_giou: (self.loss_gain["giou"] * (1.0 - iou).sum() / n).squeeze(),
+                name_bbox: (self.loss_gain["bbox"] * self._l1(pred_bboxes, gt_bboxes) / n).squeeze(),
+                name_giou: (self.loss_gain["giou"] * overlap.sum() / n).squeeze(),
             }
+
 else:                                                # pragma: no cover
-    IoUKindDETRLoss = None
+    IoUKindDETRLoss = IoUKindVFL = None
 
 if SpectralFront is not None:
     # The trained model is pickled into every checkpoint, and pickle stores the
@@ -524,8 +593,9 @@ if SpectralFront is not None:
     _mod.SpectralFront = SpectralFront
     SpectralFront.__module__ = "hod26_kernel"
     if IoUKindDETRLoss is not None:
-        _mod.IoUKindDETRLoss = IoUKindDETRLoss
-        IoUKindDETRLoss.__module__ = "hod26_kernel"
+        for _c in (IoUKindDETRLoss, IoUKindVFL):
+            setattr(_mod, _c.__name__, _c)
+            _c.__module__ = "hod26_kernel"
 
 
 def install_spectral_adapter(net, n_bands, projection=None, ckpt_name=None,
@@ -684,24 +754,38 @@ def perturb_derived_rows(net, names, scale=0.05):
     return touched
 
 
-def install_bbox_loss(net, kind: str, nc: int, loss_gain: dict | None = None):
-    """Swap the overlap term RT-DETR regresses against.
-
-    ultralytics' bbox_iou already implements every variant, so the change is
-    which flag it is passed. nc comes from the caller because the model does
-    not carry it yet -- set_model_attributes attaches it after get_model runs.
-    """
-    kinds = {"GIoU": {"GIoU": True}, "DIoU": {"DIoU": True},
+IOU_KINDS = {"GIoU": {"GIoU": True}, "DIoU": {"DIoU": True},
              "CIoU": {"CIoU": True}, "IoU": {}}
-    if kind not in kinds:
-        raise ValueError(f"unknown bbox loss {kind!r}; have {sorted(kinds)}")
+
+
+def install_bbox_loss(net, nc: int, kind: str = "GIoU", alpha: float = 1.0,
+                      beta: float = 0.0, log_size: bool = False,
+                      loss_gain: dict | None = None):
+    """Condition RT-DETR's box and class losses on how good each match is.
+
+    Every default reproduces the stock loss exactly, which is what makes an A/B
+    over these clean. nc comes from the caller because the model does not carry
+    it yet -- set_model_attributes attaches it after get_model runs.
+    """
+    if kind not in IOU_KINDS:
+        raise ValueError(f"unknown bbox loss {kind!r}; have {sorted(IOU_KINDS)}")
 
     crit = IoUKindDETRLoss(nc=int(nc), use_vfl=True)
-    crit.iou_flag = kinds[kind]
+    crit.iou_flag = IOU_KINDS[kind]
+    crit.alpha_iou = float(alpha)
+    crit.log_size = bool(log_size)
+    if beta:
+        vfl = IoUKindVFL()
+        vfl.beta = float(beta)
+        crit.vfl = vfl
     if loss_gain:
         crit.loss_gain.update(loss_gain)
     net.criterion = crit
-    log(f"  box loss: {kind}" + (f", gains {loss_gain}" if loss_gain else ""))
+    log(f"  box loss: {kind}"
+        + (f", alpha={alpha}" if alpha != 1.0 else "")
+        + (f", vfl_beta={beta}" if beta else "")
+        + (", log-space wh" if log_size else "")
+        + (f", gains {loss_gain}" if loss_gain else ""))
     return True
 
 
@@ -730,7 +814,8 @@ def restore_state(net, src):
 
 
 def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
-                  bbox_loss="GIoU", loss_gain=None, is_rtdetr=True):
+                  bbox_loss="GIoU", loss_gain=None, is_rtdetr=True,
+                  bbox_alpha=1.0, vfl_beta=0.0, log_size_l1=False):
     """A trainer that seeds the head from COCO by name and installs the adapter.
 
     Both have to happen inside get_model, and for the same reason: ultralytics
@@ -817,9 +902,10 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                 perturb_derived_rows(net, real)
             # RTDETRDetectionLoss only: the YOLO head computes its box loss
             # somewhere else entirely, so this override would silently miss.
-            if is_rtdetr and (bbox_loss not in ("", "GIoU") or loss_gain):
-                install_bbox_loss(net, bbox_loss or "GIoU",
-                                  self.data["nc"], loss_gain)
+            if is_rtdetr and any((bbox_loss not in ("", "GIoU"), loss_gain,
+                                  bbox_alpha != 1.0, vfl_beta, log_size_l1)):
+                install_bbox_loss(net, self.data["nc"], bbox_loss or "GIoU",
+                                  bbox_alpha, vfl_beta, log_size_l1, loss_gain)
             if adapter:
                 install_spectral_adapter(net, **adapter)
                 # Resuming rebuilds the model from its yaml, which has no
@@ -1131,7 +1217,10 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                                 schedule_epochs=int(tr.get("schedule_epochs", 0)),
                                 bbox_loss=tr.get("bbox_loss", "GIoU"),
                                 loss_gain=tr.get("loss_gain") or None,
-                                is_rtdetr=tr["model"].startswith("rtdetr"))
+                                is_rtdetr=tr["model"].startswith("rtdetr"),
+                                bbox_alpha=float(tr.get("bbox_alpha", 1.0)),
+                                vfl_beta=float(tr.get("vfl_beta", 0.0)),
+                                log_size_l1=bool(tr.get("log_size_l1", False)))
     log_state = attach_epoch_log(model, tag, budget_seconds, reserve_seconds)
     results = model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
