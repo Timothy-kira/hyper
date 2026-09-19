@@ -80,22 +80,18 @@ AUGMENT = {"sg_window": 7, "sg_polyorder": 2, "smote_alpha": 0.3,
 CLOSE_MOSAIC = 5
 
 
-def full_candidate(track: str, epochs: int, total: int | None = None) -> dict:
-    """One session's candidate: trains to ``epochs`` of a ``total``-epoch run.
+def full_candidate(track: str, total: int) -> dict:
+    """The candidate every session of the run declares.
 
-    Two settings have to be expressed in whole-run terms or a split run stops
-    behaving like the run it is meant to be. The LR curve is shaped over the
-    total, so the sessions join where an uninterrupted run would have been
-    rather than decaying to lrf and restarting near half the peak. And mosaic
-    closes at the *global* epoch total - CLOSE_MOSAIC, which for an early
-    session means not closing at all -- ultralytics compares against this
-    session's own epoch count, so the value it is given has to be shifted.
+    Each session asks for the whole run and stops itself on the clock, so the
+    epoch count, the LR schedule and the mosaic-close epoch are all expressed
+    in whole-run terms and none of them has to be shifted per session. Where
+    the session boundary lands is then a measurement the kernel makes, not an
+    estimate made here.
     """
-    total = total or epochs
     cand = seed_candidate(**DESIGN)
-    cand["train"].update(model=TRACK_MODEL[track], epochs=epochs,
-                         schedule_epochs=total,
-                         close_mosaic=max(0, epochs - (total - CLOSE_MOSAIC)))
+    cand["train"].update(model=TRACK_MODEL[track], epochs=total,
+                         schedule_epochs=total, close_mosaic=CLOSE_MOSAIC)
     cand["augment"].update(AUGMENT)
     return normalize(cand)
 
@@ -116,80 +112,107 @@ def wait_for_quota(need: float, poll: int = 600, log=print) -> float:
         time.sleep(poll)
 
 
-def session_plan(total_epochs: int, chunks: int) -> list[int]:
-    """Cumulative epoch target for each session.
+def reached_epoch(payload: dict, default: int = 0) -> int:
+    """How far the run has actually got, from a session's results.json.
 
-    Each session trains *to* its target and stops there, so the target is what
-    goes in the config; ultralytics reads the epochs already done out of the
-    checkpoint.
+    Sessions pushed before the clock guard existed do not report last_epoch;
+    they ran to their target or died, so the target is the right fallback.
     """
-    return [round(total_epochs * (i + 1) / chunks) for i in range(chunks)]
+    got = payload.get("last_epoch")
+    if got is None:
+        got = payload.get("epochs_to", default)
+    return int(got or 0)
 
 
-def run_track(track: str, epochs: int, chunks: int, use_all_train: bool,
-              timeout_hours: float) -> dict:
-    cand_final = full_candidate(track, epochs, epochs)
-    print(f"=== {track}: {cand_final['train']['model']} / "
-          f"{cand_final['channels']['mode']} + srf{cand_final['train']['srf_k']} "
-          f"adapter / {epochs}ep @ {cand_final['train']['imgsz']} / "
-          f"augment x{1 + cand_final['augment']['copies']} in {chunks} session(s) ===")
+def run_track(track: str, total: int, use_all_train: bool, session_hours: float,
+              timeout_hours: float, max_sessions: int,
+              continue_from: str | None) -> dict:
+    cand = full_candidate(track, total)
+    print(f"=== {track}: {cand['train']['model']} / {cand['channels']['mode']} + "
+          f"srf{cand['train']['srf_k']} adapter / {total}ep @ "
+          f"{cand['train']['imgsz']} / augment x{1 + cand['augment']['copies']}, "
+          f"{session_hours}h per session ===")
 
-    previous, payload = None, {}
-    for i, target in enumerate(session_plan(epochs, chunks)):
-        slug = f"xishengfeng/hod26-final-{track}-s{i + 1}"
-        cand = full_candidate(track, target, epochs)
+    previous, reached, payload, i = continue_from, 0, {}, 0
+    if previous:
+        ex = KaggleRoundExecutor(previous, timeout_hours=timeout_hours,
+                                 out_dir=REPO / "runs" / f"final_{track}_s0")
+        print(f"  waiting on {previous} (already pushed): {ex.wait()}")
+        payload = ex.fetch()
+        reached = reached_epoch(payload, total)
+        i = int(previous.rsplit("-s", 1)[-1]) if "-s" in previous else 0
+        print(f"  it reached epoch {reached}/{total}, holdout {payload.get('holdout')}")
+
+    while reached < total and i < max_sessions:
+        i += 1
+        need = max(1.0, session_hours * 0.5)
+        have = wait_for_quota(need)
+        slug = f"xishengfeng/hod26-final-{track}-s{i}"
         ex = KaggleRoundExecutor(slug, timeout_hours=timeout_hours,
-                                 out_dir=REPO / "runs" / f"final_{track}_s{i + 1}",
+                                 out_dir=REPO / "runs" / f"final_{track}_s{i}",
                                  kernel_sources=[previous] if previous else [])
-        # Only the last session predicts and writes a submission; the earlier
-        # ones exist to move the checkpoint forward.
-        ex.push({"round": f"final-{track}-s{i + 1}", "candidates": [],
+        ex.push({"round": f"final-{track}-s{i}", "candidates": [],
                  "submit": {"candidate": cand, "use_all_train": use_all_train,
-                            "predict": i == chunks - 1}})
-        print(f"  session {i + 1}/{chunks} -> {target} epochs, pushed {slug}"
+                            "predict": "if_complete", "session_hours": session_hours}})
+        print(f"  session {i}: from epoch {reached} toward {total}, {have:.1f} GPU-h "
+              f"available, pushed {slug}"
               + (f" (continues {previous})" if previous else ""))
         state = ex.wait()
-        print(f"  session {i + 1} finished: {state}")
+        print(f"  session {i} finished: {state}")
         try:
             payload = ex.fetch()
         except Exception as e:                       # noqa: BLE001
             print(f"  could not fetch results: {e}")
-            return {"error": str(e), "session": i + 1, "candidate": cand_final}
-        print(f"  holdout mAP={payload.get('holdout')} rows={payload.get('rows')}")
-        previous = slug
+            return {"error": str(e), "session": i, "reached": reached,
+                    "candidate": cand}
+        got = reached_epoch(payload)
+        print(f"  reached epoch {got}/{total}, holdout {payload.get('holdout')}, "
+              f"predicted={payload.get('predicted')}")
+        if got <= reached:
+            # No forward progress means the next session would repeat this one.
+            # Stopping here keeps the remaining quota for a deliberate retry.
+            return {"error": f"session {i} ended at epoch {got}, no further than "
+                             f"the {reached} it started from",
+                    "reached": reached, "candidate": cand}
+        previous, reached = slug, got
 
-    sub = REPO / "runs" / f"final_{track}_s{chunks}" / "submission.csv"
+    sub = REPO / "runs" / f"final_{track}_s{i}" / "submission.csv"
     return {"holdout": payload.get("holdout"), "rows": payload.get("rows"),
+            "reached": reached, "sessions": i,
             "submission": str(sub) if sub.exists() else None,
-            "candidate": cand_final}
+            "candidate": cand}
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tracks", nargs="+", default=["transformer"])
-    ap.add_argument("--epochs", type=int, default=18)
-    ap.add_argument("--chunks", type=int, default=2,
-                    help="Kaggle sessions to split the run across")
-    ap.add_argument("--need-hours", type=float, default=14.0)
-    ap.add_argument("--timeout-hours", type=float, default=11.5)
+    ap.add_argument("--epochs", type=int, default=27)
+    ap.add_argument("--session-hours", type=float, default=10.5,
+                    help="wall clock a session may spend before stopping itself; "
+                         "Kaggle's cap is 12h and the kernel also has to render "
+                         "and, on the last session, predict")
+    ap.add_argument("--timeout-hours", type=float, default=11.9)
+    ap.add_argument("--max-sessions", type=int, default=4)
+    ap.add_argument("--continue-from", default=None,
+                    help="a session already pushed; wait for it and carry on")
     ap.add_argument("--use-all-train", action="store_true",
                     help="refit on every frame; the holdout score then means nothing")
-    ap.add_argument("--no-wait", action="store_true")
     args = ap.parse_args()
 
-    if not args.no_wait:
-        print(f"proceeding with {wait_for_quota(args.need_hours):.2f} GPU-h available")
-
-    results = {t: run_track(t, args.epochs, args.chunks, args.use_all_train,
-                            args.timeout_hours) for t in args.tracks}
+    results = {t: run_track(t, args.epochs, args.use_all_train, args.session_hours,
+                            args.timeout_hours, args.max_sessions,
+                            args.continue_from if t == args.tracks[0] else None)
+               for t in args.tracks}
     out = REPO / "runs" / "final_comparison.json"
     out.write_text(json.dumps(results, indent=2))
     print(f"\nwrote {out}")
-    ranked = sorted(((v.get("holdout") or -1, k) for k, v in results.items()), reverse=True)
-    for score, track in ranked:
-        print(f"  {track:12s} holdout mAP {score}")
-    if len(ranked) > 1:
-        print(f"\nbetter track: {ranked[0][1]}")
+    for track, r in results.items():
+        if r.get("error"):
+            print(f"  {track:12s} stopped: {r['error']}")
+        else:
+            print(f"  {track:12s} holdout mAP {r.get('holdout')} at epoch "
+                  f"{r.get('reached')} over {r.get('sessions')} session(s); "
+                  f"submission {r.get('submission')}")
 
 
 if __name__ == "__main__":

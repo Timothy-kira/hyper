@@ -27,6 +27,9 @@ WORK = Path("/kaggle/working")
 # uploaded as the kernel's output and mounted by the session that continues it.
 SCRATCH = Path("/kaggle/temp") if Path("/kaggle/temp").is_dir() else WORK
 RUNS = SCRATCH / "runs"
+# When this kernel started. Kaggle's 12-hour cap is measured from here, not
+# from the start of training, so the clock guard has to be too.
+T0 = time.time()
 VAL_FRACTION = 0.2
 PREDICT_BATCH = 32
 CACHE_SEED = 20260918
@@ -814,8 +817,21 @@ def keep_for_resume(tag):
             log(f"kept {f.name} ({f.stat().st_size / 1e6:.1f} MB)")
 
 
-def attach_epoch_log(model, tag):
-    """One flushed stdout line and one JSON record per epoch.
+def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
+    """One flushed stdout line and one JSON record per epoch, and the clock.
+
+    The clock guard is the other half of chunking. A session that overruns
+    Kaggle's 12-hour cap is killed, and a killed kernel's /kaggle/working is not
+    saved -- so an overrun costs both the GPU hours and the checkpoint they
+    bought. Rather than sizing sessions from an estimate made in advance, each
+    one stops itself when the epoch it is about to start will not fit, which
+    makes the boundary a measurement instead of a guess.
+
+    Setting trainer.stop is the clean way out: ultralytics checks it immediately
+    after this callback (engine/trainer.py, "if self.stop: break"), so the run
+    leaves through the same path a completed one does -- final_eval, save,
+    return. The unstripped last.pt is already copied out from on_model_save.
+
 
     A pushed kernel is a batch job: its log cannot be fetched through the API
     until it finishes, so the only thing that makes a long run watchable is what
@@ -879,6 +895,22 @@ def attach_epoch_log(model, tag):
             f"{rec['seconds']:.0f}s"
             + (f"  drift {drift['rel']:.4%}" if drift else ""))
 
+        if rec["final_eval"]:
+            return
+        state["last_epoch"] = rec["epoch"]
+        if not budget_seconds:
+            return
+        elapsed = time.time() - T0
+        # 15% headroom: epochs are not identical, and the one that overruns is
+        # the one that costs the whole session.
+        need = (rec["seconds"] or 0) * 1.15
+        if elapsed + need + reserve_seconds > budget_seconds:
+            trainer.stop = True
+            log(f"  stopping cleanly at epoch {rec['epoch']}: {elapsed / 3600:.2f}h "
+                f"used of {budget_seconds / 3600:.2f}h, next epoch needs "
+                f"~{need / 60:.0f} min and {reserve_seconds / 60:.0f} min is "
+                f"reserved for finishing up. The next session resumes here.")
+
     def announce(trainer):
         log(f"  training starts at epoch {trainer.start_epoch + 1} of "
             f"{trainer.epochs} (resume={bool(trainer.resume)})")
@@ -889,7 +921,8 @@ def attach_epoch_log(model, tag):
     return state
 
 
-def run_candidate(cand, index, train_ids, val_ids, anns, tag):
+def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
+                  reserve_seconds=300):
 
     root = SCRATCH / f"ds_{channels_key(cand)}"
     yaml = materialize(cand, index, train_ids, val_ids, anns, root)
@@ -923,7 +956,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     trainer_cls = hod26_trainer(base_trainer(tr["model"]), adapter=adapter,
                                 coco_prior=tr.get("coco_prior", True),
                                 schedule_epochs=int(tr.get("schedule_epochs", 0)))
-    log_state = attach_epoch_log(model, tag)
+    log_state = attach_epoch_log(model, tag, budget_seconds, reserve_seconds)
     results = model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
         lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=close_mosaic,
@@ -966,6 +999,9 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
         if getattr(box, "ap_class_index", None) is not None else {},
     }
     scores["adapter"] = drift
+    # The epoch the run actually reached, which the clock guard can cut short.
+    # The caller needs it to decide whether the run is finished.
+    scores["last_epoch"] = log_state.get("last_epoch", tr["epochs"])
     weights = RUNS / tag / "weights" / "best.pt"
     return scores, [], (str(weights) if weights.exists() else None)
 
@@ -1021,20 +1057,33 @@ def run_submission(round_cfg):
 
     anns = {pid: parse(ann_dir / f"{pid}.xml") for pid in set(train_ids) | set(val_ids)}
     index = frame_index(root, "train", sorted(set(train_ids) | set(val_ids)))
-    scores, _, weights = run_candidate(cand, index, train_ids, val_ids, anns, "final")
-    note = " (optimistic: seen in training)" if round_cfg["submit"].get("use_all_train", True) else ""
-    log(f"fit done; holdout mAP={scores['mAP']:.4f}{note}")
 
-    if not round_cfg["submit"].get("predict", True):
-        # An intermediate session of a chunked run. Its whole job is to advance
+    # A chunked run does not know in advance which session will be the last one
+    # -- the clock decides -- so "if_complete" lets the session that reaches the
+    # target epoch be the one that predicts, and reserves the time to do it.
+    target = int(cand["train"]["epochs"])
+    want = round_cfg["submit"].get("predict", True)
+    budget = float(round_cfg["submit"].get("session_hours", 0) or 0) * 3600
+    reserve = 1800 if want else 300
+
+    scores, _, weights = run_candidate(cand, index, train_ids, val_ids, anns, "final",
+                                       budget_seconds=budget, reserve_seconds=reserve)
+    note = " (optimistic: seen in training)" if round_cfg["submit"].get("use_all_train", True) else ""
+    reached = int(scores.get("last_epoch") or 0)
+    log(f"fit done at epoch {reached}/{target}; holdout mAP={scores['mAP']:.4f}{note}")
+
+    predict = want is True or (want == "if_complete" and reached >= target)
+    if not predict:
+        # An unfinished session of a chunked run. Its whole job is to advance
         # the checkpoint; predicting 1000 frames here would cost GPU time and
         # produce a submission from a half-trained model.
         (WORK / "results.json").write_text(json.dumps({
             "mode": "submit", "rows": 0, "holdout": scores["mAP"],
-            "epochs_to": cand["train"]["epochs"], "candidate": cand,
+            "last_epoch": reached, "epochs_to": target, "candidate": cand,
             "weights": weights, "predicted": False,
         }, indent=2))
-        log("intermediate session: checkpoint saved, prediction deferred")
+        log(f"session ended at epoch {reached} of {target}: checkpoint saved, "
+            f"prediction deferred")
         return
 
     model = build_model(cand["train"]["model"], weights)
@@ -1047,6 +1096,7 @@ def run_submission(round_cfg):
     log(f"wrote submission.csv: {n} rows over {len({p[0] for p in preds})} images")
     (WORK / "results.json").write_text(json.dumps({
         "mode": "submit", "rows": n, "holdout": scores["mAP"],
+        "last_epoch": reached, "epochs_to": target,
         "candidate": cand, "weights": weights, "predicted": True,
     }, indent=2))
 
