@@ -49,10 +49,12 @@ VARIANTS = {
 # thing worth ruling in or out. DETR-family models often lose here, because the
 # query priors are tuned to the training scale -- which is exactly why it is
 # measured rather than assumed.
+# batch comes down with resolution: the first attempt errored, and 1536 at the
+# default predict batch of 32 is 2.25x the memory of the 1024 pass that fits.
 UPSCALE = {
-    "imgsz1024": {"imgsz": 1024},
-    "imgsz1280": {"imgsz": 1280},
-    "imgsz1536": {"imgsz": 1536},
+    "imgsz1024": {"imgsz": 1024, "batch": 16},
+    "imgsz1280": {"imgsz": 1280, "batch": 8},
+    "imgsz1536": {"imgsz": 1536, "batch": 4},
 }
 
 
@@ -67,7 +69,7 @@ def main() -> None:
 
     cand = arm(**{"train.model": "rtdetr-l"})
     ex = KaggleRoundExecutor(args.slug, timeout_hours=3.0,
-                             out_dir=REPO / "runs" / "sweepinfer",
+                             out_dir=REPO / "runs" / args.slug.split("/")[-1],
                              kernel_sources=[args.source])
     ex.push({"round": "sweep", "candidates": [],
              "submit": {"candidate": cand, "weights_from": args.weights,
@@ -81,7 +83,7 @@ def main() -> None:
         print(f"  {name:22s} {r['mAP']:>8.4f} {r['mAP50']:>8.4f} "
               f"{r['boxes']:>8} {r['seconds']:>6.0f}")
     print("\n  for reference: ultralytics' own validator gave 0.4556 on these frames")
-    (REPO / "runs" / "sweepinfer" / "sweep.json").write_text(json.dumps(sweep, indent=2))
+    (ex.out_dir / "sweep.json").write_text(json.dumps(sweep, indent=2))
 
 
 if __name__ == "__main__":
