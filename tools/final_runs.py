@@ -51,7 +51,9 @@ DESIGN = {
     # 493x241 cube, and the feature stride is fixed. It is also the one thing
     # the public 0.66 notebooks do that the search never tried.
     "train.imgsz": 1024,
-    "train.batch": 8,
+    # A T4 has 16 GB and RT-DETR trains without AMP; at 1024 that is what fits.
+    # nbs is 64 either way, so the optimizer still steps on an effective 64.
+    "train.batch": 4,
     # COCO pretraining was at 640, so training at 1024 pulls the backbone off
     # the scale statistics it knows; covering a range is gentler than jumping.
     "train.multi_scale": True,
