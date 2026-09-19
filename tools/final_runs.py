@@ -33,6 +33,7 @@ sys.path.insert(0, str(REPO))
 from dream_rsi.budget import read_quota  # noqa: E402
 from dream_rsi.candidate import normalize, seed_candidate  # noqa: E402
 from dream_rsi.executor import KaggleRoundExecutor  # noqa: E402
+from tools.predict_submit import predict_and_submit  # noqa: E402
 
 TRACK_MODEL = {"transformer": "rtdetr-l", "yolo26": "yolo26m"}
 
@@ -126,7 +127,7 @@ def reached_epoch(payload: dict, default: int = 0) -> int:
 
 def run_track(track: str, total: int, use_all_train: bool, session_hours: float,
               timeout_hours: float, max_sessions: int,
-              continue_from: str | None) -> dict:
+              continue_from: str | None, no_submit: bool = False) -> dict:
     cand = full_candidate(track, total)
     print(f"=== {track}: {cand['train']['model']} / {cand['channels']['mode']} + "
           f"srf{cand['train']['srf_k']} adapter / {total}ep @ "
@@ -134,6 +135,7 @@ def run_track(track: str, total: int, use_all_train: bool, session_hours: float,
           f"{session_hours}h per session ===")
 
     previous, reached, payload, i = continue_from, 0, {}, 0
+    scores: list[dict] = []
     if previous:
         ex = KaggleRoundExecutor(previous, timeout_hours=timeout_hours,
                                  out_dir=REPO / "runs" / f"final_{track}_s0")
@@ -151,9 +153,13 @@ def run_track(track: str, total: int, use_all_train: bool, session_hours: float,
         ex = KaggleRoundExecutor(slug, timeout_hours=timeout_hours,
                                  out_dir=REPO / "runs" / f"final_{track}_s{i}",
                                  kernel_sources=[previous] if previous else [])
+        # Training sessions never predict. Prediction is a separate kernel on
+        # the other GPU slot afterwards, which keeps every minute of a
+        # session's clock budget on training and makes the submission come
+        # through one well-exercised path rather than two.
         ex.push({"round": f"final-{track}-s{i}", "candidates": [],
                  "submit": {"candidate": cand, "use_all_train": use_all_train,
-                            "predict": "if_complete", "session_hours": session_hours}})
+                            "predict": False, "session_hours": session_hours}})
         print(f"  session {i}: from epoch {reached} toward {total}, {have:.1f} GPU-h "
               f"available, pushed {slug}"
               + (f" (continues {previous})" if previous else ""))
@@ -164,23 +170,32 @@ def run_track(track: str, total: int, use_all_train: bool, session_hours: float,
         except Exception as e:                       # noqa: BLE001
             print(f"  could not fetch results: {e}")
             return {"error": str(e), "session": i, "reached": reached,
-                    "candidate": cand}
+                    "per_session": scores, "candidate": cand}
         got = reached_epoch(payload)
         print(f"  reached epoch {got}/{total}, holdout {payload.get('holdout')}, "
               f"predicted={payload.get('predicted')}")
+        scores.append({"session": i, "epoch": got, "holdout": payload.get("holdout")})
+        if not no_submit:
+            r = predict_and_submit(
+                source=slug, cand=cand,
+                slug=f"xishengfeng/hod26-predict-s{i}",
+                message=f"{track} session {i}: rtdetr-l + SRF adapter, epoch "
+                        f"{got}/{total}, holdout {payload.get('holdout')}",
+                out_dir=REPO / "runs" / f"predict_{track}_s{i}",
+                log=print)
+            scores[-1].update(lb=r.get("score"), submitted=r.get("submitted"))
+            print(f"  session {i}: holdout {payload.get('holdout')} -> "
+                  f"leaderboard {r.get('score')}")
         if got <= reached:
             # No forward progress means the next session would repeat this one.
             # Stopping here keeps the remaining quota for a deliberate retry.
             return {"error": f"session {i} ended at epoch {got}, no further than "
                              f"the {reached} it started from",
-                    "reached": reached, "candidate": cand}
+                    "reached": reached, "per_session": scores, "candidate": cand}
         previous, reached = slug, got
 
-    sub = REPO / "runs" / f"final_{track}_s{i}" / "submission.csv"
-    return {"holdout": payload.get("holdout"), "rows": payload.get("rows"),
-            "reached": reached, "sessions": i,
-            "submission": str(sub) if sub.exists() else None,
-            "candidate": cand}
+    return {"holdout": payload.get("holdout"), "reached": reached, "sessions": i,
+            "per_session": scores, "candidate": cand}
 
 
 def main() -> None:
@@ -195,13 +210,16 @@ def main() -> None:
     ap.add_argument("--max-sessions", type=int, default=4)
     ap.add_argument("--continue-from", default=None,
                     help="a session already pushed; wait for it and carry on")
+    ap.add_argument("--no-submit", action="store_true",
+                    help="train only; skip the per-session predict and submit")
     ap.add_argument("--use-all-train", action="store_true",
                     help="refit on every frame; the holdout score then means nothing")
     args = ap.parse_args()
 
     results = {t: run_track(t, args.epochs, args.use_all_train, args.session_hours,
                             args.timeout_hours, args.max_sessions,
-                            args.continue_from if t == args.tracks[0] else None)
+                            args.continue_from if t == args.tracks[0] else None,
+                            args.no_submit)
                for t in args.tracks}
     out = REPO / "runs" / "final_comparison.json"
     out.write_text(json.dumps(results, indent=2))
@@ -210,9 +228,11 @@ def main() -> None:
         if r.get("error"):
             print(f"  {track:12s} stopped: {r['error']}")
         else:
-            print(f"  {track:12s} holdout mAP {r.get('holdout')} at epoch "
-                  f"{r.get('reached')} over {r.get('sessions')} session(s); "
-                  f"submission {r.get('submission')}")
+            print(f"  {track:12s} epoch {r.get('reached')} over "
+                  f"{r.get('sessions')} session(s)")
+        for sc in r.get("per_session", []):
+            print(f"    session {sc['session']}: epoch {sc['epoch']:>3}  "
+                  f"holdout {sc.get('holdout')}  leaderboard {sc.get('lb')}")
 
 
 if __name__ == "__main__":

@@ -792,13 +792,18 @@ def stage_checkpoint(tag):
     (run / "weights").mkdir(parents=True, exist_ok=True)
     last = run / "weights" / "last.pt"
     shutil.copy2(src, last)
-    for name, dst in ((f"{tag}_results.csv", run / "results.csv"),
+    for name, dst in ((f"{tag}_best.pt", run / "weights" / "best.pt"),
+                      (f"{tag}_results.csv", run / "results.csv"),
                       ("results.csv", run / "results.csv"),
                       (f"{tag}_metrics.jsonl", WORK / f"{tag}_metrics.jsonl"),
                       ("metrics.jsonl", WORK / f"{tag}_metrics.jsonl")):
         f = src.parent / name
         if f.exists() and not dst.exists():
             shutil.copy2(f, dst)
+    # best.pt matters as much as last.pt here. best_fitness is restored from the
+    # checkpoint, so a session whose epochs never beat the previous session's
+    # best writes no best.pt at all -- and then the session that submits has
+    # none to submit from.
     log(f"resuming from {src} -> {last}")
     return str(last)
 
@@ -1143,11 +1148,22 @@ def run_score_val(round_cfg):
     # predict_test rows are (image_id, class, conf, x1, y1, x2, y2), which is
     # the shape evaluate() takes.
     scored = evaluate(anns, preds, per_class=True)
-    log(f"pycocotools on the held-out split: mAP={scored['mAP']:.4f} "
-        f"mAP50={scored['mAP50']:.4f} over {len(val_ids)} frames, {len(preds)} boxes")
+    wide = evaluate(anns, preds, max_dets=300)
+    log(f"pycocotools on the held-out split, {len(val_ids)} frames, "
+        f"{len(preds)} boxes:")
+    log(f"  maxDets=100 (what COCOeval reports): mAP={scored['mAP']:.4f} "
+        f"mAP50={scored['mAP50']:.4f}")
+    log(f"  maxDets=300 (what ultralytics counts): mAP={wide['mAP']:.4f} "
+        f"mAP50={wide['mAP50']:.4f}")
+    # Keep the raw predictions: every question asked of them afterwards is then
+    # a CPU question, not another GPU session.
+    (WORK / "val_predictions.json").write_text(json.dumps(
+        [[int(r[0]), int(r[1]), round(float(r[2]), 5)] + [round(float(x), 2) for x in r[3:]]
+         for r in preds]))
     (WORK / "results.json").write_text(json.dumps({
         "mode": "score_val", "frames": len(val_ids), "boxes": len(preds),
         "weights": str(w), "candidate": cand, **scored,
+        "mAP_maxdet300": wide["mAP"], "mAP50_maxdet300": wide["mAP50"],
     }, indent=2))
 
 
