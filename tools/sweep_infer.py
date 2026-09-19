@@ -41,13 +41,29 @@ VARIANTS = {
     "tta": {"augment": True},
 }
 
+# Round two. The first sweep found the path is not the problem -- every setting
+# landed within 0.0002 of the others except imgsz 640, which cost 0.015. That
+# leaves inference resolution as the one knob shown to move anything, and it was
+# only tested downward. Localization is the largest bottleneck (+0.102 in macro
+# AP) and the objects are 15-45 px, so more pixels at inference is the cheap
+# thing worth ruling in or out. DETR-family models often lose here, because the
+# query priors are tuned to the training scale -- which is exactly why it is
+# measured rather than assumed.
+UPSCALE = {
+    "imgsz1024": {"imgsz": 1024},
+    "imgsz1280": {"imgsz": 1280},
+    "imgsz1536": {"imgsz": 1536},
+}
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", default="xishengfeng/hod26-phasea-arch2")
     ap.add_argument("--weights", default="rtdetr-srf8_best.pt")
     ap.add_argument("--slug", default="xishengfeng/hod26-sweepinfer")
+    ap.add_argument("--variants", default="VARIANTS", choices=["VARIANTS", "UPSCALE"])
     args = ap.parse_args()
+    variants = {"VARIANTS": VARIANTS, "UPSCALE": UPSCALE}[args.variants]
 
     cand = arm(**{"train.model": "rtdetr-l"})
     ex = KaggleRoundExecutor(args.slug, timeout_hours=3.0,
@@ -55,7 +71,7 @@ def main() -> None:
                              kernel_sources=[args.source])
     ex.push({"round": "sweep", "candidates": [],
              "submit": {"candidate": cand, "weights_from": args.weights,
-                        "sweep": VARIANTS, "score_val": False,
+                        "sweep": variants, "score_val": False,
                         "predict_test": False}})
     print(f"pushed {ex.slug}")
     print(f"  {ex.wait()}")

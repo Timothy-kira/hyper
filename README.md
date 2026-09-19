@@ -130,6 +130,38 @@ discrimination the averaging costs (the three averaged channels correlate above
 These are single runs at 1/100th of the final run's compute. They are used to
 choose between structural alternatives, not to set hyperparameters.
 
+### What our own numbers mean
+
+The table above is ultralytics' validator. It reads high. Submitting the first
+of those checkpoints and re-scoring it three ways puts a number on how high:
+
+| same checkpoint, same 600 held-out frames unless noted | mAP |
+| --- | --- |
+| ultralytics' validator, during training | 0.4556 |
+| pycocotools through the submission path | 0.4076 |
+| pycocotools through the submission path, *test* frames (leaderboard) | 0.40249 |
+
+So the held-out split is representative -- 0.005 from the test set -- and
+essentially the whole 0.053 is the two metrics disagreeing rather than the test
+set being harder. Every local number in this repository is therefore read down
+by about 0.048 before it is compared to a leaderboard position.
+
+The gap is not something to recover. maxDets is not the cause: capping at 100
+and at 300 gives the identical 0.4076, because the detections past the first
+hundred sit at conf 0.001 and match nothing. Nor is it the inference path --
+sweeping it against pycocotools moves nothing that matters:
+
+| inference setting | mAP |
+| --- | --- |
+| rectangular letterbox | 0.4078 |
+| augmented inference (TTA) | 0.4078 |
+| square letterbox at 1024 (what the submission does) | 0.4076 |
+| square letterbox at 640 | 0.3928 |
+
+which also confirms that imgsz carries over from the checkpoint correctly, that
+inference resolution is worth 0.015 between 640 and 1024, and that TTA buys
+nothing here.
+
 ## Credentials
 
 `KAGGLE_API_TOKEN` is read from the environment. Nothing in this repository
