@@ -103,6 +103,18 @@ DEFAULT: dict = {
         # The length the LR curve is shaped over, when a run is split across
         # sessions. 0 means this session is the whole run.
         "schedule_epochs": 0,
+        # Which overlap term the box regression is trained against. The error
+        # decomposition puts nearly all the remaining loss in box tightness on
+        # elongated objects, and CIoU is GIoU plus a centre-distance and an
+        # aspect-ratio penalty -- the two things that failure is made of.
+        "bbox_loss": "GIoU",
+        # DETRLoss weights: {"bbox": 5, "giou": 2, "class": 1, ...}. Raising
+        # giou against bbox moves capacity from L1 on coordinates to overlap.
+        "loss_gain": {},
+        # Frames holding a class that appears in few frames are repeated, so a
+        # macro-averaged metric is not decided by how often a class was
+        # photographed. 0 disables it.
+        "repeat_threshold": 0.0,
         # COCO pretraining was at 640; training at 1024 pulls the backbone away
         # from the scale statistics it knows, and covering a range is gentler
         # than jumping to one new scale.
@@ -161,6 +173,8 @@ _MOVES: dict[str, list] = {
     "train.srf_width": [1.5, 2.0, 3.0],
     "train.warmup_epochs": [3.0, 5.0],
     "train.multi_scale": [True, False],
+    "train.bbox_loss": ["GIoU", "DIoU", "CIoU"],
+    "train.repeat_threshold": [0.0, 0.05, 0.1],
 }
 
 _BANDS_FOR_MODE = {

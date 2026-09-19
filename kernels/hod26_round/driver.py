@@ -271,6 +271,39 @@ def augment_cube(cube, boxes, aug, donors, pool, rng):
     return cube, boxes
 
 
+def repeat_factors(train_ids, anns, threshold: float):
+    """How many times each training frame is written, by class rarity.
+
+    Repeat-factor sampling (Gupta et al., LVIS 2019): a frame is repeated
+    sqrt(t / f) times for the rarest class it contains, where f is the fraction
+    of frames holding that class. The metric here macro-averages over eighteen
+    classes, so a class contributes a full eighteenth however seldom it was
+    photographed -- and the frame counts run from stone_block's 42 to
+    badminton's 608. Two of the four worst-scoring classes are among the
+    rarest, which is what this addresses; the other two are elongated rather
+    than rare, which it does not.
+    """
+    import math
+    if threshold <= 0:
+        return {pid: 1 for pid in train_ids}
+    n = max(1, len(train_ids))
+    freq = {}
+    for pid in train_ids:
+        for name in {CLASSES[b.cls_id] for b in anns[pid].boxes}:
+            freq[name] = freq.get(name, 0) + 1
+    cls_rep = {c: max(1.0, math.sqrt(threshold / (k / n))) for c, k in freq.items()}
+    out = {}
+    for pid in train_ids:
+        names = {CLASSES[b.cls_id] for b in anns[pid].boxes}
+        out[pid] = int(round(max((cls_rep[c] for c in names), default=1.0)))
+    extra = sum(out.values()) - len(train_ids)
+    if extra:
+        top = sorted(cls_rep.items(), key=lambda kv: -kv[1])[:4]
+        log(f"  repeat sampling (t={threshold}): +{extra} frames, "
+            + ", ".join(f"{c} x{r:.1f}" for c, r in top))
+    return out
+
+
 def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
     """Write the YOLO dataset this candidate trains on, reusing it if rendered.
 
@@ -306,6 +339,7 @@ def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
         (root / "labels" / split / f"{stem}.txt").write_text("\n".join(lines))
         return n
 
+    reps = repeat_factors(train_ids, anns, float(cand["train"].get("repeat_threshold", 0.0)))
     n_ch = 3
     for split, ids in (("train", train_ids), ("val", val_ids)):
         for pid in ids:
@@ -317,15 +351,20 @@ def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
             n_ch = img.shape[2]
             emit(root, split, str(pid), img, a.boxes, a)
 
-            if split == "train" and wants_aug:
-                for k in range(copies):
+            if split == "train":
+                # Repeats are augmented copies rather than duplicates: the same
+                # frame written twice teaches nothing the first copy did not.
+                n_extra = copies if wants_aug else 0
+                n_extra += (reps[pid] - 1) if wants_aug else 0
+                for k in range(n_extra):
                     c2, b2 = augment_cube(cube, list(a.boxes), aug, donors, pool, rng)
                     emit(root, split, f"{pid}_a{k}", build_channels(c2, cand["channels"]), b2, a)
 
     for split, ids in (("train", train_ids), ("val", val_ids)):
         n = len(list((root / "images" / split).glob("*.png"))) + \
             len(list((root / "images" / split).glob("*.tiff")))
-        expect = len(ids) * (1 + copies if split == "train" and wants_aug else 1)
+        expect = (sum(reps[p] + copies for p in ids) if split == "train" and wants_aug
+                  else len(ids))
         if n == 0 or n != expect:
             raise RuntimeError(f"{split}: wrote {n} images, expected {expect}")
     log(f"  rendered {cand['channels']['mode']}"
@@ -594,6 +633,55 @@ def perturb_derived_rows(net, names, scale=0.05):
     return touched
 
 
+def install_bbox_loss(net, kind: str, loss_gain: dict | None = None):
+    """Swap the box-overlap term RT-DETR regresses against.
+
+    The error decomposition says the score is almost entirely a box-tightness
+    problem -- 96.6% of held-out ground truth is found at IoU >= 0.5 and only
+    0.1% is given the wrong class, so what is left is the distance from a
+    median matched IoU of 0.864 up to the thresholds above it. And the classes
+    that fall short are the elongated ones: people at median aspect 2.13, car
+    1.68, stone_block 1.50, against 1.0-1.2 for the tabletop objects that score
+    0.65-0.80.
+
+    CIoU is the term with an aspect-ratio consistency penalty on top of DIoU's
+    centre distance, which is exactly the failure being measured. ultralytics'
+    bbox_iou already implements it, so the change is which flag is passed.
+    """
+    import torch
+    import torch.nn.functional as F
+    from ultralytics.models.utils.loss import RTDETRDetectionLoss
+    from ultralytics.utils.metrics import bbox_iou
+
+    kinds = {"GIoU": {"GIoU": True}, "DIoU": {"DIoU": True}, "CIoU": {"CIoU": True},
+             "IoU": {}}
+    if kind not in kinds:
+        raise ValueError(f"unknown bbox loss {kind!r}; have {sorted(kinds)}")
+    flag = kinds[kind]
+
+    class Loss(RTDETRDetectionLoss):
+        def _get_loss_bbox(self, pred_bboxes, gt_bboxes, postfix=""):
+            name_bbox, name_giou = f"loss_bbox{postfix}", f"loss_giou{postfix}"
+            if not len(gt_bboxes):
+                z = torch.tensor(0.0, device=self.device)
+                return {name_bbox: z, name_giou: z.clone()}
+            loss = {}
+            loss[name_bbox] = self.loss_gain["bbox"] * F.l1_loss(
+                pred_bboxes, gt_bboxes, reduction="sum") / len(gt_bboxes)
+            iou = bbox_iou(pred_bboxes, gt_bboxes, xywh=True, **flag)
+            giou = (1.0 - iou).sum() / len(gt_bboxes)
+            loss[name_giou] = self.loss_gain["giou"] * giou
+            return {k: v.squeeze() for k, v in loss.items()}
+
+    crit = Loss(nc=net.nc, use_vfl=True)
+    if loss_gain:
+        crit.loss_gain.update(loss_gain)
+    net.init_criterion = lambda: crit
+    net.criterion = None            # force a rebuild through the override
+    log(f"  box loss: {kind}" + (f", gains {loss_gain}" if loss_gain else ""))
+    return True
+
+
 def restore_state(net, src):
     """Copy every shape-compatible tensor from a checkpoint module into ``net``.
 
@@ -618,7 +706,8 @@ def restore_state(net, src):
     return len(ok)
 
 
-def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0):
+def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
+                  bbox_loss="GIoU", loss_gain=None):
     """A trainer that seeds the head from COCO by name and installs the adapter.
 
     Both have to happen inside get_model, and for the same reason: ultralytics
@@ -703,6 +792,10 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0):
             if real is not None:
                 net.names = real
                 perturb_derived_rows(net, real)
+            if bbox_loss and bbox_loss != "GIoU":
+                install_bbox_loss(net, bbox_loss, loss_gain)
+            elif loss_gain:
+                install_bbox_loss(net, "GIoU", loss_gain)
             if adapter:
                 install_spectral_adapter(net, **adapter)
                 # Resuming rebuilds the model from its yaml, which has no
@@ -1011,7 +1104,9 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
             attach_spectral_stem_init(model, tr["model"], tr["in_channels"], proj)
     trainer_cls = hod26_trainer(base_trainer(tr["model"]), adapter=adapter,
                                 coco_prior=tr.get("coco_prior", True),
-                                schedule_epochs=int(tr.get("schedule_epochs", 0)))
+                                schedule_epochs=int(tr.get("schedule_epochs", 0)),
+                                bbox_loss=tr.get("bbox_loss", "GIoU"),
+                                loss_gain=tr.get("loss_gain") or None)
     log_state = attach_epoch_log(model, tag, budget_seconds, reserve_seconds)
     results = model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
@@ -1318,14 +1413,28 @@ def main():
     ann_dir = root / "train" / "annotations"
     ids = require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
     train_ids, val_ids = split_ids(ids)
+    anns = {pid: parse(ann_dir / f"{pid}.xml") for pid in ids}
+
+    keep = round_cfg.get("proxy_classes")
+    if keep:
+        # Restrict the proxy to the frames holding a chosen set of classes.
+        # The four weak classes live in 518 frames that share no frame with the
+        # other fourteen, so a 300-frame random proxy gives stone_block about
+        # four frames and can measure nothing about it. Selecting the regime
+        # under test gives those classes enough support to rank a treatment.
+        keep = set(keep)
+        sel = {pid for pid, a in anns.items()
+               if {CLASSES[b.cls_id] for b in a.boxes} & keep}
+        train_ids = [i for i in train_ids if i in sel]
+        val_ids = [i for i in val_ids if i in sel]
+        log(f"restricted to frames containing {sorted(keep)}: "
+            f"{len(train_ids)} train / {len(val_ids)} val")
 
     limit = round_cfg.get("proxy_train_images")
     if limit:
         train_ids = train_ids[:limit]
         val_ids = val_ids[:round_cfg.get("proxy_val_images", len(val_ids))]
     log(f"{len(train_ids)} train / {len(val_ids)} val images")
-
-    anns = {pid: parse(ann_dir / f"{pid}.xml") for pid in train_ids + val_ids}
     index = frame_index(root, "train", train_ids + val_ids)
 
     results = []
