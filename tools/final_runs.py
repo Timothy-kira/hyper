@@ -9,11 +9,13 @@ outright. A proxy can say which choices are structural; it cannot pick the
 final configuration, and carrying proxy-fitted hyperparameters into a
 full-fidelity run is how a search talks itself into its own noise.
 
-The run does not fit in one Kaggle session. At imgsz 1024 it is around 19
-GPU-hours against a 12-hour per-session limit, and a session killed by the
-limit loses its /kaggle/working entirely -- so it goes as N sessions that each
-end on purpose, every one of them listing the last as a kernel source and
-picking up its last.pt.
+The run does not fit comfortably in one Kaggle session. Phase A measured
+rtdetr-l at 130 s per epoch over 300 images at 1024, which puts 4800 training
+images (2400 of the 80% split, doubled by augmentation) at about 35 minutes an
+epoch -- around 10.4 GPU-hours for 18 epochs, plus rendering. A session killed
+by the 12-hour limit loses its /kaggle/working entirely, so the run goes as N
+sessions that each end on purpose, every one of them listing the last as a
+kernel source and picking up its last.pt.
 """
 
 from __future__ import annotations
@@ -152,7 +154,7 @@ def main() -> None:
     ap.add_argument("--epochs", type=int, default=18)
     ap.add_argument("--chunks", type=int, default=2,
                     help="Kaggle sessions to split the run across")
-    ap.add_argument("--need-hours", type=float, default=19.0)
+    ap.add_argument("--need-hours", type=float, default=14.0)
     ap.add_argument("--timeout-hours", type=float, default=11.5)
     ap.add_argument("--use-all-train", action="store_true",
                     help="refit on every frame; the holdout score then means nothing")
