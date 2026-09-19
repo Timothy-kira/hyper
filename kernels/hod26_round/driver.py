@@ -393,6 +393,19 @@ if _nn is not None:
 else:                                                # pragma: no cover
     SpectralFront = None
 
+if SpectralFront is not None:
+    # The trained model is pickled into every checkpoint, and pickle stores the
+    # class by module *name*. This script is __main__ on Kaggle but not
+    # necessarily anywhere else, and a checkpoint that names a module the
+    # loading process does not have is unloadable -- which would strand a
+    # chunked run at its first resume. Registering a stable module and pointing
+    # the class at it makes the reference the same wherever the script runs.
+    import sys as _sys
+    import types as _types
+    _mod = _sys.modules.setdefault("hod26_kernel", _types.ModuleType("hod26_kernel"))
+    _mod.SpectralFront = SpectralFront
+    SpectralFront.__module__ = "hod26_kernel"
+
 
 def install_spectral_adapter(net, n_bands, projection=None, ckpt_name=None,
                              srf_k=0, srf_width=2.0, stem_src=None):
@@ -868,8 +881,12 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
             "fitness": _f(getattr(trainer, "fitness", None)),
         }
         # final_eval re-fires this callback once for the best checkpoint, one
-        # epoch past the end; marking it keeps the plotted curve honest.
-        rec["final_eval"] = rec["epoch"] > rec["total_epochs"]
+        # epoch past the end; marking it keeps the plotted curve honest. On a
+        # completed run that record sits past total_epochs, but a run the clock
+        # cut short ends below the total and its final_eval record looks like an
+        # ordinary epoch -- so the guard's own flag is what identifies it there.
+        rec["final_eval"] = (rec["epoch"] > rec["total_epochs"]
+                             or bool(state.get("stopped")))
         try:
             box = trainer.validator.metrics.box
             rec["per_class"] = {trainer.data["names"][int(c)]: _f(a)
@@ -906,6 +923,7 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
         need = (rec["seconds"] or 0) * 1.15
         if elapsed + need + reserve_seconds > budget_seconds:
             trainer.stop = True
+            state["stopped"] = True
             log(f"  stopping cleanly at epoch {rec['epoch']}: {elapsed / 3600:.2f}h "
                 f"used of {budget_seconds / 3600:.2f}h, next epoch needs "
                 f"~{need / 60:.0f} min and {reserve_seconds / 60:.0f} min is "
@@ -1000,8 +1018,13 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
     }
     scores["adapter"] = drift
     # The epoch the run actually reached, which the clock guard can cut short.
-    # The caller needs it to decide whether the run is finished.
-    scores["last_epoch"] = log_state.get("last_epoch", tr["epochs"])
+    # Read from the trainer rather than counted from the log: the log's last
+    # record is ultralytics re-validating the best checkpoint, which is not an
+    # epoch, and getting this one too high would let the orchestrator call an
+    # unfinished run done and never produce a submission.
+    reached = getattr(getattr(model, "trainer", None), "epoch", None)
+    scores["last_epoch"] = (int(reached) + 1 if reached is not None
+                            else log_state.get("last_epoch", tr["epochs"]))
     weights = RUNS / tag / "weights" / "best.pt"
     return scores, [], (str(weights) if weights.exists() else None)
 
