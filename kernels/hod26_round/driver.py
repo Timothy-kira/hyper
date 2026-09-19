@@ -25,7 +25,29 @@ WORK = Path("/kaggle/working")
 # The full run materializes 3000 frames plus an augmented copy of each as
 # 16-band TIFFs -- around 8 GB -- and everything under /kaggle/working is
 # uploaded as the kernel's output and mounted by the session that continues it.
-SCRATCH = Path("/kaggle/temp") if Path("/kaggle/temp").is_dir() else WORK
+def _scratch():
+    """A writable directory Kaggle will not save as this kernel's output.
+
+    /kaggle/temp is the documented place for this and it does not exist in the
+    image these kernels run on, so the original check fell through to
+    /kaggle/working -- which meant the rendered frames were being uploaded as
+    output and mounted by the next session. Only /kaggle/working is saved, so
+    creating the directory is enough to keep it out; /tmp is the fallback and
+    the output directory itself the last resort.
+    """
+    for c in (Path("/kaggle/temp"), Path("/tmp/hod26")):
+        try:
+            c.mkdir(parents=True, exist_ok=True)
+            probe = c / ".w"
+            probe.write_text("")
+            probe.unlink()
+            return c
+        except OSError:
+            continue
+    return WORK
+
+
+SCRATCH = _scratch()
 RUNS = SCRATCH / "runs"
 # When this kernel started. Kaggle's 12-hour cap is measured from here, not
 # from the start of training, so the clock guard has to be too.
@@ -37,6 +59,15 @@ CACHE_SEED = 20260918
 
 def log(*a):
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
+
+
+def free_gb(path):
+    """Free space where we are about to write several gigabytes of frames."""
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize / 1e9
+    except OSError:
+        return float("nan")
 
 
 def _looks_like_dataset(p):
@@ -948,6 +979,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                   reserve_seconds=300):
 
     root = SCRATCH / f"ds_{channels_key(cand)}"
+    log(f"  scratch {SCRATCH} ({free_gb(SCRATCH):.1f} GB free), "
+        f"output {WORK} ({free_gb(WORK):.1f} GB free)")
     yaml = materialize(cand, index, train_ids, val_ids, anns, root)
     tr, inf = cand["train"], cand["infer"]
 
@@ -1253,6 +1286,8 @@ def run_submission(round_cfg):
         }, indent=2))
         log(f"session ended at epoch {reached} of {target}: checkpoint saved, "
             f"prediction deferred")
+        for d in SCRATCH.glob("ds_*"):
+            shutil.rmtree(d, ignore_errors=True)
         return
 
     model = build_model(cand["train"]["model"], weights)
