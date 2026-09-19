@@ -76,9 +76,19 @@ initialised from **Ultralytics RT-DETR COCO-pretrained weights**
 licensed **AGPL-3.0**, pretrained on **COCO** (ImageNet for the ResNet
 backbones). Organizers confirmed public ImageNet/COCO weights are "allowed and
 encouraged" provided they are declared here. No other external dataset is used
-for pretraining. When the 16-band input is selected the stem cannot take COCO
-weights (shape mismatch) and trains from scratch; every other layer is
-pretrained.
+for pretraining. The 16-band input does not change that: the detector itself is
+built with three input channels, so every COCO tensor transfers including the
+stem, and the sixteen bands are reduced to three in front of it by a fixed
+non-negative Gaussian response bank followed by a trainable 1x1 mixer (24
+parameters). Those 152 front-end parameters and the classifier rows for the six
+classes with no COCO counterpart are the only weights that start from scratch.
+
+Classifier head rows are inherited from COCO by class name, using ultralytics'
+own remapping with an explicit HOD26 -> COCO name map (`COCO_PRIOR` in
+`src/hod26/voc.py`) so that, for example, `people` inherits `person` and
+`badminton` inherits `sports ball`. This transfers 12 of 18 rows rather than
+the 4 that match by exact spelling. No external data or annotation is involved
+-- it is the same COCO checkpoint, read for more of what it already contains.
 
 **Single model.** The submission comes from one checkpoint. Test-time
 augmentation and multi-scale inference are in the candidate space because
@@ -96,6 +106,29 @@ incompletely annotated — sample 558 has visible stone blocks with no boxes whi
 **Submission schema.** `id,image_id,class_id,confidence,x1,y1,x2,y2`, with `id`
 a 0-based row counter, per the organizers' correction. The bundled
 `sample_submission.csv` omits `id` and was explicitly disavowed as outdated.
+
+## What was measured
+
+Phase A, 300 images / 10 epochs / imgsz 1024, one seed each, scored on the same
+held-out split by the trainer's own validation pass:
+
+| model | front end | mAP@[.5:.95] | mAP@.5 | min |
+| --- | --- | --- | --- | --- |
+| rtdetr-l | band_stack, 16->8 SRF bank + trainable 8->3 | **0.4556** | 0.6603 | 23.1 |
+| rtdetr-l | srf3 -- the same averaging, rendered offline | 0.4447 | 0.6501 | 23.6 |
+| rtdetr-l | pseudo_rgb, bands 0/1/2 | 0.4325 | 0.6292 | 23.7 |
+| yolo26m | band_stack, 16->8 SRF bank + trainable 8->3 | 0.4129 | 0.6376 | 13.7 |
+
+The front-end ordering separates two claims that are usually made together.
+Averaging all sixteen bands non-negatively beats picking three adjacent ones by
+0.0122 -- that is the signal-to-noise argument, and it needs no trainable
+parameters. The trainable mixer then adds 0.0109 on top of that averaging --
+that is the adapter argument, and it is what recovers the material
+discrimination the averaging costs (the three averaged channels correlate above
+0.98 before the mixer sees them).
+
+These are single runs at 1/100th of the final run's compute. They are used to
+choose between structural alternatives, not to set hyperparameters.
 
 ## Credentials
 
