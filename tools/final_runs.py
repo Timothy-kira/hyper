@@ -81,7 +81,7 @@ AUGMENT = {"sg_window": 7, "sg_polyorder": 2, "smote_alpha": 0.3,
 CLOSE_MOSAIC = 5
 
 
-def full_candidate(track: str, total: int) -> dict:
+def full_candidate(track: str, total: int, overrides: dict | None = None) -> dict:
     """The candidate every session of the run declares.
 
     Each session asks for the whole run and stops itself on the clock, so the
@@ -90,7 +90,7 @@ def full_candidate(track: str, total: int) -> dict:
     the session boundary lands is then a measurement the kernel makes, not an
     estimate made here.
     """
-    cand = seed_candidate(**DESIGN)
+    cand = seed_candidate(**{**DESIGN, **(overrides or {})})
     cand["train"].update(model=TRACK_MODEL[track], epochs=total,
                          schedule_epochs=total, close_mosaic=CLOSE_MOSAIC)
     cand["augment"].update(AUGMENT)
@@ -146,8 +146,8 @@ def reached_epoch(payload: dict, default: int = 0) -> int:
 def run_track(track: str, total: int, use_all_train: bool, session_hours: float,
               timeout_hours: float, max_sessions: int,
               continue_from: str | None, no_submit: bool = False,
-              known_reached: int = 0) -> dict:
-    cand = full_candidate(track, total)
+              known_reached: int = 0, overrides: dict | None = None) -> dict:
+    cand = full_candidate(track, total, overrides)
     print(f"=== {track}: {cand['train']['model']} / {cand['channels']['mode']} + "
           f"srf{cand['train']['srf_k']} adapter / {total}ep @ "
           f"{cand['train']['imgsz']} / augment x{1 + cand['augment']['copies']}, "
@@ -243,11 +243,36 @@ def main() -> None:
     ap.add_argument("--auto-continue", action="store_true",
                     help="find the latest session already pushed and carry on "
                          "from it; how a restarted orchestrator rejoins a run")
+    # Loss and sampling overrides, for a continuation session that carries a
+    # change the earlier ones did not. Empty means DESIGN as written.
+    ap.add_argument("--bbox-loss", default=None, choices=["GIoU", "DIoU", "CIoU", "IoU"])
+    ap.add_argument("--bbox-alpha", type=float, default=None)
+    ap.add_argument("--vfl-beta", type=float, default=None)
+    ap.add_argument("--log-size-l1", action="store_true")
+    ap.add_argument("--repeat-threshold", type=float, default=None)
+    ap.add_argument("--lr0", type=float, default=None,
+                    help="restart the LR for a continuation session; the "
+                         "27-epoch cosine has annealed to lrf by its end, so an "
+                         "extension needs its own schedule to act at all")
     ap.add_argument("--no-submit", action="store_true",
                     help="train only; skip the per-session predict and submit")
     ap.add_argument("--use-all-train", action="store_true",
                     help="refit on every frame; the holdout score then means nothing")
     args = ap.parse_args()
+
+    over = {}
+    for flag, key in (("bbox_loss", "train.bbox_loss"),
+                      ("bbox_alpha", "train.bbox_alpha"),
+                      ("vfl_beta", "train.vfl_beta"),
+                      ("repeat_threshold", "train.repeat_threshold"),
+                      ("lr0", "train.lr0")):
+        v = getattr(args, flag)
+        if v is not None:
+            over[key] = v
+    if args.log_size_l1:
+        over["train.log_size_l1"] = True
+    if over:
+        print(f"overrides: {over}")
 
     results = {}
     for t in args.tracks:
@@ -258,7 +283,7 @@ def main() -> None:
         results[t] = run_track(t, args.epochs, args.use_all_train,
                                args.session_hours, args.timeout_hours,
                                args.max_sessions, cont, args.no_submit,
-                               args.reached)
+                               args.reached, over)
     out = REPO / "runs" / "final_comparison.json"
     out.write_text(json.dumps(results, indent=2))
     print(f"\nwrote {out}")
