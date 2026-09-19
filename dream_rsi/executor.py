@@ -32,8 +32,12 @@ class KaggleRoundExecutor:
     """Push one round, wait for it, and read back per-candidate scores."""
 
     def __init__(self, slug: str, poll_seconds: int = 60, timeout_hours: float = 6.0,
-                 out_dir: Path | None = None):
+                 out_dir: Path | None = None, kernel_sources: list[str] | None = None):
         self.slug = slug
+        # A run longer than Kaggle's 12-hour session limit is split across
+        # sessions. Listing the previous kernel here mounts its /kaggle/working
+        # under /kaggle/input, which is where the driver looks for last.pt.
+        self.kernel_sources = list(kernel_sources or [])
         self.poll_seconds = poll_seconds
         self.timeout_hours = timeout_hours
         self.out_dir = Path(out_dir or REPO / "runs" / "kernel_output")
@@ -51,7 +55,8 @@ class KaggleRoundExecutor:
         subprocess.run(
             ["python3", str(REPO / "tools" / "build_kernel.py"),
              "--round-config", str(cfg_path), "--slug", self.slug,
-             "--out-dir", str(self.build_dir)],
+             "--out-dir", str(self.build_dir),
+             *sum((["--kernel-source", k] for k in self.kernel_sources), [])],
             check=True, capture_output=True, text=True,
         )
         _kaggle("kernels", "push", "-p", str(self.build_dir))

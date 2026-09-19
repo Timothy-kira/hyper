@@ -51,6 +51,9 @@ def main() -> None:
     ap.add_argument("--out-dir", type=Path,
                     default=REPO / "kernels" / "hod26_round" / "build")
     ap.add_argument("--slug", default=None, help="kaggle kernel slug (user/name)")
+    ap.add_argument("--kernel-source", action="append", default=[],
+                    help="a previous kernel whose output this run continues from; "
+                         "its /kaggle/working lands under /kaggle/input/<name>")
     args = ap.parse_args()
 
     cfg = json.loads(args.round_config.read_text())
@@ -74,7 +77,7 @@ def main() -> None:
         "enable_internet": True,
         "competition_sources": [],
         "dataset_sources": ["xishengfeng/hod26-planar"],
-        "kernel_sources": [],
+        "kernel_sources": list(args.kernel_source),
     }, indent=2))
     print(f"wrote {script} ({script.stat().st_size} bytes)")
     print(f"wrote {args.out_dir / 'kernel-metadata.json'}  slug={slug}")

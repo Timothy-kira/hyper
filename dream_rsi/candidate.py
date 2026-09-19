@@ -30,6 +30,9 @@ CHANNEL_MODES = [
     "lda3",            # 16 -> 3 discriminant projection, pretrained stem intact
     "bandgroup3",      # 3 contiguous band groups averaged: reduction that also
                        # raises SNR, unlike picking single bands
+    "srf3",            # 3 overlapping Gaussian response curves -- the same
+                       # averaging the adapter's fixed stage does, but rendered
+                       # offline, so the network stays a plain 3-channel one
 ]
 
 # Transformer detectors. RT-DETR is a hybrid-encoder DETR with IoU-aware query
@@ -55,6 +58,9 @@ DEFAULT: dict = {
         "stretch_lo": 0.0,       # percentile clip; 0/100 = the demo's min-max
         "stretch_hi": 100.0,
         "per_image_norm": True,  # False = dataset-wide statistics
+        # Width of the Gaussian response curves the srf3 mode renders with.
+        # Wider averages more bands, so it is cleaner and less discriminative.
+        "srf_width": 3.0,
     },
     "train": {
         "model": "rtdetr-l",
@@ -81,6 +87,25 @@ DEFAULT: dict = {
         # renders cleanest but separates worst -- so the default sits between
         # them and the search decides.
         "adapter_penalty": "0.001",
+        # Two-stage front end: a fixed non-negative SRF bank reduces 16 bands to
+        # srf_k averages, and only the srf_k -> 3 mixer trains. 0 disables it and
+        # falls back to the single trainable 16 -> 3 stage, which starts from a
+        # signed projection and renders a noise-dominated frame.
+        "srf_k": 8,
+        "srf_width": 2.0,
+        # Protect the pretrained backbone while the new head and mixer settle:
+        # their early gradients are large and reach every layer behind them.
+        # The lever is warmup, not ultralytics' freeze -- freeze holds the first
+        # k *layers* for the whole run, and the optimizer is built once from the
+        # parameters that require grad, so anything unfrozen later would receive
+        # gradients with no optimizer state behind them.
+        "warmup_epochs": 3.0,
+        # COCO pretraining was at 640; training at 1024 pulls the backbone away
+        # from the scale statistics it knows, and covering a range is gentler
+        # than jumping to one new scale.
+        "multi_scale": False,
+        # Copy COCO head rows into classes that have a COCO ancestor by name.
+        "coco_prior": True,
     },
     "infer": {
         "conf": 0.001,           # mAP rewards deep recall, not a clean top-1
@@ -110,6 +135,7 @@ _MOVES: dict[str, list] = {
     "channels.stretch_lo": [0.0, 0.5, 1.0, 2.0],
     "channels.stretch_hi": [98.0, 99.0, 99.5, 100.0],
     "channels.per_image_norm": [True, False],
+    "channels.srf_width": [2.0, 3.0, 4.0],
     "train.model": TRANSFORMER_MODELS + YOLO_MODELS,
     "train.imgsz": [640, 768, 896, 1024],
     "train.epochs": [6, 10, 14, 20],
@@ -128,6 +154,10 @@ _MOVES: dict[str, list] = {
     "augment.copies": [0, 1, 2],
     "train.spectral_stem": ["adapter", "seed"],
     "train.adapter_penalty": ["0", "0.001", "0.01"],
+    "train.srf_k": [0, 4, 6, 8, 12],
+    "train.srf_width": [1.5, 2.0, 3.0],
+    "train.warmup_epochs": [3.0, 5.0],
+    "train.multi_scale": [True, False],
 }
 
 _BANDS_FOR_MODE = {
@@ -139,6 +169,7 @@ _BANDS_FOR_MODE = {
     "bandsel": list(BEST_BANDS),
     "lda3": list(range(16)),
     "bandgroup3": list(range(16)),
+    "srf3": list(range(16)),
 }
 
 
@@ -199,9 +230,19 @@ def normalize(cfg: dict) -> dict:
     if cfg["train"]["in_channels"] != 3:
         # Ultralytics skips HSV on non-3-channel input anyway; make it explicit.
         cfg["train"]["hsv_h"] = cfg["train"]["hsv_s"] = cfg["train"]["hsv_v"] = 0.0
+    # The SRF bank only exists on the 16-band path, and cannot have more
+    # outputs than it has bands to average.
+    if cfg["train"]["in_channels"] == 3:
+        cfg["train"]["srf_k"] = 0
+    else:
+        cfg["train"]["srf_k"] = max(0, min(int(cfg["train"].get("srf_k", 0)),
+                                           cfg["train"]["in_channels"]))
     if cfg["fidelity"] == "proxy":
         cfg["train"]["epochs"] = min(cfg["train"]["epochs"], 12)
-        cfg["train"]["imgsz"] = min(cfg["train"]["imgsz"], 768)
+        # imgsz is not capped. Resolution is the one design choice the proxy
+        # must not shrink: localization is the largest recoverable loss, so a
+        # proxy measured at 640 would rank a design the full run never uses.
+        cfg["train"]["imgsz"] = min(cfg["train"]["imgsz"], 1024)
     # Ultralytics disables mosaic for the last close_mosaic epochs; that is
     # meaningless once it exceeds the run length.
     cfg["train"]["close_mosaic"] = min(cfg["train"]["close_mosaic"],

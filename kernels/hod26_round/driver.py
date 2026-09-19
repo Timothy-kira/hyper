@@ -19,6 +19,7 @@ import numpy as np
 # competition_sources on push), so the frames arrive via a private dataset
 # holding them band-planar and already de-mosaiced.
 DATA = Path("/kaggle/input/hod26-planar")
+INPUT = Path("/kaggle/input")
 WORK = Path("/kaggle/working")
 VAL_FRACTION = 0.2
 PREDICT_BATCH = 32
@@ -43,7 +44,7 @@ def data_root():
     searches for the directory that actually holds the split instead, bounded in
     depth so it cannot wander a large input tree.
     """
-    roots = [DATA, Path("/kaggle/input")]
+    roots = [DATA, INPUT]
 
     def search(base, depth=5):
         if not base.exists():
@@ -110,6 +111,12 @@ def split_ids(all_ids):
     return [i for i in ids if i not in val], [i for i in ids if i in val]
 
 
+def _np_einsum(cube, bank):
+    """(H, W, B) cube through a (C, B) response bank -> (H, W, C)."""
+    return np.einsum("hwb,cb->hwc", cube.astype(np.float32),
+                     np.asarray(bank, dtype=np.float32))
+
+
 def build_channels(cube, spec):
     """Turn an (H, W, 16) cube into a 3-channel uint8 image per the candidate."""
     mode = spec["mode"]
@@ -136,6 +143,14 @@ def build_channels(cube, spec):
         proj = (flat @ np.asarray(LDA_16_TO_3, np.float32).T).reshape(
             cube.shape[0], cube.shape[1], 3)
         return np.dstack([stretch(proj[:, :, c], lo, hi) for c in range(3)])
+    if mode == "srf3":
+        # Three non-negative Gaussian spectral response curves, as a real RGB
+        # sensor has. One stretch shared across the three outputs, not one per
+        # channel: the material cue is the *ratio* between them, and rescaling
+        # each independently is exactly the operation that discards it.
+        bank = gaussian_srf_bank(cube.shape[2], 3, float(spec.get("srf_width", 3.0)))
+        y = _np_einsum(cube, bank)
+        return stretch(y.reshape(y.shape[0], -1), lo, hi).reshape(y.shape)
     if mode == "bandgroup3":
         n = cube.shape[2]
         edges = [0, n // 3, 2 * n // 3, n]
@@ -290,7 +305,8 @@ def predict_kwargs(cand):
     """Inference arguments, omitting NMS IoU for detectors that have no NMS."""
     inf = cand["infer"]
     kw = {"conf": inf["conf"], "max_det": inf["max_det"],
-          "augment": inf["tta"], "verbose": False, "stream": False}
+          "augment": inf["tta"], "verbose": False, "stream": True,
+          "batch": PREDICT_BATCH}
     if inf.get("iou") is not None:
         kw["iou"] = inf["iou"]
     return kw
@@ -338,60 +354,134 @@ def pretrained_stem_weight(name):
     return conv.weight.detach().float().clone()
 
 
-def install_spectral_adapter(net, n_bands, projection, ckpt_name):
-    """Put a trainable 1x1 band mixer in front of an untouched pretrained stem.
+# The wrapper is defined at module level, not built inside a factory: the
+# trained model is pickled into every checkpoint, and pickle can only name a
+# class that its module exposes. torch is guaranteed present wherever this runs,
+# but the guard keeps the file importable for offline inspection.
+try:
+    import torch.nn as _nn
+except ImportError:                                  # pragma: no cover
+    _nn = None
 
-        W_mix[c, b] = P[c, b]      (48 parameters, initialised to the discriminant)
+if _nn is not None:
+    class SpectralFront(_nn.Module):
+        """The band reduction, wrapped *around* the pretrained first block.
 
-    The alternatives each give something up: a fixed 3-channel projection cannot
-    adapt, and reparameterising the stem lets all 4608 of its weights drift from
-    what COCO learned. This keeps the pretrained convolution exactly as trained
-    and learns only the mixing, which is the adapter shape the multispectral
-    transfer literature converges on (UniRGB-IR 2404.17360, SpectralX
-    2508.01731). It matters because the measured gap between 12 and 202 bands
-    under a pretrained backbone is small (TerraMind 2603.06690) -- the
-    pretrained spatial prior is worth more than the extra spectral resolution,
-    so the prior is the thing to protect.
+        Replacing the block's inner Conv2d instead was the earlier attempt and
+        it crashed at validation: ultralytics' fuse() reaches into every Conv
+        block for m.conv.weight, and a Sequential has no .weight. Wrapping the
+        whole block leaves its internals exactly as ultralytics expects and
+        keeps the pretrained convolution reachable for fusion.
+        """
+
+        def __init__(self, front, block):
+            super().__init__()
+            self.front = front
+            self.block = block
+
+        def forward(self, x):
+            return self.block(self.front(x))
+else:                                                # pragma: no cover
+    SpectralFront = None
+
+
+def install_spectral_adapter(net, n_bands, projection=None, ckpt_name=None,
+                             srf_k=0, srf_width=2.0, stem_src=None):
+    """Put a band mixer in front of an untouched pretrained first block.
+
+    Two shapes, selected by ``srf_k``:
+
+        srf_k == 0   16 --[trainable 1x1, init P]--> 3 --> pretrained block
+        srf_k == k   16 --[fixed SRF bank]--> k --[trainable 1x1]--> 3 --> block
+
+    The single-stage form starts from a signed discriminant, and that is what
+    went wrong: every such projection is a weighted *difference* whose positive
+    and negative halves cancel (|sum w| / sum |w| = 0.000), so it amplifies
+    noise -- the rendered frame keeps only 0.537 of its gradient through a 3x3
+    blur against pseudo_rgb's 0.744. Being trainable does not save it, because
+    the first epochs still feed the backbone a frame it cannot read.
+
+    The two-stage form fixes the first reduction to be an *average*: a
+    non-negative, row-normalised Gaussian SRF bank, which has variance ~1/n
+    rather than amplifying noise, and renders at 0.759. Only the second stage
+    trains. Averaging also costs discrimination -- the three outputs correlate
+    at 0.98 or above -- and recovering it is exactly what the trainable stage is
+    for: a signed mix of already-denoised channels is what any CNN's first layer
+    computes over R, G and B.
+
+    The network behind it is built with three input channels, so every one of
+    its pretrained tensors transfers, the stem included. That is the adapter
+    shape the multispectral transfer literature converges on (UniRGB-IR
+    2404.17360, SpectralX 2508.01731), and it matters because the measured gap
+    between 12 and 202 bands under a pretrained backbone is small (TerraMind
+    2603.06690) -- the pretrained spatial prior is worth more than the extra
+    spectral resolution, so the prior is the thing to protect.
     """
     import numpy as _np
     import torch
     import torch.nn as nn
 
-    conv = first_conv(net)
-    if conv is None or conv.in_channels != n_bands:
-        return False
-    P = _np.asarray(projection, dtype=_np.float32)
-    if P.shape[1] != n_bands:
-        log(f"  adapter skipped: projection maps {P.shape[1]} bands, not {n_bands}")
-        return False
-    out_ch = P.shape[0]
-
-    pre = pretrained_stem_weight(ckpt_name)
-    if pre is None or pre.shape[1] != out_ch or pre.shape[0] != conv.out_channels:
-        log(f"  adapter skipped: pretrained stem {None if pre is None else tuple(pre.shape)} "
-            f"does not fit a {out_ch}-channel mixer into {conv.out_channels} filters")
+    block = net.model[0]
+    if isinstance(block, SpectralFront):
+        return False                      # already installed (resumed model)
+    conv = first_conv(block)
+    if conv is None or conv.in_channels != 3:
+        log(f"  adapter skipped: first block reads "
+            f"{None if conv is None else conv.in_channels} channels, not 3")
         return False
 
-    mixer = nn.Conv2d(n_bands, out_ch, kernel_size=1, bias=False)
-    stem = nn.Conv2d(out_ch, conv.out_channels, conv.kernel_size, conv.stride,
-                     conv.padding, bias=conv.bias is not None)
+    if srf_k:
+        bank = gaussian_srf_bank(n_bands, int(srf_k), float(srf_width))
+        P = _np.asarray(srf_to_rgb_init(bank), dtype=_np.float32)
+    else:
+        bank = None
+        P = _np.asarray(projection, dtype=_np.float32)
+        if P.shape[1] != n_bands:
+            log(f"  adapter skipped: projection maps {P.shape[1]} bands, not {n_bands}")
+            return False
+    out_ch, in_ch = P.shape[0], (bank.shape[0] if bank is not None else n_bands)
+    if out_ch != 3:
+        log(f"  adapter skipped: mixer produces {out_ch} channels, not 3")
+        return False
+
+    mixer = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
     with torch.no_grad():
-        mixer.weight.copy_(torch.from_numpy(P).view(out_ch, n_bands, 1, 1))
-        stem.weight.copy_(pre)
-        if conv.bias is not None:
-            stem.bias.copy_(conv.bias)
-    dev = conv.weight.device
-    if not replace_module(net, conv, nn.Sequential(mixer, stem).to(dev)):
-        log("  adapter skipped: could not locate the stem in the module tree")
-        return False
+        mixer.weight.copy_(torch.from_numpy(P).view(out_ch, in_ch, 1, 1))
+    front = [mixer]
+    if bank is not None:
+        srf = nn.Conv2d(n_bands, in_ch, kernel_size=1, bias=False)
+        with torch.no_grad():
+            srf.weight.copy_(torch.from_numpy(
+                _np.asarray(bank, dtype=_np.float32)).view(in_ch, n_bands, 1, 1))
+        # Fixed on purpose. Its job is to guarantee an average; letting gradient
+        # descent touch it lets the weights go negative, which is the failure
+        # this stage exists to rule out.
+        srf.weight.requires_grad_(False)
+        front.insert(0, srf)
+
+    wrapper = SpectralFront(nn.Sequential(*front), block).to(conv.weight.device)
+    # parse_model tags every layer with its index and input sources, and the
+    # forward loop reads them off the module it is holding.
+    for attr in ("i", "f", "type", "np"):
+        if hasattr(block, attr):
+            setattr(wrapper, attr, getattr(block, attr))
+    net.model[0] = wrapper
     # Keep the initial mixing so the run can prove the adapter actually trained.
     # Installing it in the wrong place leaves the optimizer without its
     # parameters, and it would then behave as a fixed projection while
     # reporting itself as the adapter -- a failure with no symptom.
-    net._hod26_mixer = mixer
-    net._hod26_mixer_init = mixer.weight.detach().clone()
-    log(f"  spectral adapter: trainable {n_bands}->{out_ch} 1x1 in front of an "
-        f"unchanged {tuple(pre.shape)} pretrained stem")
+    # Straight into __dict__: assigning a Module through nn.Module.__setattr__
+    # would register the mixer a second time and put a duplicate key in every
+    # state_dict, including the checkpoints a resume has to match exactly.
+    net.__dict__["_hod26_mixer"] = mixer
+    net.__dict__["_hod26_mixer_init"] = mixer.weight.detach().clone()
+    if bank is not None:
+        log(f"  spectral adapter: fixed {n_bands}->{in_ch} SRF bank (non-negative, "
+            f"width {srf_width}) then trainable {in_ch}->3 1x1 in front of an "
+            f"unchanged pretrained {type(block).__name__}")
+    else:
+        log(f"  spectral adapter: trainable {n_bands}->3 1x1 in front of an "
+            f"unchanged pretrained {type(block).__name__}")
     return True
 
 
@@ -409,35 +499,149 @@ def adapter_drift(model):
     return None
 
 
-def adapter_trainer(base_cls, n_bands, projection, ckpt_name):
-    """A trainer whose get_model returns a model that already has the adapter.
+def cls_head_params(net, nc):
+    """The classifier-logit parameters of either head, one row per class.
 
-    The adapter cannot be installed from a callback. ultralytics builds the
-    optimizer inside _setup_train, *before* on_pretrain_routine_end fires, so a
-    module swapped in from that callback leaves the optimizer holding the old
-    stem's parameters and the mixer's 48 new ones never receive an update -- it
-    would silently train as a fixed projection while reporting itself as the
-    adapter. on_pretrain_routine_start is earlier still, and trainer.model does
-    not exist yet there. Overriding get_model puts the adapter in place before
-    the optimizer is ever constructed.
+    YOLO keeps them in the Detect head's cv3 branch, RT-DETR in the decoder's
+    score_head and class_embed. Requiring nc rows excludes the box branch and
+    RT-DETR's denoising embedding, which has nc + 1.
+    """
+    for name, prm in net.named_parameters():
+        head = (".cv3." in name or "one2one_cv3" in name
+                or "score_head" in name or "class_embed" in name)
+        if head and prm.shape[0] == nc:
+            yield name, prm
+
+
+def perturb_derived_rows(net, names, scale=0.05):
+    """Separate head rows that inherited the same COCO logits.
+
+    apple and apple_plastic both start from COCO's apple, which is the point --
+    they look identical and only the spectrum tells them apart. But identical
+    rows produce identical logits, so the two classes start entangled and the
+    loss has to pull them apart from exactly equal footing. A perturbation of a
+    twentieth of the row's own scale costs nothing against the prior and gives
+    the gradient a direction to work in from the first step.
+    """
+    import torch
+
+    derived = [i for i, n in names.items() if n in COCO_PRIOR_DERIVED]
+    if not derived:
+        return 0
+    g = torch.Generator(device="cpu").manual_seed(CACHE_SEED)
+    touched = 0
+    with torch.no_grad():
+        for _, prm in cls_head_params(net, len(names)):
+            ref = float(prm.detach().float().std()) or 1.0
+            for i in derived:
+                noise = torch.randn(prm[i].shape, generator=g).to(prm.device, prm.dtype)
+                prm[i] += scale * ref * noise
+            touched += 1
+    log(f"  perturbed {len(derived)} derived class rows across {touched} head tensors")
+    return touched
+
+
+def restore_state(net, src):
+    """Copy every shape-compatible tensor from a checkpoint module into ``net``.
+
+    Used instead of ultralytics' own load() when resuming an adapted model.
+    That path assumes the first layer is reachable as model.0.conv.weight and
+    raises a KeyError on a wrapped stem; it is also a name-matched intersect,
+    which would silently drop the front end rather than fail. Here the two
+    modules have identical structure, so anything short of a full restore is a
+    bug and says so.
+    """
+    import torch.nn as nn
+    if not isinstance(src, nn.Module):
+        raise RuntimeError("resume expected a checkpoint module to restore from")
+    own, sd = net.state_dict(), src.float().state_dict()
+    ok = {k: v for k, v in sd.items() if k in own and own[k].shape == v.shape}
+    net.load_state_dict(ok, strict=False)
+    missing = sorted(set(own) - set(ok))
+    if missing:
+        raise RuntimeError(f"resume restored {len(ok)}/{len(own)} tensors; "
+                           f"{len(missing)} missing, first: {missing[:5]}")
+    log(f"  resumed {len(ok)}/{len(own)} tensors from the checkpoint")
+    return len(ok)
+
+
+def hod26_trainer(base_cls, adapter=None, coco_prior=True):
+    """A trainer that seeds the head from COCO by name and installs the adapter.
+
+    Both have to happen inside get_model, and for the same reason: ultralytics
+    builds the optimizer inside _setup_train, *before* on_pretrain_routine_end
+    fires, so a module swapped in from that callback leaves the optimizer
+    holding the old stem's parameters and the mixer's new ones never receive an
+    update -- it would silently train as a fixed projection while reporting
+    itself as the adapter. on_pretrain_routine_start is earlier still, and
+    trainer.model does not exist yet there.
+
+    The head prior rides the mechanism ultralytics already has. Its
+    _remap_cls_by_names copies a pretrained classifier row into any target class
+    whose *name* matches, and set_model_names_for_load is the hook that decides
+    which names it sees. Renaming the targets to their COCO ancestors for the
+    duration of the load lifts the inheritance from 4 of 18 classes to 12 --
+    people alone is 1095 boxes that would otherwise start from noise, because
+    COCO calls it person. The real names go back on immediately afterwards, so
+    nothing downstream sees the substitution.
     """
 
-    class AdapterTrainer(base_cls):
+    class HOD26Trainer(base_cls):
+        def check_resume(self, overrides):
+            super().check_resume(overrides)
+            # check_resume replaces args wholesale with the checkpoint's, and
+            # epochs is not on its override whitelist. A chunked run raises the
+            # total each session, so without this the resume asserts that
+            # training already finished.
+            if self.resume and overrides.get("epochs"):
+                self.args.epochs = overrides["epochs"]
+
+        def set_model_names_for_load(self, model):
+            parent = getattr(super(), "set_model_names_for_load", None)
+            model = parent(model) if parent else model
+            if (not coco_prior or getattr(self, "resume", False)
+                    or not isinstance(getattr(model, "names", None), dict)):
+                return model
+            self._hod26_names = dict(model.names)
+            model.names = {i: COCO_PRIOR.get(n, n) for i, n in model.names.items()}
+            n_mapped = sum(1 for i, n in model.names.items()
+                           if n != self._hod26_names[i])
+            log(f"  head prior: renamed {n_mapped} classes to their COCO ancestors "
+                f"for the weight load")
+            return model
+
         def get_model(self, cfg=None, weights=None, verbose=True):
-            net = super().get_model(cfg=cfg, weights=weights, verbose=verbose)
-            install_spectral_adapter(net, n_bands, projection, ckpt_name)
+            ch = self.data.get("channels")
+            resuming = bool(getattr(self, "resume", False)) and adapter
+            if adapter:
+                # Build and load a plain 3-channel network. A 16-channel build
+                # cannot inherit the stem -- the shapes differ -- and then sits
+                # behind 32.8M pretrained parameters tuned for what that stem
+                # produced. The adapter is prepended afterwards, so the bands
+                # arrive as 16 and the network still reads three.
+                self.data["channels"] = 3
+            try:
+                # Resuming loads the checkpoint below, after the adapter is
+                # back in place; letting ultralytics do it here would trip over
+                # a stem it cannot address.
+                net = super().get_model(cfg=cfg, verbose=verbose,
+                                        weights=None if resuming else weights)
+            finally:
+                self.data["channels"] = ch
+            real = getattr(self, "_hod26_names", None)
+            if real is not None:
+                net.names = real
+                perturb_derived_rows(net, real)
+            if adapter:
+                install_spectral_adapter(net, **adapter)
+                # Resuming rebuilds the model from its yaml, which has no
+                # adapter in it. Only once the front end is back does the
+                # checkpoint's every tensor have a key to land on.
+                if resuming:
+                    restore_state(net, weights)
             return net
 
-    return AdapterTrainer
-
-
-def pretrained_stem_weight_from(net, want_in):
-    """The COCO stem kernel, read back from the checkpoint the run started from."""
-    name = getattr(net, "_hod26_ckpt", None)
-    w = pretrained_stem_weight(name) if name else None
-    if w is not None and w.shape[1] == want_in:
-        return w
-    return None
+    return HOD26Trainer
 
 
 def replace_module(net, target, replacement):
@@ -513,6 +717,154 @@ def build_model(name, weights=None):
     return cls(weights or f"{name}.pt")
 
 
+# ------------------------------------------------- chunked runs & logging ---
+# A Kaggle session is capped at 12 hours and its /kaggle/working is kept only
+# when the kernel exits cleanly, so a run longer than that has to be split into
+# sessions that each finish on purpose. Each session leaves last.pt, results.csv
+# and metrics.jsonl as its output; the next lists it in kernel_sources, finds
+# them under /kaggle/input and continues. A resume that silently restarts from
+# epoch 0 looks like a slow run rather than a failure, which is why the starting
+# epoch is logged explicitly.
+
+def find_checkpoint(tag):
+    """The previous session's last.pt, attached as another kernel's output."""
+    for base in sorted(INPUT.glob("*")):
+        if _looks_like_dataset(base):
+            continue          # the planar frames, not a previous session
+        for cand in (base / f"{tag}_last.pt", base / "last.pt"):
+            if cand.exists():
+                return cand
+    return None
+
+
+def stage_checkpoint(tag):
+    """Put a previous session's state where ultralytics expects to resume from.
+
+    ultralytics rebuilds save_dir from the checkpoint's own args, which is the
+    same /kaggle/working/runs/<tag> this session uses, and appends to the
+    results.csv already there. Both files therefore have to be back in place
+    before training starts.
+    """
+    src = find_checkpoint(tag)
+    if src is None:
+        return None
+    run = WORK / "runs" / tag
+    (run / "weights").mkdir(parents=True, exist_ok=True)
+    last = run / "weights" / "last.pt"
+    shutil.copy2(src, last)
+    for name, dst in ((f"{tag}_results.csv", run / "results.csv"),
+                      ("results.csv", run / "results.csv"),
+                      (f"{tag}_metrics.jsonl", WORK / f"{tag}_metrics.jsonl"),
+                      ("metrics.jsonl", WORK / f"{tag}_metrics.jsonl")):
+        f = src.parent / name
+        if f.exists() and not dst.exists():
+            shutil.copy2(f, dst)
+    log(f"resuming from {src} -> {last}")
+    return str(last)
+
+
+def snapshot_for_resume(tag, run):
+    """Copy last.pt out while it still carries optimizer state.
+
+    ultralytics strips the optimizer, the EMA and the epoch number from last.pt
+    once training ends, which is exactly what a resume needs -- a stripped
+    checkpoint restarts from epoch 0 with a fresh schedule and reports itself as
+    a normal run. So the copy is taken per epoch, from on_model_save, before the
+    strip can reach it.
+    """
+    for src, dst in ((run / "weights" / "last.pt", WORK / f"{tag}_last.pt"),
+                     (run / "results.csv", WORK / f"{tag}_results.csv")):
+        if src.exists():
+            shutil.copy2(src, dst)
+
+
+def keep_for_resume(tag):
+    """Copy the remaining outputs into this kernel's output root."""
+    run = WORK / "runs" / tag
+    src = run / "weights" / "best.pt"
+    if src.exists():
+        shutil.copy2(src, WORK / f"{tag}_best.pt")
+    for f in (WORK / f"{tag}_last.pt", WORK / f"{tag}_best.pt",
+              WORK / f"{tag}_results.csv", WORK / f"{tag}_metrics.jsonl"):
+        if f.exists():
+            log(f"kept {f.name} ({f.stat().st_size / 1e6:.1f} MB)")
+
+
+def attach_epoch_log(model, tag):
+    """One flushed stdout line and one JSON record per epoch.
+
+    A pushed kernel is a batch job: its log cannot be fetched through the API
+    until it finishes, so the only thing that makes a long run watchable is what
+    it prints to the console its web page streams. The JSON file is the one to
+    plot from afterwards, and it is written incrementally so it survives a
+    session that is killed rather than ending.
+    """
+    path = WORK / f"{tag}_metrics.jsonl"
+    state = {}
+
+    def record(trainer):
+        try:
+            _record(trainer)
+        except Exception:
+            # A logging fault must never end a nine-hour run.
+            log(f"  epoch log failed: {traceback.format_exc(limit=2)}")
+
+    def _record(trainer):
+        def _f(x):
+            try:
+                return round(float(x), 6)
+            except (TypeError, ValueError):
+                return None
+
+        m = {k: _f(v) for k, v in (trainer.metrics or {}).items()}
+        rec = {
+            "tag": tag,
+            "epoch": int(trainer.epoch) + 1,
+            "total_epochs": int(trainer.epochs),
+            "seconds": _f(getattr(trainer, "epoch_time", None)),
+            "lr": {k: _f(v) for k, v in (getattr(trainer, "lr", None) or {}).items()},
+            "loss": {k: _f(v) for k, v in (getattr(trainer, "tloss", None) or {}).items()},
+            "metrics": {k: v for k, v in m.items() if v is not None},
+            "fitness": _f(getattr(trainer, "fitness", None)),
+        }
+        # final_eval re-fires this callback once for the best checkpoint, one
+        # epoch past the end; marking it keeps the plotted curve honest.
+        rec["final_eval"] = rec["epoch"] > rec["total_epochs"]
+        try:
+            box = trainer.validator.metrics.box
+            rec["per_class"] = {trainer.data["names"][int(c)]: _f(a)
+                                for c, a in zip(box.ap_class_index,
+                                                box.maps[box.ap_class_index])}
+        except Exception:
+            rec["per_class"] = {}
+        drift = adapter_drift(trainer)
+        if drift:
+            rec["adapter_drift"] = round(drift["rel"], 6)
+            # The model handed back after training is the *best* checkpoint,
+            # which may predate the last epoch, so its drift is not this run's.
+            state["drift"] = drift
+        with path.open("a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        loss = "/".join(f"{v:.3f}" for v in rec["loss"].values() if v is not None)
+        log(f"  epoch {rec['epoch']}/{rec['total_epochs']}  loss {loss}  "
+            f"mAP50 {m.get('metrics/mAP50(B)', float('nan')):.4f}  "
+            f"mAP50-95 {m.get('metrics/mAP50-95(B)', float('nan')):.4f}  "
+            f"lr {next(iter(rec['lr'].values()), float('nan')):.2e}  "
+            f"{rec['seconds']:.0f}s"
+            + (f"  drift {drift['rel']:.4%}" if drift else ""))
+
+    def announce(trainer):
+        log(f"  training starts at epoch {trainer.start_epoch + 1} of "
+            f"{trainer.epochs} (resume={bool(trainer.resume)})")
+
+    model.add_callback("on_fit_epoch_end", record)
+    model.add_callback("on_train_start", announce)
+    model.add_callback("on_model_save", lambda t: snapshot_for_resume(tag, Path(t.save_dir)))
+    return state
+
+
 def run_candidate(cand, index, train_ids, val_ids, anns, tag):
 
     root = WORK / f"ds_{channels_key(cand)}"
@@ -523,8 +875,9 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     # not burn a GPU session on an argument ultralytics will reject.
     close_mosaic = min(tr.get("close_mosaic", 5), max(0, tr["epochs"] - 1))
 
-    model = build_model(tr["model"])
-    trainer_cls = None
+    resume_from = stage_checkpoint(tag)
+    model = build_model(tr["model"], resume_from)
+    adapter = None
     if tr.get("in_channels", 3) > 3:
         # Remember which checkpoint this started from; the stem strategies need
         # to read its 3-channel kernel back after ultralytics rebuilds the model.
@@ -534,23 +887,31 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
             pass
         # Which starting projection the adapter gets. Smoother starts trade
         # measured separability for robustness to a spectral shift; the adapter
-        # is trainable, so this is a starting point, not a commitment.
+        # is trainable, so this is a starting point, not a commitment. It is
+        # ignored entirely when srf_k selects the two-stage front end.
         proj = PDA_PROJECTIONS.get(str(tr.get("adapter_penalty", "0")), LDA_16_TO_3)
         if tr.get("spectral_stem", "adapter") == "adapter":
-            trainer_cls = adapter_trainer(base_trainer(tr["model"]), tr["in_channels"],
-                                          proj, tr["model"])
+            adapter = {"n_bands": tr["in_channels"], "projection": proj,
+                       "ckpt_name": tr["model"], "srf_k": tr.get("srf_k", 0),
+                       "srf_width": tr.get("srf_width", 2.0)}
         else:
             attach_spectral_stem_init(model, tr["model"], tr["in_channels"], proj)
+    trainer_cls = hod26_trainer(base_trainer(tr["model"]), adapter=adapter,
+                                coco_prior=tr.get("coco_prior", True))
+    log_state = attach_epoch_log(model, tag)
     results = model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
         lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=close_mosaic,
         hsv_h=tr["hsv_h"], hsv_s=tr["hsv_s"], hsv_v=tr["hsv_v"],
         fliplr=tr["fliplr"], scale=tr["scale"], cos_lr=tr.get("cos_lr", True),
+        multi_scale=tr.get("multi_scale", False),
+        warmup_epochs=tr.get("warmup_epochs", 3.0),
         project=str(WORK / "runs"), name=tag, exist_ok=True,
         verbose=False, plots=False, val=True, seed=0,
         amp=tr.get("amp", True), deterministic=tr.get("deterministic", True),
-        **({"trainer": trainer_cls} if trainer_cls else {}),
+        resume=bool(resume_from), trainer=trainer_cls,
     )
+    keep_for_resume(tag)
 
     # Score from the trainer's own validation pass rather than a second
     # inference pass of our own. Three reasons, in order of weight:
@@ -562,13 +923,13 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     #    the replay simulator depends on.
     # The pycocotools scorer still guards the final submission, where the
     # official protocol matters and the candidate is known to be 3-channel.
-    drift = adapter_drift(model)
+    drift = log_state.get("drift") or adapter_drift(model)
     if drift is not None:
         if drift["l2"] == 0.0:
             log("  !! adapter did NOT train: its weights are unchanged, so it ran "
                 "as a fixed projection")
         else:
-            log(f"  adapter trained: moved {drift['rel']:.1%} from its initialisation "
+            log(f"  adapter trained: moved {drift['rel']:.4%} from its initialisation "
                 f"(L2 {drift['l2']:.4f} of {drift['init_norm']:.4f})")
 
     box = results.box
@@ -585,24 +946,37 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
 
 
 def predict_test(model, cand, test_dir, png_ids):
-    """Run the trained model over the test set at cube resolution."""
-    inf = cand["infer"]
-    preds, sizes, staged = [], {}, {}
+    """Run the trained model over the test set at cube resolution.
+
+    The frames are staged into a directory and the *directory* is handed to
+    predict(). Passing a list of paths instead looks equivalent and is not:
+    ultralytics' check_source runs autocast_list over a list, which opens each
+    file with PIL and returns a 3-channel RGB image -- so a 16-band model would
+    be fed three bands, and nothing in the output would say so. A directory
+    keeps the multi-page TIFF reader in the path.
+    """
+    sizes, of_path = {}, {}
     staging = WORK / "test_images"
+    shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True, exist_ok=True)
     for n, pid in enumerate(png_ids):
         img = build_channels(load_planar(test_dir / f"{pid}.png"), cand["channels"])
         sizes[pid] = (img.shape[1], img.shape[0])
-        staged[pid] = write_frame(staging / str(pid), img)
+        of_path[str(write_frame(staging / str(pid), img))] = pid
         if n % 250 == 0:
             log(f"  staged {n}/{len(png_ids)}")
 
-    for lo in range(0, len(png_ids), PREDICT_BATCH):
-        ids = png_ids[lo:lo + PREDICT_BATCH]
-        chunk = [str(staged[pid]) for pid in ids]
-        for pid, r in zip(ids, model.predict(chunk, **predict_kwargs(cand))):
-            preds.extend(_rows(pid, r))
-        log(f"  predicted {min(lo + PREDICT_BATCH, len(png_ids))}/{len(png_ids)}")
+    preds, seen = [], 0
+    for r in model.predict(str(staging), **predict_kwargs(cand)):
+        pid = of_path.get(str(Path(r.path).resolve()), of_path.get(str(r.path)))
+        if pid is None:
+            raise RuntimeError(f"prediction for an unexpected frame: {r.path}")
+        preds.extend(_rows(pid, r))
+        seen += 1
+        if seen % 250 == 0:
+            log(f"  predicted {seen}/{len(png_ids)}")
+    if seen != len(png_ids):
+        raise RuntimeError(f"predicted {seen} frames but staged {len(png_ids)}")
     return preds, sizes
 
 
@@ -670,7 +1044,7 @@ def main():
             scores, preds, weights = run_candidate(cand, index, train_ids, val_ids, anns, node_id)
             rec.update(score=scores["mAP"], diagnostics={
                 "mAP50": scores["mAP50"], "per_class": scores["per_class"],
-                "weights": weights, "adapter": drift,
+                "weights": weights, "adapter": scores.get("adapter"),
             })
             log(f"  -> mAP={scores['mAP']:.4f}  mAP50={scores['mAP50']:.4f}")
         except Exception:
