@@ -45,6 +45,12 @@ KERNELS = {
         ("rtdetr-srf8", arm(**{"train.model": "rtdetr-l"})),
         ("yolo26m-srf8", arm(**{"train.model": "yolo26m"})),
     ],
+    # The first push lost this arm to the multi_scale OOM, and it is the one the
+    # track decision turns on, so it goes again on its own at the same batch as
+    # the yolo26m arm it is being compared with.
+    "arch2": [
+        ("rtdetr-srf8", arm(**{"train.model": "rtdetr-l"})),
+    ],
     "frontend": [
         ("rtdetr-pseudorgb", arm(**{"train.model": "rtdetr-l",
                                     "channels.mode": "pseudo_rgb"})),
