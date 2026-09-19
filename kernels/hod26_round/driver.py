@@ -384,9 +384,29 @@ def install_spectral_adapter(net, n_bands, projection, ckpt_name):
     if not replace_module(net, conv, nn.Sequential(mixer, stem).to(dev)):
         log("  adapter skipped: could not locate the stem in the module tree")
         return False
+    # Keep the initial mixing so the run can prove the adapter actually trained.
+    # Installing it in the wrong place leaves the optimizer without its
+    # parameters, and it would then behave as a fixed projection while
+    # reporting itself as the adapter -- a failure with no symptom.
+    net._hod26_mixer = mixer
+    net._hod26_mixer_init = mixer.weight.detach().clone()
     log(f"  spectral adapter: trainable {n_bands}->{out_ch} 1x1 in front of an "
         f"unchanged {tuple(pre.shape)} pretrained stem")
     return True
+
+
+def adapter_drift(model):
+    """How far the mixer moved from its initialisation. Zero means it never trained."""
+    for net in (getattr(model, "model", None), model):
+        mixer = getattr(net, "_hod26_mixer", None)
+        init = getattr(net, "_hod26_mixer_init", None)
+        if mixer is None or init is None:
+            continue
+        w = mixer.weight.detach().to(init.device)
+        return {"l2": float((w - init).norm()),
+                "rel": float((w - init).norm() / (init.norm() + 1e-12)),
+                "init_norm": float(init.norm())}
+    return None
 
 
 def adapter_trainer(base_cls, n_bands, projection, ckpt_name):
@@ -542,6 +562,15 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
     #    the replay simulator depends on.
     # The pycocotools scorer still guards the final submission, where the
     # official protocol matters and the candidate is known to be 3-channel.
+    drift = adapter_drift(model)
+    if drift is not None:
+        if drift["l2"] == 0.0:
+            log("  !! adapter did NOT train: its weights are unchanged, so it ran "
+                "as a fixed projection")
+        else:
+            log(f"  adapter trained: moved {drift['rel']:.1%} from its initialisation "
+                f"(L2 {drift['l2']:.4f} of {drift['init_norm']:.4f})")
+
     box = results.box
     scores = {
         "mAP": float(box.map),          # mAP@[.5:.95], the competition's primary
@@ -550,6 +579,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
                       for c, a in zip(results.box.ap_class_index, box.maps[box.ap_class_index])}
         if getattr(box, "ap_class_index", None) is not None else {},
     }
+    scores["adapter"] = drift
     weights = WORK / "runs" / tag / "weights" / "best.pt"
     return scores, [], (str(weights) if weights.exists() else None)
 
@@ -640,7 +670,7 @@ def main():
             scores, preds, weights = run_candidate(cand, index, train_ids, val_ids, anns, node_id)
             rec.update(score=scores["mAP"], diagnostics={
                 "mAP50": scores["mAP50"], "per_class": scores["per_class"],
-                "weights": weights,
+                "weights": weights, "adapter": drift,
             })
             log(f"  -> mAP={scores['mAP']:.4f}  mAP50={scores['mAP50']:.4f}")
         except Exception:
