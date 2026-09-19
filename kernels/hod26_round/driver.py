@@ -21,6 +21,12 @@ import numpy as np
 DATA = Path("/kaggle/input/hod26-planar")
 INPUT = Path("/kaggle/input")
 WORK = Path("/kaggle/working")
+# Rendered frames and run directories go to scratch, not to /kaggle/working.
+# The full run materializes 3000 frames plus an augmented copy of each as
+# 16-band TIFFs -- around 8 GB -- and everything under /kaggle/working is
+# uploaded as the kernel's output and mounted by the session that continues it.
+SCRATCH = Path("/kaggle/temp") if Path("/kaggle/temp").is_dir() else WORK
+RUNS = SCRATCH / "runs"
 VAL_FRACTION = 0.2
 PREDICT_BATCH = 32
 CACHE_SEED = 20260918
@@ -741,14 +747,14 @@ def stage_checkpoint(tag):
     """Put a previous session's state where ultralytics expects to resume from.
 
     ultralytics rebuilds save_dir from the checkpoint's own args, which is the
-    same /kaggle/working/runs/<tag> this session uses, and appends to the
-    results.csv already there. Both files therefore have to be back in place
-    before training starts.
+    same scratch runs/<tag> this session uses, and appends to the results.csv
+    already there. Both files therefore have to be back in place before
+    training starts.
     """
     src = find_checkpoint(tag)
     if src is None:
         return None
-    run = WORK / "runs" / tag
+    run = RUNS / tag
     (run / "weights").mkdir(parents=True, exist_ok=True)
     last = run / "weights" / "last.pt"
     shutil.copy2(src, last)
@@ -780,7 +786,7 @@ def snapshot_for_resume(tag, run):
 
 def keep_for_resume(tag):
     """Copy the remaining outputs into this kernel's output root."""
-    run = WORK / "runs" / tag
+    run = RUNS / tag
     src = run / "weights" / "best.pt"
     if src.exists():
         shutil.copy2(src, WORK / f"{tag}_best.pt")
@@ -867,7 +873,7 @@ def attach_epoch_log(model, tag):
 
 def run_candidate(cand, index, train_ids, val_ids, anns, tag):
 
-    root = WORK / f"ds_{channels_key(cand)}"
+    root = SCRATCH / f"ds_{channels_key(cand)}"
     yaml = materialize(cand, index, train_ids, val_ids, anns, root)
     tr, inf = cand["train"], cand["infer"]
 
@@ -906,7 +912,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
         fliplr=tr["fliplr"], scale=tr["scale"], cos_lr=tr.get("cos_lr", True),
         multi_scale=tr.get("multi_scale", False),
         warmup_epochs=tr.get("warmup_epochs", 3.0),
-        project=str(WORK / "runs"), name=tag, exist_ok=True,
+        project=str(RUNS), name=tag, exist_ok=True,
         verbose=False, plots=False, val=True, seed=0,
         amp=tr.get("amp", True), deterministic=tr.get("deterministic", True),
         resume=bool(resume_from), trainer=trainer_cls,
@@ -941,7 +947,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag):
         if getattr(box, "ap_class_index", None) is not None else {},
     }
     scores["adapter"] = drift
-    weights = WORK / "runs" / tag / "weights" / "best.pt"
+    weights = RUNS / tag / "weights" / "best.pt"
     return scores, [], (str(weights) if weights.exists() else None)
 
 
@@ -956,7 +962,7 @@ def predict_test(model, cand, test_dir, png_ids):
     keeps the multi-page TIFF reader in the path.
     """
     sizes, of_path = {}, {}
-    staging = WORK / "test_images"
+    staging = SCRATCH / "test_images"
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True, exist_ok=True)
     for n, pid in enumerate(png_ids):
@@ -1017,6 +1023,7 @@ def run_submission(round_cfg):
     log(f"predicting {len(test_ids)} test images")
     preds, sizes = predict_test(model, cand, test_dir, test_ids)
 
+    shutil.rmtree(SCRATCH / "test_images", ignore_errors=True)
     n = write(WORK / "submission.csv", preds, clip_to=sizes)
     log(f"wrote submission.csv: {n} rows over {len({p[0] for p in preds})} images")
     (WORK / "results.json").write_text(json.dumps({
@@ -1068,7 +1075,7 @@ def main():
         (WORK / "results.json").write_text(json.dumps(
             {"round": round_cfg.get("round"), "results": results}, indent=2))
 
-    for d in WORK.glob("ds_*"):
+    for d in SCRATCH.glob("ds_*"):
         shutil.rmtree(d, ignore_errors=True)
     log(f"round complete: {sum(r['score'] is not None for r in results)}/{len(results)} succeeded")
 

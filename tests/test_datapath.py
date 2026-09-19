@@ -76,7 +76,12 @@ def load_kernel(work: Path, data: Path):
     finally:
         subprocess.run = real_run
     mod.DATA, mod.WORK = data, work
+    # Scratch is a separate volume on Kaggle; here it just has to not be the
+    # output directory, so the test sees the same split the kernel does.
+    mod.SCRATCH = work.parent / "scratch"
+    mod.RUNS = mod.SCRATCH / "runs"
     work.mkdir(parents=True, exist_ok=True)
+    mod.SCRATCH.mkdir(parents=True, exist_ok=True)
     return mod
 
 
