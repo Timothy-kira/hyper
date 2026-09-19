@@ -1064,6 +1064,52 @@ def predict_test(model, cand, test_dir, png_ids):
     return preds, sizes
 
 
+def find_weights(name):
+    """A checkpoint left behind by another kernel, mounted under /kaggle/input."""
+    for base in sorted(INPUT.glob("*")):
+        if _looks_like_dataset(base):
+            continue
+        direct = base / name
+        if direct.exists():
+            return direct
+        for c in sorted(base.glob(f"**/{name}")):
+            return c
+    return None
+
+
+def run_predict_only(round_cfg):
+    """Predict the test set from a checkpoint another kernel already trained.
+
+    This exists to buy the one number the project has never had: how a score on
+    our own held-out split translates to the leaderboard. Every design decision
+    so far has been made against a local validator that has never been checked
+    against the competition's scorer, and the gap between them is unknown in
+    both size and sign. Reusing a checkpoint that already exists makes that
+    calibration cost a few GPU-minutes instead of a training run.
+    """
+    cand = round_cfg["submit"]["candidate"]
+    name = round_cfg["submit"]["weights_from"]
+    w = find_weights(name)
+    if w is None:
+        raise RuntimeError(f"no {name} under {INPUT}; attached kernels: "
+                           f"{[p.name for p in sorted(INPUT.glob('*'))]}")
+    log(f"predict-only from {w} ({w.stat().st_size / 1e6:.0f} MB)")
+
+    root = data_root()
+    test_dir = root / "test" / "images"
+    model = build_model(cand["train"]["model"], str(w))
+    test_ids = require_ids(sorted(int(p.stem) for p in test_dir.glob("*.png")), test_dir)
+    log(f"predicting {len(test_ids)} test images")
+    preds, sizes = predict_test(model, cand, test_dir, test_ids)
+    shutil.rmtree(SCRATCH / "test_images", ignore_errors=True)
+    n = write(WORK / "submission.csv", preds, clip_to=sizes)
+    log(f"wrote submission.csv: {n} rows over {len({p[0] for p in preds})} images")
+    (WORK / "results.json").write_text(json.dumps({
+        "mode": "predict_only", "rows": n, "weights": str(w),
+        "candidate": cand, "predicted": True,
+    }, indent=2))
+
+
 def run_submission(round_cfg):
     """Train one candidate at full fidelity and write submission.csv."""
     cand = round_cfg["submit"]["candidate"]
@@ -1129,6 +1175,8 @@ def main():
         if Path(__file__).with_name("round.json").exists() else ROUND_CONFIG
 
     if round_cfg.get("submit"):
+        if round_cfg["submit"].get("weights_from"):
+            return run_predict_only(round_cfg)
         return run_submission(round_cfg)
 
     root = data_root()
