@@ -1110,6 +1110,47 @@ def run_predict_only(round_cfg):
     }, indent=2))
 
 
+def run_score_val(round_cfg):
+    """Score an existing checkpoint on the held-out split, through the real path.
+
+    The calibration submission put a checkpoint whose local score is known
+    exactly (0.4556, ultralytics' validator) on the leaderboard at 0.40249. That
+    0.053 is either the two scorers and two inference paths disagreeing, or the
+    test set being harder than our split -- and the two call for opposite
+    responses. Running the *prediction* path over the *validation* frames and
+    scoring with pycocotools isolates it: land near 0.4556 and the pipeline is
+    consistent, so the gap is the test set; land near 0.40 and the gap is ours
+    to fix, and it is worth 0.05 on the submission that counts.
+    """
+    cand = round_cfg["submit"]["candidate"]
+    name = round_cfg["submit"]["weights_from"]
+    w = find_weights(name)
+    if w is None:
+        raise RuntimeError(f"no {name} under {INPUT}")
+    log(f"scoring {w} on the held-out split")
+
+    root = data_root()
+    ann_dir = root / "train" / "annotations"
+    ids = require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
+    _, val_ids = split_ids(ids)
+    # parse() already takes image_id from the filename, which is the same id
+    # predict_test tags its rows with.
+    anns = [parse(ann_dir / f"{pid}.xml") for pid in val_ids]
+
+    model = build_model(cand["train"]["model"], str(w))
+    preds, _ = predict_test(model, cand, root / "train" / "images", val_ids)
+    shutil.rmtree(SCRATCH / "test_images", ignore_errors=True)
+    # predict_test rows are (image_id, class, conf, x1, y1, x2, y2), which is
+    # the shape evaluate() takes.
+    scored = evaluate(anns, preds, per_class=True)
+    log(f"pycocotools on the held-out split: mAP={scored['mAP']:.4f} "
+        f"mAP50={scored['mAP50']:.4f} over {len(val_ids)} frames, {len(preds)} boxes")
+    (WORK / "results.json").write_text(json.dumps({
+        "mode": "score_val", "frames": len(val_ids), "boxes": len(preds),
+        "weights": str(w), "candidate": cand, **scored,
+    }, indent=2))
+
+
 def run_submission(round_cfg):
     """Train one candidate at full fidelity and write submission.csv."""
     cand = round_cfg["submit"]["candidate"]
@@ -1176,6 +1217,8 @@ def main():
 
     if round_cfg.get("submit"):
         if round_cfg["submit"].get("weights_from"):
+            if round_cfg["submit"].get("score_val"):
+                return run_score_val(round_cfg)
             return run_predict_only(round_cfg)
         return run_submission(round_cfg)
 
