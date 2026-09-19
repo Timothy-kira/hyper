@@ -113,6 +113,24 @@ def wait_for_quota(need: float, poll: int = 600, log=print) -> float:
         time.sleep(poll)
 
 
+def latest_session(track: str, max_sessions: int) -> str | None:
+    """The highest-numbered session kernel that has actually been pushed.
+
+    Lets a restarted orchestrator rejoin a run in flight without being told
+    where it got to. A kernel that has never run 404s on status, which the
+    executor reports as "pending", so the last non-pending one is the latest.
+    """
+    found = None
+    for i in range(1, max_sessions + 1):
+        slug = f"xishengfeng/hod26-final-{track}-s{i}"
+        try:
+            if KaggleRoundExecutor(slug).status() != "pending":
+                found = slug
+        except Exception:                            # noqa: BLE001
+            break
+    return found
+
+
 def reached_epoch(payload: dict, default: int = 0) -> int:
     """How far the run has actually got, from a session's results.json.
 
@@ -210,17 +228,24 @@ def main() -> None:
     ap.add_argument("--max-sessions", type=int, default=4)
     ap.add_argument("--continue-from", default=None,
                     help="a session already pushed; wait for it and carry on")
+    ap.add_argument("--auto-continue", action="store_true",
+                    help="find the latest session already pushed and carry on "
+                         "from it; how a restarted orchestrator rejoins a run")
     ap.add_argument("--no-submit", action="store_true",
                     help="train only; skip the per-session predict and submit")
     ap.add_argument("--use-all-train", action="store_true",
                     help="refit on every frame; the holdout score then means nothing")
     args = ap.parse_args()
 
-    results = {t: run_track(t, args.epochs, args.use_all_train, args.session_hours,
-                            args.timeout_hours, args.max_sessions,
-                            args.continue_from if t == args.tracks[0] else None,
-                            args.no_submit)
-               for t in args.tracks}
+    results = {}
+    for t in args.tracks:
+        cont = args.continue_from if t == args.tracks[0] else None
+        if cont is None and args.auto_continue:
+            cont = latest_session(t, args.max_sessions)
+            print(f"rejoining {t} at {cont or 'the beginning'}")
+        results[t] = run_track(t, args.epochs, args.use_all_train,
+                               args.session_hours, args.timeout_hours,
+                               args.max_sessions, cont, args.no_submit)
     out = REPO / "runs" / "final_comparison.json"
     out.write_text(json.dumps(results, indent=2))
     print(f"\nwrote {out}")
