@@ -997,7 +997,20 @@ def run_submission(round_cfg):
     anns = {pid: parse(ann_dir / f"{pid}.xml") for pid in set(train_ids) | set(val_ids)}
     index = frame_index(root, "train", sorted(set(train_ids) | set(val_ids)))
     scores, _, weights = run_candidate(cand, index, train_ids, val_ids, anns, "final")
-    log(f"fit done; holdout mAP={scores['mAP']:.4f} (optimistic: seen in training)")
+    note = " (optimistic: seen in training)" if round_cfg["submit"].get("use_all_train", True) else ""
+    log(f"fit done; holdout mAP={scores['mAP']:.4f}{note}")
+
+    if not round_cfg["submit"].get("predict", True):
+        # An intermediate session of a chunked run. Its whole job is to advance
+        # the checkpoint; predicting 1000 frames here would cost GPU time and
+        # produce a submission from a half-trained model.
+        (WORK / "results.json").write_text(json.dumps({
+            "mode": "submit", "rows": 0, "holdout": scores["mAP"],
+            "epochs_to": cand["train"]["epochs"], "candidate": cand,
+            "weights": weights, "predicted": False,
+        }, indent=2))
+        log("intermediate session: checkpoint saved, prediction deferred")
+        return
 
     model = build_model(cand["train"]["model"], weights)
     test_ids = require_ids(sorted(int(p.stem) for p in test_dir.glob("*.png")), test_dir)
@@ -1008,7 +1021,7 @@ def run_submission(round_cfg):
     log(f"wrote submission.csv: {n} rows over {len({p[0] for p in preds})} images")
     (WORK / "results.json").write_text(json.dumps({
         "mode": "submit", "rows": n, "holdout": scores["mAP"],
-        "candidate": cand, "weights": weights,
+        "candidate": cand, "weights": weights, "predicted": True,
     }, indent=2))
 
 

@@ -49,6 +49,7 @@ class StubResult:
         import cv2
         im = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
         h, w = im.shape[:2]
+        self.path = str(path)
         self.boxes = StubBoxes(w, h)
 
 
@@ -64,10 +65,14 @@ class StubModel:
                                       ap_class_index=np.array([], int))
         return m
 
-    def predict(self, paths, **kw):
-        paths = [paths] if isinstance(paths, str) else list(paths)
+    def predict(self, source, **kw):
+        # Mirrors ultralytics: a directory is walked, a list is not -- a list
+        # would be autocast through PIL and silently reduced to 3 channels.
+        src = Path(source)
+        assert src.is_dir(), f"predict must be given the staging directory, got {source!r}"
+        paths = sorted(str(p) for p in src.iterdir())
         self.seen.extend(paths)
-        return [StubResult(p) for p in paths]
+        return iter([StubResult(p) for p in paths])
 
 
 def test_submission(tmp_root: Path) -> None:

@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""Fit one full-fidelity model per track and produce a submission for each.
+"""Fit one full-fidelity model per track, chunked across Kaggle sessions.
 
-Built on the trainable spectral adapter: a 1x1 band mixer initialised to the
-offline discriminant in front of a convolution that stays exactly as
-pretrained. All three spectral/spatial augmentations are on, expanding the
-training set threefold.
+The design is written down here rather than read back from the search. Every
+number the search measured came from 300 images and 10 epochs -- about 1/100th
+of the compute of the public 0.66 baseline -- and re-running the bottleneck
+analysis on a healthy run against an undertrained one reordered the bottlenecks
+outright. A proxy can say which choices are structural; it cannot pick the
+final configuration, and carrying proxy-fitted hyperparameters into a
+full-fidelity run is how a search talks itself into its own noise.
 
-The two runs hold out the same 20% the search used rather than fitting on
-everything. Training on all of it would score each run against data it had
-seen, which is the one number that cannot be compared between tracks -- and
-comparing them is the entire point of running both.
+The run does not fit in one Kaggle session. At imgsz 1024 it is around 19
+GPU-hours against a 12-hour per-session limit, and a session killed by the
+limit loses its /kaggle/working entirely -- so it goes as N sessions that each
+end on purpose, every one of them listing the last as a kernel source and
+picking up its last.pt.
 """
 
 from __future__ import annotations
@@ -27,53 +31,48 @@ sys.path.insert(0, str(REPO))
 from dream_rsi.budget import read_quota  # noqa: E402
 from dream_rsi.candidate import normalize, seed_candidate  # noqa: E402
 from dream_rsi.executor import KaggleRoundExecutor  # noqa: E402
-from dream_rsi.tree import load_pool  # noqa: E402
 
 TRACK_MODEL = {"transformer": "rtdetr-l", "yolo26": "yolo26m"}
 
-# The trainable adapter is a 16 -> 3 mixer sitting in front of an untouched
-# pretrained stem, so the model has to be fed all sixteen bands for it to exist
-# at all. A 3-channel mode such as lda3 has already collapsed the spectrum
-# itself: the projection is then fixed and the adapter never attaches. Feeding
-# band_stack is what makes the mixer the thing being trained.
-BASE_MODE = "band_stack"
+# The design, and why each part of it is here.
+DESIGN = {
+    # 16 bands in, so the front end exists at all. A 3-channel mode has already
+    # collapsed the spectrum with a fixed rule and leaves nothing to adapt.
+    "channels.mode": "band_stack",
+    # Fixed non-negative SRF bank, then a trainable 8 -> 3 mix in front of an
+    # untouched pretrained block. Averaging is what makes the frame readable to
+    # a backbone trained on natural images; the trainable stage is what gets
+    # the material discrimination back out of the averaged channels.
+    "train.spectral_stem": "adapter",
+    "train.srf_k": 8,
+    "train.srf_width": 2.0,
+    # Localization is the largest recoverable loss (mAP50 0.626 against
+    # mAP50-95 0.429: objects found, boxes loose), objects are 15-45 px in a
+    # 493x241 cube, and the feature stride is fixed. It is also the one thing
+    # the public 0.66 notebooks do that the search never tried.
+    "train.imgsz": 1024,
+    "train.batch": 8,
+    # COCO pretraining was at 640, so training at 1024 pulls the backbone off
+    # the scale statistics it knows; covering a range is gentler than jumping.
+    "train.multi_scale": True,
+    # Large early gradients from a fresh head and mixer reach every pretrained
+    # layer behind them. A longer ramp is the lever that does not also freeze.
+    "train.warmup_epochs": 5.0,
+    "train.cos_lr": True,
+    "train.coco_prior": True,
+    "fidelity": "full",
+}
+
+# All three augmentations on, doubling the training set. Three copies does not
+# fit at 1024 within the remaining budget.
 AUGMENT = {"sg_window": 7, "sg_polyorder": 2, "smote_alpha": 0.3,
-           "cutmix_prob": 0.4, "cutmix_blocks": 24, "copies": 2}
+           "cutmix_prob": 0.4, "cutmix_blocks": 24, "copies": 1}
 
 
-def ablation_summary(ablation: Path) -> str:
-    """What the controlled ablation measured, for the record."""
-    if not ablation.exists():
-        return "ablation not available"
-    rows = json.loads(ablation.read_text()).get("results", [])
-    scored = sorted(((r["score"], r["candidate"]["channels"]["mode"])
-                     for r in rows if r.get("score") is not None), reverse=True)
-    if not scored:
-        return "ablation produced no scores"
-    return ", ".join(f"{m} {s:.4f}" for s, m in scored)
-
-
-def best_train_params(state_dir: Path) -> dict:
-    """Training parameters from the best attempt this track measured."""
-    best = None
-    for tree in load_pool(state_dir):
-        n = tree.best()
-        if n and (best is None or n.score > best.score):
-            best = n
-    return dict(best.candidate["train"]) if best else {}
-
-
-def full_candidate(track: str, mode: str, state_dir: Path, epochs: int,
-                   imgsz: int) -> dict:
-    cand = seed_candidate(channels__mode=mode)
-    learned = best_train_params(state_dir)
-    for key in ("lr0", "mosaic", "scale", "fliplr", "hsv_s", "hsv_v"):
-        if key in learned:
-            cand["train"][key] = learned[key]
-    cand["train"].update(model=TRACK_MODEL[track], epochs=epochs, imgsz=imgsz,
-                         batch=8, spectral_stem="adapter")
+def full_candidate(track: str, epochs: int) -> dict:
+    cand = seed_candidate(**DESIGN)
+    cand["train"].update(model=TRACK_MODEL[track], epochs=epochs)
     cand["augment"].update(AUGMENT)
-    cand["fidelity"] = "full"
     return normalize(cand)
 
 
@@ -93,69 +92,79 @@ def wait_for_quota(need: float, poll: int = 600, log=print) -> float:
         time.sleep(poll)
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--tracks", nargs="+", default=["transformer", "yolo26"])
-    ap.add_argument("--epochs", type=int, default=15)
-    ap.add_argument("--imgsz", type=int, default=640)
-    ap.add_argument("--need-hours", type=float, default=16.0)
-    ap.add_argument("--ablation", type=Path,
-                    default=REPO / "runs" / "ablation" / "results.json")
-    ap.add_argument("--mode", default=BASE_MODE,
-                    help="channel construction; band_stack is what gives the "
-                         "trainable adapter something to adapt")
-    ap.add_argument("--no-wait", action="store_true")
-    args = ap.parse_args()
+def session_plan(total_epochs: int, chunks: int) -> list[int]:
+    """Cumulative epoch target for each session.
 
-    mode = args.mode
-    print(f"ablation measured: {ablation_summary(args.ablation)}")
-    print(f"running on: {mode} + trainable spectral adapter")
+    Each session trains *to* its target and stops there, so the target is what
+    goes in the config; ultralytics reads the epochs already done out of the
+    checkpoint.
+    """
+    return [round(total_epochs * (i + 1) / chunks) for i in range(chunks)]
 
-    if not args.no_wait:
-        have = wait_for_quota(args.need_hours)
-        print(f"proceeding with {have:.2f} GPU-h available")
 
-    # Kaggle allows two concurrent GPU sessions, which is exactly the number of
-    # tracks -- so both fits are pushed first and then waited on together. Run
-    # sequentially they would cost the sum of their wall clocks; run together
-    # they cost the longer of the two.
-    pending = {}
-    for track in args.tracks:
-        state = REPO / "runs" / f"rsi_{track}"
-        cand = full_candidate(track, mode, state, args.epochs, args.imgsz)
-        print(f"=== {track}: {cand['train']['model']} / {mode} / "
-              f"{cand['train']['epochs']}ep / augment x{1 + cand['augment']['copies']} ===")
-        ex = KaggleRoundExecutor(f"xishengfeng/hod26-final-{track}", timeout_hours=11.0,
-                                 out_dir=REPO / "runs" / f"final_{track}")
-        # Hold out the search's own validation split so the two tracks are
-        # comparable; fitting on everything would score each on data it saw.
-        ex.push({"round": f"final-{track}", "candidates": [],
-                 "submit": {"candidate": cand, "use_all_train": False}})
-        print(f"  pushed {ex.slug}")
-        pending[track] = (ex, cand)
+def run_track(track: str, epochs: int, chunks: int, use_all_train: bool,
+              timeout_hours: float) -> dict:
+    cand_final = full_candidate(track, epochs)
+    print(f"=== {track}: {cand_final['train']['model']} / "
+          f"{cand_final['channels']['mode']} + srf{cand_final['train']['srf_k']} "
+          f"adapter / {epochs}ep @ {cand_final['train']['imgsz']} / "
+          f"augment x{1 + cand_final['augment']['copies']} in {chunks} session(s) ===")
 
-    results = {}
-    for track, (ex, cand) in pending.items():
-        state_str = ex.wait()
-        print(f"\n{track}: kernel finished: {state_str}")
+    previous, payload = None, {}
+    for i, target in enumerate(session_plan(epochs, chunks)):
+        slug = f"xishengfeng/hod26-final-{track}-s{i + 1}"
+        cand = full_candidate(track, target)
+        ex = KaggleRoundExecutor(slug, timeout_hours=timeout_hours,
+                                 out_dir=REPO / "runs" / f"final_{track}_s{i + 1}",
+                                 kernel_sources=[previous] if previous else [])
+        # Only the last session predicts and writes a submission; the earlier
+        # ones exist to move the checkpoint forward.
+        ex.push({"round": f"final-{track}-s{i + 1}", "candidates": [],
+                 "submit": {"candidate": cand, "use_all_train": use_all_train,
+                            "predict": i == chunks - 1}})
+        print(f"  session {i + 1}/{chunks} -> {target} epochs, pushed {slug}"
+              + (f" (continues {previous})" if previous else ""))
+        state = ex.wait()
+        print(f"  session {i + 1} finished: {state}")
         try:
             payload = ex.fetch()
         except Exception as e:                       # noqa: BLE001
             print(f"  could not fetch results: {e}")
-            continue
-        sub = ex.out_dir / "submission.csv"
-        results[track] = {"holdout": payload.get("holdout"), "rows": payload.get("rows"),
-                          "submission": str(sub) if sub.exists() else None,
-                          "candidate": cand}
+            return {"error": str(e), "session": i + 1, "candidate": cand_final}
         print(f"  holdout mAP={payload.get('holdout')} rows={payload.get('rows')}")
+        previous = slug
 
+    sub = REPO / "runs" / f"final_{track}_s{chunks}" / "submission.csv"
+    return {"holdout": payload.get("holdout"), "rows": payload.get("rows"),
+            "submission": str(sub) if sub.exists() else None,
+            "candidate": cand_final}
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tracks", nargs="+", default=["transformer"])
+    ap.add_argument("--epochs", type=int, default=18)
+    ap.add_argument("--chunks", type=int, default=2,
+                    help="Kaggle sessions to split the run across")
+    ap.add_argument("--need-hours", type=float, default=19.0)
+    ap.add_argument("--timeout-hours", type=float, default=11.5)
+    ap.add_argument("--use-all-train", action="store_true",
+                    help="refit on every frame; the holdout score then means nothing")
+    ap.add_argument("--no-wait", action="store_true")
+    args = ap.parse_args()
+
+    if not args.no_wait:
+        print(f"proceeding with {wait_for_quota(args.need_hours):.2f} GPU-h available")
+
+    results = {t: run_track(t, args.epochs, args.chunks, args.use_all_train,
+                            args.timeout_hours) for t in args.tracks}
     out = REPO / "runs" / "final_comparison.json"
     out.write_text(json.dumps(results, indent=2))
     print(f"\nwrote {out}")
     ranked = sorted(((v.get("holdout") or -1, k) for k, v in results.items()), reverse=True)
     for score, track in ranked:
         print(f"  {track:12s} holdout mAP {score}")
-    if ranked:
+    if len(ranked) > 1:
         print(f"\nbetter track: {ranked[0][1]}")
 
 
