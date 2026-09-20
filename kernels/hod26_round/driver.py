@@ -1311,6 +1311,259 @@ def predict_test(model, cand, test_dir, png_ids):
     return preds, sizes
 
 
+# --- Test-time augmentation -------------------------------------------------
+#
+# ultralytics' `augment=True` is a no-op on this detector. RTDETRDetectionModel
+# .predict (nn/tasks.py) accepts the flag and never reads it -- there is no
+# _predict_augment branch the way DetectionModel has one -- so the "tta" arm of
+# the first inference sweep measured the identical forward pass as "default"
+# and came back 0.0002 apart, which is what an untested knob looks like.
+#
+# TTA is worth testing properly here because localization, not detection, is
+# where the score goes: 82% of held-out boxes are already matched at IoU >= 0.75
+# and only 1.4% of the error is missing or misclassified objects, while a
+# uniform 3-pixel shift is enough to take mAP from 1.00 to 0.249. Averaging the
+# same box across views cancels the independent part of that coordinate noise.
+# Weighted Boxes Fusion is the right merge for it: unlike NMS, which keeps one
+# member of a cluster and discards the rest, WBF replaces the cluster with its
+# confidence-weighted mean, so every view contributes to the coordinates.
+#
+# Scale views are deliberately excluded. The upscale sweep already measured
+# them -- imgsz 1024 -> 0.4076, 1280 -> 0.3847, 1536 -> 0.3362 -- because a
+# DETR decoder's query priors are tuned to the training scale. Only
+# scale-preserving views are offered: a horizontal flip, which the model is
+# already equivariant to because it trains with fliplr=0.5, and a whole-pixel
+# translation that moves objects relative to the feature grid without resizing
+# anything.
+
+VIEWS = {
+    "id": (),
+    "hflip": ("hflip",),
+    "shift3": ("shift3",),
+    "shift5": ("shift5",),
+    "hflip_shift3": ("hflip", "shift3"),
+}
+
+
+def _apply_view(img, ops):
+    """Transform a rendered frame for one TTA view. Shape is preserved."""
+    for op in ops:
+        if op == "hflip":
+            img = img[:, ::-1]
+        elif op.startswith("shift"):
+            n = int(op[5:])
+            # Pad top-left by n and crop back to size: the content moves down
+            # and right by exactly n pixels and nothing is rescaled, so the
+            # decoder still sees objects at the scale it was trained on.
+            img = np.pad(img, ((n, 0), (n, 0), (0, 0)), mode="edge")[
+                : img.shape[0], : img.shape[1]]
+        else:
+            raise ValueError(f"unknown view op {op!r}")
+    return np.ascontiguousarray(img)
+
+
+def _unapply_view(xyxy, ops, w, h):
+    """Map boxes from one view's coordinates back to the frame's."""
+    xyxy = np.asarray(xyxy, dtype=np.float64).reshape(-1, 4).copy()
+    for op in reversed(ops):
+        if op == "hflip":
+            x1 = w - xyxy[:, 2]
+            xyxy[:, 2] = w - xyxy[:, 0]
+            xyxy[:, 0] = x1
+        elif op.startswith("shift"):
+            xyxy[:, [0, 2]] -= int(op[5:])
+            xyxy[:, [1, 3]] -= int(op[5:])
+    xyxy[:, [0, 2]] = np.clip(xyxy[:, [0, 2]], 0, w)
+    xyxy[:, [1, 3]] = np.clip(xyxy[:, [1, 3]], 0, h)
+    return xyxy
+
+
+def _wbf_cluster(boxes, scores, n_views, iou_thr, rescale):
+    """Weighted Boxes Fusion over one frame's detections of one class.
+
+    Boxes are taken in descending confidence. Each either joins the cluster it
+    overlaps most (above `iou_thr`), whose fused box is then the running
+    confidence-weighted mean of its members, or starts a new one. A cluster's
+    score is the mean of its members', optionally scaled by how many of the
+    views found it -- a box only one view saw is, on the evidence, less certain
+    than one all of them saw.
+    """
+    order = np.argsort(-scores)
+    boxes, scores = boxes[order], scores[order]
+    fused, fscore, weight, count = [], [], [], []
+    for b, s in zip(boxes, scores):
+        j = -1
+        if fused:
+            fa = np.asarray(fused)
+            xx1 = np.maximum(fa[:, 0], b[0])
+            yy1 = np.maximum(fa[:, 1], b[1])
+            xx2 = np.minimum(fa[:, 2], b[2])
+            yy2 = np.minimum(fa[:, 3], b[3])
+            inter = np.clip(xx2 - xx1, 0, None) * np.clip(yy2 - yy1, 0, None)
+            union = ((fa[:, 2] - fa[:, 0]) * (fa[:, 3] - fa[:, 1])
+                     + (b[2] - b[0]) * (b[3] - b[1]) - inter)
+            iou = inter / np.maximum(union, 1e-9)
+            k = int(np.argmax(iou))
+            if iou[k] >= iou_thr:
+                j = k
+        if j < 0:
+            fused.append(b.astype(np.float64))
+            fscore.append(float(s))
+            weight.append(float(s))
+            count.append(1)
+            continue
+        w = weight[j] + s
+        fused[j] = (fused[j] * weight[j] + b * s) / max(w, 1e-9)
+        count[j] += 1
+        fscore[j] += (s - fscore[j]) / count[j]
+        weight[j] = w
+    out = np.asarray(fscore, dtype=np.float64)
+    if rescale:
+        out = out * np.minimum(np.asarray(count), n_views) / n_views
+    return np.asarray(fused, dtype=np.float64), out
+
+
+def wbf(per_view, n_views, iou_thr=0.65, rescale=True, max_det=300):
+    """Fuse several views' rows into one set, per frame and per class.
+
+    `per_view` is a list of row lists, each row (pid, cls, score, x1, y1, x2, y2)
+    already mapped back to frame coordinates.
+    """
+    grouped = {}
+    for rows in per_view:
+        for pid, cls, score, x1, y1, x2, y2 in rows:
+            grouped.setdefault((pid, cls), ([], []))
+            grouped[(pid, cls)][0].append((x1, y1, x2, y2))
+            grouped[(pid, cls)][1].append(score)
+    by_frame = {}
+    for (pid, cls), (boxes, scores) in grouped.items():
+        fb, fs = _wbf_cluster(np.asarray(boxes, dtype=np.float64),
+                              np.asarray(scores, dtype=np.float64),
+                              n_views, iou_thr, rescale)
+        by_frame.setdefault(pid, []).extend(
+            (pid, cls, float(s), float(b[0]), float(b[1]), float(b[2]),
+             float(b[3])) for b, s in zip(fb, fs))
+    out = []
+    for pid, rows in by_frame.items():
+        rows.sort(key=lambda r: -r[2])
+        out.extend(rows[:max_det])
+    return out
+
+
+def _read_frame(path):
+    """Read back a staged frame the same way ultralytics' loader will."""
+    if path.suffix == ".tiff":
+        ok, pages = cv2.imreadmulti(str(path), flags=cv2.IMREAD_UNCHANGED)
+        if not ok or not pages:
+            raise RuntimeError(f"could not read {path}")
+        return np.stack(pages, axis=2)
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise RuntimeError(f"could not read {path}")
+    return img if img.ndim == 3 else img[:, :, None]
+
+
+def predict_views(model, cand, src_dir, png_ids, views):
+    """Run one forward pass per view and return each view's rows, unwarped.
+
+    The mosaic decode is paid once: the identity view is rendered from the
+    cubes and every other view is built by reading those staged frames back
+    and transforming them, which is a file read rather than a de-mosaic. The
+    frames are not held in memory -- at sixteen bands, a thousand of them is
+    close to two gigabytes, and this runs beside a training session.
+    """
+    if "id" not in views:
+        raise ValueError("the identity view is the reference; include it")
+    kw = predict_kwargs(cand)
+    base = SCRATCH / "tta_id"
+    shutil.rmtree(base, ignore_errors=True)
+    base.mkdir(parents=True, exist_ok=True)
+    staged, sizes = {}, {}
+    for n, pid in enumerate(png_ids):
+        img = build_channels(load_planar(src_dir / f"{pid}.png"), cand["channels"])
+        sizes[pid] = (img.shape[1], img.shape[0])
+        staged[pid] = write_frame(base / str(pid), img)
+        if n % 250 == 0:
+            log(f"  decoded {n}/{len(png_ids)}")
+
+    per_view = []
+    for view in views:
+        ops = VIEWS[view]
+        if ops:
+            staging = SCRATCH / "tta_view"
+            shutil.rmtree(staging, ignore_errors=True)
+            staging.mkdir(parents=True, exist_ok=True)
+            of_path = {str(write_frame(staging / str(pid),
+                                       _apply_view(_read_frame(staged[pid]), ops))): pid
+                       for pid in png_ids}
+        else:
+            staging = base
+            of_path = {str(staged[pid]): pid for pid in png_ids}
+
+        t0, rows, seen = time.time(), [], 0
+        for r in model.predict(str(staging), **kw):
+            pid = of_path.get(str(Path(r.path).resolve()), of_path.get(str(r.path)))
+            if pid is None:
+                raise RuntimeError(f"prediction for an unexpected frame: {r.path}")
+            raw = _rows(pid, r)
+            if raw:
+                w, h = sizes[pid]
+                backed = _unapply_view([q[3:] for q in raw], ops, w, h)
+                rows.extend((pid, q[1], q[2], *map(float, bb))
+                            for q, bb in zip(raw, backed))
+            seen += 1
+        if seen != len(png_ids):
+            raise RuntimeError(f"view {view}: predicted {seen} of {len(png_ids)}")
+        log(f"  view {view:14s} {len(rows)} boxes in {time.time() - t0:.0f}s")
+        per_view.append(rows)
+        if ops:
+            shutil.rmtree(staging, ignore_errors=True)
+    shutil.rmtree(base, ignore_errors=True)
+    return per_view, sizes
+
+
+def tta_sweep(model, cand, root, spec):
+    """Measure TTA + WBF against the scorer that counts, on the held-out split.
+
+    Every arm that shares a view set shares its forward passes: the views are
+    predicted once and each fusion setting is then pure CPU over the cached
+    rows. So the GPU cost is the number of distinct views, not the number of
+    arms, and the fusion knobs are effectively free to sweep.
+    """
+    ann_dir = root / "train" / "annotations"
+    ids = require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
+    _, val_ids = split_ids(ids)
+    anns = [parse(ann_dir / f"{pid}.xml") for pid in val_ids]
+
+    arms = spec["arms"]
+    needed = sorted({v for a in arms.values() for v in a["views"]})
+    log(f"TTA sweep: {len(arms)} arms over views {needed}")
+    cached, _ = predict_views(model, cand, root / "train" / "images", val_ids, needed)
+    rows_by_view = dict(zip(needed, cached))
+
+    out = {}
+    base = evaluate(anns, rows_by_view["id"], per_class=True)
+    out["base"] = {**base, "boxes": len(rows_by_view["id"]),
+                   "note": "single view, no fusion -- the current submission path"}
+    log(f"  {'base':28s} mAP={base['mAP']:.4f} mAP50={base['mAP50']:.4f}")
+    for name, a in arms.items():
+        t0 = time.time()
+        fused = wbf([rows_by_view[v] for v in a["views"]], len(a["views"]),
+                    iou_thr=a.get("iou", 0.65), rescale=a.get("rescale", True),
+                    max_det=cand["infer"]["max_det"])
+        scored = evaluate(anns, fused, per_class=True)
+        out[name] = {**scored, "boxes": len(fused), "arm": a,
+                     "delta": round(scored["mAP"] - base["mAP"], 5),
+                     "seconds": round(time.time() - t0, 1)}
+        log(f"  {name:28s} mAP={scored['mAP']:.4f} mAP50={scored['mAP50']:.4f} "
+            f"d={out[name]['delta']:+.4f} ({len(fused)} boxes)")
+    best = max(out, key=lambda k: out[k]["mAP"])
+    log(f"  best arm: {best} at mAP {out[best]['mAP']:.4f} "
+        f"({out[best].get('delta', 0.0):+.4f} vs the current path)")
+    out["_best"] = best
+    return out
+
+
 def find_weights(name):
     """A checkpoint left behind by another kernel, mounted under /kaggle/input."""
     for base in sorted(INPUT.glob("*")):
@@ -1410,11 +1663,28 @@ def sweep_inference(model, cand, root, variants):
 
 
 def predict_test_set(model, cand, root):
-    """Predict the competition's test frames and write submission.csv."""
+    """Predict the competition's test frames and write submission.csv.
+
+    With `infer.tta_views` set, the frames go through the multi-view path and
+    the views are fused with WBF instead of a single forward pass being taken
+    as the answer. Organizers confirmed test-time augmentation does not count
+    as an ensemble; this is one checkpoint looked at from several angles, not
+    several checkpoints.
+    """
     test_dir = root / "test" / "images"
     test_ids = require_ids(sorted(int(p.stem) for p in test_dir.glob("*.png")), test_dir)
     log(f"predicting {len(test_ids)} test images")
-    preds, sizes = predict_test(model, cand, test_dir, test_ids)
+    views = cand["infer"].get("tta_views") or []
+    if views:
+        log(f"  TTA views {views}, WBF iou={cand['infer'].get('wbf_iou', 0.65)} "
+            f"rescale={cand['infer'].get('wbf_rescale', True)}")
+        per_view, sizes = predict_views(model, cand, test_dir, test_ids, views)
+        preds = wbf(per_view, len(views),
+                    iou_thr=cand["infer"].get("wbf_iou", 0.65),
+                    rescale=cand["infer"].get("wbf_rescale", True),
+                    max_det=cand["infer"]["max_det"])
+    else:
+        preds, sizes = predict_test(model, cand, test_dir, test_ids)
     shutil.rmtree(SCRATCH / "test_images", ignore_errors=True)
     n = write(WORK / "submission.csv", preds, clip_to=sizes)
     log(f"wrote submission.csv: {n} rows over {len({p[0] for p in preds})} images")
@@ -1444,6 +1714,8 @@ def run_from_checkpoint(round_cfg):
     out = {"mode": "checkpoint", "weights": str(w), "candidate": cand}
     if sub.get("sweep"):
         out["sweep"] = sweep_inference(model, cand, root, sub["sweep"])
+    if sub.get("tta_sweep"):
+        out["tta"] = tta_sweep(model, cand, root, sub["tta_sweep"])
     if sub.get("score_val", True):
         out["val"] = score_val_split(model, cand, root)
     if sub.get("predict_test", True):
