@@ -45,8 +45,13 @@ deadline, which is why this cannot be run on our side.
 ## Running it
 
 1. kaggle.com → **Create → New Notebook**.
-2. **File → Import Notebook** and upload `hod26_round.py`. (Or make one code
-   cell and paste the whole file into it.)
+2. Get the script. It is 134 kB, so downloading beats pasting — a cell that
+   large tends to lag the editor or truncate:
+
+   <https://raw.githubusercontent.com/Timothy-kira/hyper/claude/kaggle-cli-setup-ppjny1/handoff/hod26_round.py>
+
+   Save it, then **File → Import Notebook** and upload it. (If import gives
+   you trouble: one code cell, paste the whole file in, nothing else.)
 3. Right panel → **Input → Add Input → Datasets**, and add **both**:
    `hod26-planar` and `hod26-ckpt-s2`. Missing the second one means it has
    nothing to resume from and it will refuse to start.
