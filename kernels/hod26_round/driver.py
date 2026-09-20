@@ -868,7 +868,8 @@ def restore_state(net, src):
 
 def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                   bbox_loss="GIoU", loss_gain=None, is_rtdetr=True,
-                  bbox_alpha=1.0, vfl_beta=0.0, log_size_l1=False):
+                  bbox_alpha=1.0, vfl_beta=0.0, log_size_l1=False,
+                  reset_best_fitness=True):
     """A trainer that seeds the head from COCO by name and installs the adapter.
 
     Both have to happen inside get_model, and for the same reason: ultralytics
@@ -907,6 +908,31 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                 super()._setup_scheduler()
             finally:
                 self.epochs = real
+
+        def resume_training(self, ckpt):
+            """Resume the weights, but not the previous session's yardstick.
+
+            best.pt is only rewritten when an epoch beats self.best_fitness,
+            and _load_checkpoint_state restores that number from the
+            checkpoint. The session this run continues had folded the 600
+            validation frames into its training set, so the figure it recorded
+            -- 0.727 -- measures memorisation, while this run holds those
+            frames out and honestly scores about 0.69. Comparing the two picks
+            nothing: the bar sits above anything this run can print, best.pt
+            keeps the weights it arrived with, and eighteen epochs of training
+            end up predicting from the checkpoint they started from.
+
+            Clearing it restarts selection on this run's own scale, which is
+            the only one its epochs are measured against. last.pt is
+            unaffected, so a resume still continues from the right weights.
+            """
+            super().resume_training(ckpt)
+            if self.resume and reset_best_fitness:
+                previous = self.best_fitness
+                self.best_fitness = None
+                log(f"  best.pt selection restarts from this run's own scale "
+                    f"(the checkpoint's {previous} was measured on a "
+                    f"validation split it had trained on)")
 
         def check_resume(self, overrides):
             super().check_resume(overrides)
