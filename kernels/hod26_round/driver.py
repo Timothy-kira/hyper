@@ -598,6 +598,59 @@ if SpectralFront is not None:
             _c.__module__ = "hod26_kernel"
 
 
+def materialise_kernel_module():
+    """Give the DDP workers a real hod26_kernel.py to import.
+
+    The registration above pins SpectralFront and the loss overrides to a
+    synthetic module so a checkpoint names the same class wherever it is
+    loaded. cloudpickle -- which ultralytics uses to hand the trainer, the
+    model and the callbacks to its DDP workers -- resolves that name exactly
+    as pickle does: the module answers in sys.modules here, so the classes go
+    across *by reference*, and the worker, a fresh interpreter that never ran
+    this script, dies on ModuleNotFoundError before the first batch. Measured,
+    not assumed: pickling the same shape and loading it in a clean process
+    reproduces it every time.
+
+    Writing this file to disk under that name and putting it on sys.path makes
+    the reference resolvable in the worker, and the worker's sys.path is this
+    process's -- ultralytics bakes it into the file it generates. The import is
+    cheap because every expensive step in this script sits behind main(),
+    which only __main__ runs.
+
+    Returns False when the source cannot be located, which is the caller's cue
+    to stay on one GPU. A second card is worth a few hours; it is not worth
+    failing the session outright.
+    """
+    import sys as _s
+    src = None
+    for cand in (globals().get("__file__"), "/kaggle/src/script.py"):
+        try:
+            if cand and Path(cand).is_file():
+                src = Path(cand)
+                break
+        except OSError:
+            continue
+    if src is None:
+        return False
+    try:
+        target = SCRATCH / "hod26_kernel.py"
+        target.write_text(src.read_text())
+        if str(SCRATCH) not in _s.path:
+            _s.path.insert(0, str(SCRATCH))
+        return True
+    except OSError:
+        return False
+
+
+def visible_gpus():
+    """How many CUDA devices this session actually got, never more than asked."""
+    try:
+        import torch
+        return torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception:                                           # noqa: BLE001
+        return 0
+
+
 def install_spectral_adapter(net, n_bands, projection=None, ckpt_name=None,
                              srf_k=0, srf_width=2.0, stem_src=None):
     """Put a band mixer in front of an untouched pretrained first block.
@@ -1132,6 +1185,13 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
     """
     path = WORK / f"{tag}_metrics.jsonl"
     state = {}
+    # Bound here, not read from the global at call time. Under DDP this
+    # callback is cloudpickled into a worker that imported this module minutes
+    # after the session began, so its own T0 is not the session's -- and a
+    # guard measuring from the wrong zero would sail past Kaggle's 12-hour cap
+    # and lose the checkpoint it exists to protect. A closure cell travels with
+    # the callback; a module global does not.
+    t0 = T0
 
     def record(trainer):
         try:
@@ -1195,7 +1255,7 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
         state["last_epoch"] = rec["epoch"]
         if not budget_seconds:
             return
-        elapsed = time.time() - T0
+        elapsed = time.time() - t0
         # 15% headroom: epochs are not identical, and the one that overruns is
         # the one that costs the whole session.
         need = (rec["seconds"] or 0) * 1.15
@@ -1272,9 +1332,25 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                                 bbox_alpha=float(tr.get("bbox_alpha", 1.0)),
                                 vfl_beta=float(tr.get("vfl_beta", 0.0)),
                                 log_size_l1=bool(tr.get("log_size_l1", False)))
+    # One card or both, decided by what the session actually has rather than by
+    # what the metadata asked for: a request for two that lands on one must not
+    # take the run down with it. Per-card batch stays at tr["batch"], so each
+    # GPU does exactly the work it did on a single-card run and the optimizer
+    # still steps at nbs=64 -- the wall clock changes, the schedule does not.
+    gpus = visible_gpus()
+    use_ddp = gpus > 1 and materialise_kernel_module()
+    if gpus > 1 and not use_ddp:
+        log("  WARNING: two GPUs are visible but this script's source could not "
+            "be found on disk, so the DDP workers could not import it. "
+            "Training on one card.")
+    ddp_args = {"device": list(range(gpus))} if use_ddp else {}
+    batch = tr["batch"] * (gpus if use_ddp else 1)
+    log(f"  {gpus} GPU(s) visible; "
+        + (f"DDP across {list(range(gpus))}" if use_ddp else "single card")
+        + f", batch {batch} ({tr['batch']}/card)")
     log_state = attach_epoch_log(model, tag, budget_seconds, reserve_seconds)
     results = model.train(
-        data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
+        data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=batch,
         lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=close_mosaic,
         hsv_h=tr["hsv_h"], hsv_s=tr["hsv_s"], hsv_v=tr["hsv_v"],
         fliplr=tr["fliplr"], scale=tr["scale"], cos_lr=tr.get("cos_lr", True),
@@ -1283,7 +1359,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
         project=str(RUNS), name=tag, exist_ok=True,
         verbose=False, plots=False, val=True, seed=0,
         amp=tr.get("amp", True), deterministic=tr.get("deterministic", True),
-        resume=bool(resume_from), trainer=trainer_cls,
+        resume=bool(resume_from), trainer=trainer_cls, **ddp_args,
     )
     keep_for_resume(tag)
 
@@ -1975,7 +2051,19 @@ def preflight(round_cfg):
             bad.append("no GPU visible: the notebook's accelerator is off. "
                        "Settings -> Accelerator -> GPU T4 x2 before running.")
         else:
-            note.append(f"GPU {torch.cuda.get_device_name(0)}")
+            n = torch.cuda.device_count()
+            note.append(f"{n}x GPU {torch.cuda.get_device_name(0)}")
+            # An accelerator that silently comes back smaller than the one
+            # asked for is the expensive failure here: the run works, so
+            # nothing raises, and the session spends its whole allowance at
+            # half speed. Cheaper to refuse in the first minute.
+            want = int((round_cfg.get("submit") or {}).get("require_gpus", 1))
+            if n < want:
+                bad.append(
+                    f"asked for {want} GPUs and got {n}. Set the kernel's "
+                    "machine_shape to NvidiaTeslaT4x2 (or the notebook's "
+                    "Accelerator to GPU T4 x2) and run again -- nothing has "
+                    "been spent.")
     except Exception as exc:                                    # noqa: BLE001
         bad.append(f"torch unavailable: {exc}")
 
