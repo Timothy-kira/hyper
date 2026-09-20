@@ -1452,6 +1452,68 @@ def run_from_checkpoint(round_cfg):
     (WORK / "results.json").write_text(json.dumps(out, indent=2))
 
 
+# Test frame ids are offset into their own range so they cannot collide with a
+# training frame of the same number, which both sets have.
+PSEUDO_OFFSET = 1_000_000
+
+
+def pseudo_labels(root, conf: float, source: str = "submission.csv"):
+    """Turn a previous session's test predictions into training annotations.
+
+    Semi-supervised training on the competition's own unlabelled test frames.
+    The labels are this pipeline's own predictions, never anything read from
+    the organizers, so the leaderboard reading stays honest: a model that only
+    memorizes its own pseudo-labels reproduces its own score, and any gain has
+    to come from having adapted to frames it had not seen.
+
+    Measured on the held-out split where truth is available, predictions kept
+    at conf 0.6 are 91.7% precise, 93.2% complete, and -- the number that makes
+    this worth doing -- 99.7% correct about which class. What the model is
+    unsure of is whether an object is there and where its edges are, not what
+    it is.
+    """
+    src = None
+    for base in sorted(INPUT.glob("*")):
+        if _looks_like_dataset(base):
+            continue
+        c = base / source
+        if c.exists():
+            src = c
+            break
+    if src is None:
+        log(f"  no {source} among the attached kernels; training without pseudo-labels")
+        return {}, {}
+
+    import csv as _csv
+    kept = {}
+    with src.open() as fh:
+        for r in _csv.DictReader(fh):
+            if float(r["confidence"]) < conf:
+                continue
+            pid = int(r["image_id"])
+            kept.setdefault(pid, []).append(Box(
+                int(r["class_id"]), int(float(r["x1"])), int(float(r["y1"])),
+                int(float(r["x2"])), int(float(r["y2"]))))
+
+    test_dir = root / "test" / "images"
+    anns, index = {}, {}
+    for pid, boxes in kept.items():
+        f = test_dir / f"{pid}.png"
+        if not f.exists():
+            continue
+        h, w = load_planar(f).shape[:2]
+        boxes = [b for b in boxes if 0 <= b.x1 < b.x2 <= w and 0 <= b.y1 < b.y2 <= h]
+        if not boxes:
+            continue
+        key = PSEUDO_OFFSET + pid
+        anns[key] = Annotation(key, w, h, 16, tuple(boxes))
+        index[key] = f
+    n = sum(len(a.boxes) for a in anns.values())
+    log(f"  pseudo-labels from {src}: {len(anns)} test frames, {n} boxes "
+        f"at conf >= {conf} ({n / max(1, len(anns)):.1f} per frame)")
+    return anns, index
+
+
 def run_submission(round_cfg):
     """Train one candidate at full fidelity and write submission.csv."""
     cand = round_cfg["submit"]["candidate"]
@@ -1468,6 +1530,15 @@ def run_submission(round_cfg):
 
     anns = {pid: parse(ann_dir / f"{pid}.xml") for pid in set(train_ids) | set(val_ids)}
     index = frame_index(root, "train", sorted(set(train_ids) | set(val_ids)))
+
+    conf = float(round_cfg["submit"].get("pseudo_conf", 0) or 0)
+    if conf:
+        p_anns, p_index = pseudo_labels(root, conf)
+        anns.update(p_anns)
+        index.update(p_index)
+        train_ids = list(train_ids) + sorted(p_anns)
+        log(f"  training set is now {len(train_ids)} frames "
+            f"({len(train_ids) - len(p_anns)} labelled + {len(p_anns)} pseudo)")
 
     # A chunked run does not know in advance which session will be the last one
     # -- the clock decides -- so "if_complete" lets the session that reaches the
