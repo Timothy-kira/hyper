@@ -1150,28 +1150,34 @@ def is_main_rank():
         return True
 
 
-def metrics_tail(tag):
-    """The last real epoch record rank 0 wrote, or {}.
+def metrics_records(tag):
+    """Every epoch record rank 0 wrote, oldest first.
 
     Under DDP the validator, the trainer's epoch counter and the callback
     state all live in a subprocess the parent never sees, so this file is the
-    only place the parent can read what the run actually did. Records from a
-    cut-short run end with ultralytics re-validating the best checkpoint,
-    which is not an epoch -- final_eval marks it, and it is skipped here for
-    the same reason the trainer's own counter is preferred when there is one.
+    only place the parent can read what the run actually did.
     """
-    out = {}
+    out = []
     try:
         for line in (WORK / f"{tag}_metrics.jsonl").read_text().splitlines():
             try:
-                rec = json.loads(line)
+                out.append(json.loads(line))
             except ValueError:
                 continue
-            if not rec.get("final_eval") and rec.get("per_class"):
-                out = rec
     except OSError:
         pass
     return out
+
+
+def metrics_tail(tag):
+    """The last record that is an epoch, or {}.
+
+    A cut-short run ends with ultralytics re-validating the best checkpoint,
+    which is not an epoch -- final_eval marks it, and it is skipped here for
+    the same reason the trainer's own counter is preferred when there is one.
+    """
+    return next((r for r in reversed(metrics_records(tag))
+                 if not r.get("final_eval") and r.get("per_class")), {})
 
 
 def scores_from_results(results, tag):
@@ -1193,12 +1199,23 @@ def scores_from_results(results, tag):
                           for c, a in zip(box.ap_class_index, box.maps[box.ap_class_index])}
             if getattr(box, "ap_class_index", None) is not None else {},
         }
-    flat = results if isinstance(results, dict) else {}
+    # The dict ultralytics falls back to is best.pt's *stored* train_metrics,
+    # written by whichever session saved that checkpoint. A resumed run that
+    # never beats the checkpoint it inherited keeps the inherited best, and so
+    # reports the previous session's number as this run's holdout -- here,
+    # 0.7271 from a session that had folded the validation frames into
+    # training, for a run whose own re-validation said 0.6985. The single-GPU
+    # path reads the validator after its final pass over *this* run's split,
+    # and the final_eval record is that same pass, so preferring it keeps both
+    # paths reporting the same measurement.
+    final = next((r for r in reversed(metrics_records(tag))
+                  if r.get("final_eval")), {})
+    flat = final.get("metrics") or (results if isinstance(results, dict) else {})
     nan = float("nan")
     return {
         "mAP": float(flat.get("metrics/mAP50-95(B)", nan)),
         "mAP50": float(flat.get("metrics/mAP50(B)", nan)),
-        "per_class": metrics_tail(tag).get("per_class", {}),
+        "per_class": final.get("per_class") or metrics_tail(tag).get("per_class", {}),
     }
 
 
