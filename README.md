@@ -172,7 +172,11 @@ leaderboard uses.
 | --- | --- | --- | --- | --- |
 | 1 | 9 | 0.6689 | 0.59680 | 0.0721 |
 | 3 | 10 | 0.6706 | 0.59783 | 0.0728 |
-| 2 | 19 | 0.6869 | **0.62584** | 0.0611 |
+| 2 | 19 | 0.6869 | 0.62584 | 0.0611 |
+| 4 | 21 (resumed from 2, all 3000 frames) | 0.6989* | **0.62613** | 0.0728* |
+
+\* session 4 trained on all 3000 frames, so the held-out 600 are inside its
+training set and its 0.6989 is not comparable to the rows above.
 
 Sessions 1 and 3 are two independent runs at nearly the same length, which is
 not how they were meant to relate -- see below -- but it makes them the
@@ -191,6 +195,31 @@ inside the noise, but certainly not the gain it was included for.
 The gap between held-out and the leaderboard does not widen with training:
 0.072 at nine epochs, 0.073 at ten, 0.061 at nineteen. Longer training
 generalises better rather than memorising the split.
+
+### What the last session bought
+
+Session 4 is the only genuinely continued run here: the resume fix landed, the
+log says `training starts at epoch 20 of 21 (resume=True)`, and the checkpoint
+came from `/kaggle/input/notebooks/xishengfeng/hod26-final-transformer-s2/final_last.pt`
+-- three levels deep, which is exactly the layout the one-level search could
+never reach. It added two epochs *and* folded the 600 held-out frames back in,
+25% more real data.
+
+It moved the leaderboard by **+0.0003**, which is inside the 0.001 run-to-run
+noise measured above. Meanwhile its held-out score rose 0.0120, from 0.6869 to
+0.6989.
+
+Those two numbers together are the finding. The held-out gain is the model
+memorising the 600 frames it had just been handed; none of it reached the test
+set, and the gap widened from 0.0611 to 0.0728 to prove it. Folding the
+validation split into training buys a better validation score by construction
+and nothing else -- and it costs the only honest measurement left, because
+`best.pt` is then selected on 60 frames the model has already trained on.
+
+Two epochs at the tail of an annealed schedule also do not behave like two
+epochs of a longer run. The +0.0031/epoch slope came from comparing two
+independent runs of different lengths, which measures how good a run of length
+N is, LR schedule and all. It does not license adding epochs to a finished one.
 
 ### The resume that never resumed
 
