@@ -73,6 +73,43 @@ python3 tools/watch_run.py qwyi123/hod26-team --seconds 120
 
 ## Epochs
 
+ultralytics' own validation on the held-out 600. The leaderboard's scorer
+reads about 0.05 below this, which is why 0.69 here sits beside 0.626 there.
+
 | epoch | mAP50 | mAP50-95 | wall |
 | --- | --- | --- | --- |
-| 22 | pending | pending | |
+| 22 | 0.9488 | 0.6938 | 1101 s |
+| 23 | 0.9446 | 0.6891 | 1100 s |
+| 24 | 0.9434 | 0.6879 | 1100 s |
+| 25 | 0.9450 | 0.6915 | 1100 s |
+
+Four points cannot separate "flat" from the +0.002/epoch the earlier sessions
+ran at (epoch 10 → 19 went 0.665 → 0.687) against noise of about +/-0.003, so
+they are consistent with the run still improving slowly. They are not evidence
+that it has stopped.
+
+## The checkpoint this run predicts from
+
+`best.pt` is only rewritten when an epoch beats the fitness stored in the
+checkpoint the run resumed from, and ultralytics restores that number on
+resume. Ours was recorded at **0.727** by the session that had folded the 600
+validation frames into its training set; this run holds them out and scores
+about 0.69. The bar therefore sits above anything this run prints, `best.pt`
+keeps the weights it arrived with, and the session's own `submission.csv`
+would come from epoch 21 — the model already on the leaderboard at 0.62613.
+
+The fix (clearing `best_fitness` on resume) is in the driver but **not in the
+running session**: the push was refused with `Maximum batch GPU session count
+of 2 reached` and restarting would have cost the epochs already done.
+
+So the finish is a separate step, which costs about eight GPU-minutes and
+needs no restart:
+
+```bash
+python3 tools/predict_from_run.py --source qwyi123/hod26-team \
+    --weights final_last.pt --message "..." --no-submit
+```
+
+`final_last.pt` is the weights the run actually produced. The same kernel
+scores the held-out 600 with pycocotools — the leaderboard's own ruler — so
+the submission's worth is known before it is spent against the daily three.
