@@ -1928,9 +1928,132 @@ def run_submission(round_cfg):
     }, indent=2))
 
 
+ULTRALYTICS_PIN = "8.4.155"
+
+
+def preflight(round_cfg):
+    """Check every import this session depends on, before it costs anything.
+
+    A long session fails in one of two ways. It raises in the first minute and
+    costs nothing, or it runs for hours on a wrong assumption and costs the
+    allowance -- which on Kaggle does not come back and, near a deadline, can
+    be the whole remaining budget. Everything checked here is of the second
+    kind: it looks fine at startup and only shows up later, or does not show up
+    at all.
+
+    The precedent is find_checkpoint(), which searched one level under
+    /kaggle/input, found nothing, returned None, and so restarted from COCO
+    while reporting a healthy curve from epoch 1. Three sessions and thirteen
+    GPU-hours went that way. Every item below is a thing that could do the same.
+    """
+    import shutil as _sh
+    bad, note = [], []
+
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            bad.append("no GPU visible: the notebook's accelerator is off. "
+                       "Settings -> Accelerator -> GPU T4 x2 before running.")
+        else:
+            note.append(f"GPU {torch.cuda.get_device_name(0)}")
+    except Exception as exc:                                    # noqa: BLE001
+        bad.append(f"torch unavailable: {exc}")
+
+    # The adapter, the loss overrides and the clock guard all reach into
+    # ultralytics internals -- the module layout of the first block, the
+    # classifier remap hook, trainer.stop, check_resume. A newer release can
+    # move any of them, and the failure mode that costs money is the one where
+    # nothing raises and the behaviour quietly differs.
+    try:
+        import ultralytics
+        if ultralytics.__version__ != ULTRALYTICS_PIN:
+            bad.append(f"ultralytics {ultralytics.__version__} but this kernel "
+                       f"is written against {ULTRALYTICS_PIN}; the pinned "
+                       f"install did not take")
+        else:
+            note.append(f"ultralytics {ultralytics.__version__}")
+    except Exception as exc:                                    # noqa: BLE001
+        bad.append(f"ultralytics unavailable: {exc}")
+
+    try:
+        import pycocotools  # noqa: F401
+    except Exception as exc:                                    # noqa: BLE001
+        bad.append(f"pycocotools unavailable: {exc}")
+
+    # The dataset. A private dataset attached by someone who cannot see it
+    # simply is not mounted, and data_root() then raises much later.
+    try:
+        root = data_root()
+        ann = len(list((root / "train" / "annotations").glob("*.xml")))
+        tr = len(list((root / "train" / "images").glob("*.png")))
+        te = len(list((root / "test" / "images").glob("*.png")))
+        note.append(f"data {root}: {tr} train / {ann} xml / {te} test")
+        if (ann, tr, te) != (3000, 3000, 1000):
+            bad.append(f"expected 3000 train / 3000 xml / 1000 test, "
+                       f"got {tr}/{ann}/{te}")
+    except Exception as exc:                                    # noqa: BLE001
+        bad.append(f"dataset not found ({exc}). Attached inputs: "
+                   f"{[q.name for q in sorted(INPUT.glob('*'))]}. If the "
+                   f"planar dataset is private, its owner must add this "
+                   f"account as a collaborator before it can be mounted.")
+
+    sub = round_cfg.get("submit") or {}
+    cand = sub.get("candidate") or {}
+
+    # COCO weights. ultralytics fetches these from GitHub on first use, so a
+    # notebook with internet off trains a randomly initialised detector for
+    # hours instead of failing.
+    name = (cand.get("train") or {}).get("model", "rtdetr-l")
+    try:
+        from ultralytics.utils.downloads import attempt_download_asset
+        got = attempt_download_asset(f"{name}.pt")
+        if not Path(got).exists():
+            raise RuntimeError(f"{got} missing after download")
+        note.append(f"{name}.pt {Path(got).stat().st_size / 1e6:.0f} MB")
+    except Exception as exc:                                    # noqa: BLE001
+        bad.append(f"could not fetch {name}.pt ({exc}). Settings -> Internet "
+                   f"must be on, or the COCO weights never arrive and the "
+                   f"detector trains from random initialisation.")
+
+    # The resume, checked here rather than after the dataset is materialised.
+    if cand.get("require_resume"):
+        ck = find_checkpoint("final")
+        if ck is None:
+            bad.append("require_resume is set but no final_last.pt/last.pt is "
+                       "reachable. Attached: " + str({
+                           q.name: sorted(x.name for x in q.glob("**/*.pt"))[:6]
+                           for q in sorted(INPUT.glob("*"))}))
+        else:
+            note.append(f"resume from {ck}")
+    if sub.get("weights_from"):
+        if find_weights(sub["weights_from"]) is None:
+            bad.append(f"weights_from={sub['weights_from']} not found under "
+                       f"{INPUT}")
+
+    # Scratch. A full disk surfaces as a cryptic write error deep in training.
+    try:
+        free = free_gb(SCRATCH)
+        note.append(f"scratch {SCRATCH} {free:.1f} GB free")
+        if free < 20:
+            bad.append(f"only {free:.1f} GB free at {SCRATCH}; rendering 3000 "
+                       f"frames plus augmented copies needs about 20")
+    except Exception as exc:                                    # noqa: BLE001
+        bad.append(f"scratch unusable: {exc}")
+
+    for line in note:
+        log(f"  preflight ok: {line}")
+    if bad:
+        for line in bad:
+            log(f"  PREFLIGHT FAILED: {line}")
+        raise RuntimeError(f"{len(bad)} preflight check(s) failed; refusing to "
+                           f"spend a GPU session on a run that cannot finish")
+    log("preflight passed")
+
+
 def main():
     round_cfg = json.loads(Path(__file__).with_name("round.json").read_text()) \
         if Path(__file__).with_name("round.json").exists() else ROUND_CONFIG
+    preflight(round_cfg)
 
     if round_cfg.get("submit"):
         if round_cfg["submit"].get("weights_from"):
