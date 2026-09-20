@@ -82,6 +82,12 @@ reads about 0.05 below this, which is why 0.69 here sits beside 0.626 there.
 | 23 | 0.9446 | 0.6891 | 1100 s |
 | 24 | 0.9434 | 0.6879 | 1100 s |
 | 25 | 0.9450 | 0.6915 | 1100 s |
+| 26 | 0.9452 | 0.6891 | 1100 s |
+| 27 | 0.9470 | 0.6918 | 1100 s |
+| 28 | 0.9474 | 0.6940 | 1100 s |
+| 29 | 0.9474 | 0.6941 | 1099 s |
+| 30 | 0.9470 | 0.6947 | 1099 s |
+| 31 | 0.9459 | 0.6939 | 1100 s |
 
 Four points cannot separate "flat" from the +0.002/epoch the earlier sessions
 ran at (epoch 10 → 19 went 0.665 → 0.687) against noise of about +/-0.003, so
@@ -113,3 +119,35 @@ python3 tools/predict_from_run.py --source qwyi123/hod26-team \
 `final_last.pt` is the weights the run actually produced. The same kernel
 scores the held-out 600 with pycocotools — the leaderboard's own ruler — so
 the submission's worth is known before it is spent against the daily three.
+
+## The leftover session
+
+The v2 push at 16:06 started a new session without stopping the one from 13:27.
+`kaggle kernels status` reports only a kernel's *latest* session, so the older one
+is invisible to it, and two independent signals are what found it:
+
+- a push at 19:42 refused with `Maximum batch GPU session count of 2 reached`,
+  while only one kernel reported RUNNING;
+- quota burning at ~2.0 GPU-h per wall hour with, nominally, one session running.
+
+That second signal also settles how Kaggle bills: **each session costs 1x its own
+wall clock, whatever its GPU count.** The 15:04-16:03 window decides it — a
+dual-card kernel ran 38 minutes there alongside a single-card one, and 2x-for-dual
+predicts 2.74 GPU-h against the 1.82 observed, where 1x predicts 1.86. Dual-card is
+a 1.92x speedup at no extra cost; the doubled burn is the leftover, not the second
+GPU.
+
+It cannot be stopped from here: `cancel_kernel_session` needs a session id no public
+endpoint returns, and guessing one could cancel the wrong session. Its own 11-hour
+guard stops it around 00:32, and it reaches epoch ~40 on the way — a second,
+independent epoch-40 model, bought at about 5 GPU-h.
+
+## Finishing
+
+Neither running session carries the `best_fitness` fix, so both write a
+`submission.csv` predicted from the inherited epoch-21 `best.pt` — the model already
+on the leaderboard at 0.62613. Neither is worth submitting.
+
+The submission comes from `final_last.pt` instead, through
+`tools/predict_from_run.py`, which also scores the held-out 600 with pycocotools so
+the number is known before a submission is spent against the daily three.
