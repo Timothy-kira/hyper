@@ -59,7 +59,11 @@ which is why this cannot be run on our side.
    checkpoints and the run would resume from whichever sorts first, which is
    the wrong one. It refuses to start rather than guess, but it is simpler not
    to attach it.
-4. Right panel → **Session options → Accelerator → GPU T4 x2**.
+4. Right panel → **Session options → Accelerator → GPU T4 x2**. Both cards
+   are now used, not just one: the run trains under DDP at 4 images per card.
+   If the session comes up with a single T4 the preflight stops it in the
+   first minute rather than spending the whole allowance at half speed, so a
+   wrong accelerator costs nothing but a re-commit.
 5. Same panel → **Internet → On**. Required: the COCO pretrained weights are
    fetched at startup, and without them the model trains from random
    initialisation and the whole session is wasted.
@@ -71,10 +75,16 @@ which is why this cannot be run on our side.
 You want to see these two things:
 
 ```
+preflight ok: 2x GPU Tesla T4
 preflight passed
 resuming from /kaggle/input/hod26-ckpt-s4/final_last.pt -> ...
+2 GPU(s) visible; DDP across [0, 1], batch 8 (4/card)
+training starts at epoch 22 of 40 (resume=True)
 training starts at epoch 22 of 40 (resume=True)
 ```
+
+`training starts` appearing **twice is correct** — one line per card. Seeing it
+once means the run is on a single GPU.
 
 - If it prints `PREFLIGHT FAILED` lines instead, **nothing has been spent**.
   Each line names exactly what is wrong; fix it and commit again.
@@ -124,6 +134,7 @@ holdout mAP=...` tells us where the run got to and what it is worth.
 | `PREFLIGHT FAILED: require_resume` | `hod26-ckpt-s4` not attached — step 3 |
 | `PREFLIGHT FAILED: more than one checkpoint` | both `-s2` and `-s4` attached; remove `-s2` |
 | `PREFLIGHT FAILED: no GPU visible` | accelerator still off |
+| `PREFLIGHT FAILED: asked for 2 GPUs and got 1` | accelerator is on but set to a single T4; switch it to **GPU T4 x2**. Nothing has been spent |
 | `could not fetch rtdetr-l.pt` | Internet off |
 | `expected 3000 train / 3000 xml / 1000 test` | the dataset mounted but is incomplete; tell us |
 | killed at ~12 hours | Kaggle's hard cap; the guard should have stopped it at 11. The checkpoint is lost. Tell us rather than re-running |
