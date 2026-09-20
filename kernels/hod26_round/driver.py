@@ -1001,13 +1001,32 @@ def build_model(name, weights=None):
 # epoch is logged explicitly.
 
 def find_checkpoint(tag):
-    """The previous session's last.pt, attached as another kernel's output."""
+    """The previous session's last.pt, attached as another kernel's output.
+
+    The recursive fallback is not decoration. Kaggle does not mount a kernel's
+    output at a stable depth -- the same artifact has come up at
+    /kaggle/input/<slug>/ on one kernel and nested a level or two down on
+    another, which is why data_root() searches for the dataset rather than
+    guessing its path. find_weights() has had this fallback all along, which is
+    why every prediction kernel found its checkpoint; this function did not,
+    and so the chunked resume it exists to serve silently started from scratch
+    every time. Sessions 1, 2 and 3 were three independent runs of 9, 19 and 10
+    epochs rather than one run of 38, and the best model came out of the
+    longest of the three rather than the sum.
+
+    Returning None has to keep meaning "no previous session" for the first
+    session of a run, so the loud failure belongs in the caller, which knows
+    whether a checkpoint was expected. See require_resume in run_candidate.
+    """
     for base in sorted(INPUT.glob("*")):
         if _looks_like_dataset(base):
             continue          # the planar frames, not a previous session
-        for cand in (base / f"{tag}_last.pt", base / "last.pt"):
-            if cand.exists():
-                return cand
+        for name in (f"{tag}_last.pt", "last.pt"):
+            direct = base / name
+            if direct.exists():
+                return direct
+            for c in sorted(base.glob(f"**/{name}")):
+                return c
     return None
 
 
@@ -1192,6 +1211,18 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
     close_mosaic = min(tr.get("close_mosaic", 5), max(0, tr["epochs"] - 1))
 
     resume_from = stage_checkpoint(tag)
+    if cand.get("require_resume") and resume_from is None:
+        # The expensive failure mode this run actually hit: no checkpoint found
+        # looks exactly like a first session, so the run restarts from COCO and
+        # reports a perfectly healthy curve from epoch 1. Three sessions and
+        # thirteen GPU-hours went that way. A session that is meant to continue
+        # one says so, and dies here instead -- a failed resume then costs the
+        # minute it takes to mount the inputs rather than the whole allowance.
+        listing = {b.name: sorted(q.name for q in b.glob("**/*.pt"))[:6]
+                   for b in sorted(INPUT.glob("*"))}
+        raise RuntimeError(
+            f"require_resume is set but no {tag}_last.pt or last.pt was found "
+            f"under {INPUT}; attached inputs and their checkpoints: {listing}")
     model = build_model(tr["model"], resume_from)
     adapter = None
     if tr.get("in_channels", 3) > 3:
