@@ -176,15 +176,37 @@ leaderboard uses.
 | 4 | 21 (resumed from 2, all 3000 frames) | 0.6989* | **0.62613** | 0.0728* |
 
 \* session 4 trained on all 3000 frames, so the held-out 600 are inside its
-training set and its 0.6989 is not comparable to the rows above.
+training set. Its 0.6989 and 0.0728 are not comparable to the rows above and
+neither is evidence about the model; see below. Sessions 2 and 4 differ by
+0.00029 on the leaderboard, inside the noise, and are not distinguishable.
 
 Sessions 1 and 3 are two independent runs at nearly the same length, which is
 not how they were meant to relate -- see below -- but it makes them the
 reproducibility check this project never budgeted for. They land 0.0010 apart
 on the leaderboard and 0.0017 apart on held-out, so **run-to-run noise at full
 scale is about 0.001**, an order of magnitude below the 0.015 measured on the
-104-frame street subset the loss A/B used. That is worth knowing: it means the
-A/B's noise floor was a property of the subset, not of the pipeline.
+104-frame street subset the loss A/B used. That is worth knowing, and it
+invalidates a decision rather than just informing one.
+
+The loss A/B ran three changes aimed at the localization bottleneck: L1 on
+width and height in log space, `1 - IoU` raised to `1 - IoU^alpha` so a box
+already found is pushed harder on precision, and a floor on the Varifocal
+positive weight so a miss is punished more than a loose hit. All of its arms
+landed below the reference and its spread (0.0149) exceeded the reference's own
+lead (0.0091), so the run was read as "nothing proven" and every one of them
+was switched off -- `bbox_alpha=1.0`, `vfl_beta=0.0`, `log_size_l1=false` in
+sessions 3 and 4 alike, which is the same objective sessions 1 and 2 used.
+
+But a noise floor of 0.015 cannot resolve an effect of a few thousandths, which
+is the size these changes plausibly have. The A/B returned *no signal*, and it
+was treated as *no effect*. Those are different claims, and only the first one
+was earned. The three changes are implemented (`install_bbox_loss`,
+`IoUKindDETRLoss`, `IoUKindVFL`) and have never been run at full scale; nothing
+here says whether they help.
+
+The general lesson is cheaper to state than it was to learn: a proxy's noise
+floor has to be measured before its verdicts are acted on, and the measurement
+costs one repeated arm.
 
 It also settles, by accident, the one change session 3 was carrying. Session 3
 had `repeat_threshold=0.2` and session 1 did not. The 10 -> 19 epoch slope is
@@ -196,7 +218,7 @@ The gap between held-out and the leaderboard does not widen with training:
 0.072 at nine epochs, 0.073 at ten, 0.061 at nineteen. Longer training
 generalises better rather than memorising the split.
 
-### What the last session bought
+### What the last session showed
 
 Session 4 is the only genuinely continued run here: the resume fix landed, the
 log says `training starts at epoch 20 of 21 (resume=True)`, and the checkpoint
@@ -205,21 +227,31 @@ came from `/kaggle/input/notebooks/xishengfeng/hod26-final-transformer-s2/final_
 never reach. It added two epochs *and* folded the 600 held-out frames back in,
 25% more real data.
 
-It moved the leaderboard by **+0.0003**, which is inside the 0.001 run-to-run
-noise measured above. Meanwhile its held-out score rose 0.0120, from 0.6869 to
+It moved the leaderboard +0.0003 and its held-out score +0.0120, from 0.6869 to
 0.6989.
 
-Those two numbers together are the finding. The held-out gain is the model
-memorising the 600 frames it had just been handed; none of it reached the test
-set, and the gap widened from 0.0611 to 0.0728 to prove it. Folding the
-validation split into training buys a better validation score by construction
-and nothing else -- and it costs the only honest measurement left, because
-`best.pt` is then selected on 60 frames the model has already trained on.
+Neither number says what it looks like it says.
 
-Two epochs at the tail of an annealed schedule also do not behave like two
-epochs of a longer run. The +0.0031/epoch slope came from comparing two
-independent runs of different lengths, which measures how good a run of length
-N is, LR schedule and all. It does not license adding epochs to a finished one.
+The held-out score is no longer comparable: those 600 frames are inside session
+4's training set, so 0.6989 and session 2's 0.6869 do not measure the same
+thing. That is definitional. It also costs the only honest measurement left,
+because `best.pt` is then selected on frames the model has already trained on.
+What it is *not* is evidence that the model got worse -- a model can memorise
+frames it was handed and generalise exactly as well as before, and the widened
+val-to-leaderboard gap is the metric changing underneath, not the model
+degrading.
+
+The leaderboard score says almost nothing either, because two epochs is not
+enough to move it past the noise. Run-to-run noise here is about 0.001 and a
+plausible effect from two epochs is a few thousandths, so this experiment could
+not have detected a real gain. The +0.0031/epoch slope does not license an
+expectation: it came from comparing two independent runs of different lengths,
+which measures how good a run of length N is, schedule and all, and says
+nothing about bolting epochs onto a finished one.
+
+**Sessions 2 and 4 are therefore indistinguishable on the evidence.** The
+experiment was underpowered, not negative. The one thing it does establish is
+the resume mechanism, end to end.
 
 ### The resume that never resumed
 
