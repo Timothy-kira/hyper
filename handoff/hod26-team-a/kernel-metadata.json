@@ -1,0 +1,15 @@
+{
+  "id": "TEAMMATE/hod26-team-a",
+  "title": "Hod26 Team A",
+  "code_file": "hod26_round.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "competition_sources": [],
+  "dataset_sources": [
+    "xishengfeng/hod26-planar"
+  ],
+  "kernel_sources": []
+}
