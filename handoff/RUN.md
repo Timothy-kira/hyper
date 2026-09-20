@@ -151,3 +151,50 @@ on the leaderboard at 0.62613. Neither is worth submitting.
 The submission comes from `final_last.pt` instead, through
 `tools/predict_from_run.py`, which also scores the held-out 600 with pycocotools so
 the number is known before a submission is spent against the daily three.
+
+## Outcome
+
+`fit done at epoch 40/40; holdout mAP=0.6985` — and that number is `best.pt`'s,
+which is the epoch-21 checkpoint the run resumed from. It was never rewritten: the
+inherited `best_fitness` of 0.727 was measured on a validation split that session had
+trained on, and no honest epoch of this run came near it. So the session's own
+`submission.csv` was predicted from epoch-21 weights, exactly as predicted, and was
+not submitted.
+
+The submission came from `final_last.pt` through `tools/predict_from_run.py`:
+
+| | held-out 600 (pycocotools) | leaderboard |
+| --- | --- | --- |
+| epoch 19, session 2 | 0.6873 (ultralytics) | 0.62584 |
+| epoch 21, session 4 | — | 0.62613 |
+| **epoch 40, session 5** | **0.6943** | **0.62954** |
+
+Eighteen epochs of two-card training bought **+0.0034** on the leaderboard, against a
+noise floor of 0.001. Real, but a twentieth of what the handoff's +0.0031/epoch
+extrapolation promised.
+
+The per-epoch curve says why. Epoch 22 scored 0.6938 and epoch 40 scored 0.6941 —
+eighteen epochs, net 0.0003. Closing mosaic at 36, which usually steps the curve up,
+did nothing here (0.6971 at 35, 0.6943 at 36). The best epoch of the whole run was
+35, not 40.
+
+Two calibrations worth keeping:
+
+- pycocotools and ultralytics agree on this checkpoint (0.6943 vs 0.6941), and
+  `maxDets` 100 and 300 also agree. The ~0.06 the README describes is not a
+  difference between rulers — it is the held-out 600 against the test 1000.
+- So held-out minus 0.065 is the leaderboard estimate: 0.6943 - 0.0648 = 0.62954,
+  measured.
+
+### Where the deficit is, at epoch 40
+
+| class | AP (pycocotools) | at epoch 22 |
+| --- | --- | --- |
+| stone_block | 0.3221 | 0.315 |
+| people | 0.4150 | 0.410 |
+| e-bike | 0.4492 | 0.446 |
+| car | 0.5895 | 0.581 |
+| the other fourteen | 0.712-0.802 | 0.716-0.804 |
+
+Eighteen epochs moved the four deficit classes by 0.003-0.009 each. Whatever is
+holding them is not something more epochs of this recipe will fix.
