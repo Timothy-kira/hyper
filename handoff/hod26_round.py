@@ -2068,6 +2068,74 @@ def stage_checkpoint(tag):
     return str(last)
 
 
+def is_main_rank():
+    """True in a single-GPU run, and in rank 0 of a DDP one.
+
+    torch.distributed.run sets RANK in every worker it spawns; nothing sets it
+    otherwise. The callbacks below run inside those workers, so without this
+    both ranks append to the same metrics file and copy the same 264 MB
+    checkpoint to the same path at the same time. Only rank 0 validates, so
+    rank 1's numbers are NaN anyway -- the guard drops a corruption risk and a
+    stream of misleading log lines together.
+    """
+    try:
+        return int(os.environ.get("RANK", -1)) in (-1, 0)
+    except ValueError:
+        return True
+
+
+def metrics_tail(tag):
+    """The last real epoch record rank 0 wrote, or {}.
+
+    Under DDP the validator, the trainer's epoch counter and the callback
+    state all live in a subprocess the parent never sees, so this file is the
+    only place the parent can read what the run actually did. Records from a
+    cut-short run end with ultralytics re-validating the best checkpoint,
+    which is not an epoch -- final_eval marks it, and it is skipped here for
+    the same reason the trainer's own counter is preferred when there is one.
+    """
+    out = {}
+    try:
+        for line in (WORK / f"{tag}_metrics.jsonl").read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if not rec.get("final_eval") and rec.get("per_class"):
+                out = rec
+    except OSError:
+        pass
+    return out
+
+
+def scores_from_results(results, tag):
+    """mAP for the run, whichever shape ultralytics hands back.
+
+    On one GPU this is the validator's metrics object. Under DDP the parent's
+    validator never ran, so ultralytics falls back to the checkpoint's
+    train_metrics: a flat dict of the same numbers with no per-class
+    breakdown attached. Rank 0 wrote that breakdown to the metrics file epoch
+    by epoch, so multi-GPU runs keep their per-class scores instead of
+    silently reporting none.
+    """
+    box = getattr(results, "box", None)
+    if box is not None:
+        return {
+            "mAP": float(box.map),          # mAP@[.5:.95], the competition's primary
+            "mAP50": float(box.map50),
+            "per_class": {CLASSES[int(c)]: float(a)
+                          for c, a in zip(box.ap_class_index, box.maps[box.ap_class_index])}
+            if getattr(box, "ap_class_index", None) is not None else {},
+        }
+    flat = results if isinstance(results, dict) else {}
+    nan = float("nan")
+    return {
+        "mAP": float(flat.get("metrics/mAP50-95(B)", nan)),
+        "mAP50": float(flat.get("metrics/mAP50(B)", nan)),
+        "per_class": metrics_tail(tag).get("per_class", {}),
+    }
+
+
 def snapshot_for_resume(tag, run):
     """Copy last.pt out while it still carries optimizer state.
 
@@ -2077,6 +2145,8 @@ def snapshot_for_resume(tag, run):
     a normal run. So the copy is taken per epoch, from on_model_save, before the
     strip can reach it.
     """
+    if not is_main_rank():
+        return
     for src, dst in ((run / "weights" / "last.pt", WORK / f"{tag}_last.pt"),
                      (run / "results.csv", WORK / f"{tag}_results.csv")):
         if src.exists():
@@ -2128,6 +2198,8 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
     t0 = T0
 
     def record(trainer):
+        if not is_main_rank():
+            return
         try:
             _record(trainer)
         except Exception:
@@ -2316,23 +2388,23 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
             log(f"  adapter trained: moved {drift['rel']:.4%} from its initialisation "
                 f"(L2 {drift['l2']:.4f} of {drift['init_norm']:.4f})")
 
-    box = results.box
-    scores = {
-        "mAP": float(box.map),          # mAP@[.5:.95], the competition's primary
-        "mAP50": float(box.map50),
-        "per_class": {CLASSES[int(c)]: float(a)
-                      for c, a in zip(results.box.ap_class_index, box.maps[box.ap_class_index])}
-        if getattr(box, "ap_class_index", None) is not None else {},
-    }
+    scores = scores_from_results(results, tag)
     scores["adapter"] = drift
     # The epoch the run actually reached, which the clock guard can cut short.
     # Read from the trainer rather than counted from the log: the log's last
     # record is ultralytics re-validating the best checkpoint, which is not an
     # epoch, and getting this one too high would let the orchestrator call an
     # unfinished run done and never produce a submission.
+    # Under DDP the parent's trainer never ran an epoch, so its counter reads
+    # the start of training rather than the end of it -- claiming epoch 1 of a
+    # run that reached 39. The metrics file is rank 0's own record and is the
+    # only honest source there; log_state is empty for the same reason.
     reached = getattr(getattr(model, "trainer", None), "epoch", None)
-    scores["last_epoch"] = (int(reached) + 1 if reached is not None
-                            else log_state.get("last_epoch", tr["epochs"]))
+    if use_ddp:
+        scores["last_epoch"] = metrics_tail(tag).get("epoch", tr["epochs"])
+    else:
+        scores["last_epoch"] = (int(reached) + 1 if reached is not None
+                                else log_state.get("last_epoch", tr["epochs"]))
     weights = RUNS / tag / "weights" / "best.pt"
     return scores, [], (str(weights) if weights.exists() else None)
 
