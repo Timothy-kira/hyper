@@ -47,6 +47,12 @@ SESSION_HOURS = 11.0
 
 
 def main() -> None:
+    import argparse
+    ap = argparse.ArgumentParser()
+    # The packaged copy names TEAMMATE because a teammate imports it by hand.
+    # Pushing it ourselves needs the account that will be billed for the hours.
+    ap.add_argument("--slug", default="TEAMMATE/hod26-team")
+    args = ap.parse_args()
     # Only the generated pair. The directory also holds README.md, which is
     # the whole point of the handoff, and RUN.md, which is the record of the
     # run in flight -- rmtree on the directory takes both with it.
@@ -74,7 +80,7 @@ def main() -> None:
     subprocess.run(
         [sys.executable, str(REPO / "tools" / "build_kernel.py"),
          "--round-config", str(cfg), "--out-dir", str(OUT),
-         "--slug", "TEAMMATE/hod26-team", "--dataset-source", CKPT_DATASET,
+         "--slug", args.slug, "--dataset-source", CKPT_DATASET,
          "--machine-shape", "NvidiaTeslaT4x2"],
         check=True, capture_output=True)
     cfg.unlink()
