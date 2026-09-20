@@ -162,6 +162,114 @@ which also confirms that imgsz carries over from the checkpoint correctly, that
 inference resolution is worth 0.015 between 640 and 1024, and that TTA buys
 nothing here.
 
+## The full run
+
+Four sessions, scored on the competition's own metric throughout. Every local
+number here is pycocotools through the submission path, the same ruler the
+leaderboard uses.
+
+| session | epochs | held-out | leaderboard | gap |
+| --- | --- | --- | --- | --- |
+| 1 | 9 | 0.6689 | 0.59680 | 0.0721 |
+| 3 | 10 | 0.6706 | 0.59783 | 0.0728 |
+| 2 | 19 | 0.6869 | **0.62584** | 0.0611 |
+
+Sessions 1 and 3 are two independent runs at nearly the same length, which is
+not how they were meant to relate -- see below -- but it makes them the
+reproducibility check this project never budgeted for. They land 0.0010 apart
+on the leaderboard and 0.0017 apart on held-out, so **run-to-run noise at full
+scale is about 0.001**, an order of magnitude below the 0.015 measured on the
+104-frame street subset the loss A/B used. That is worth knowing: it means the
+A/B's noise floor was a property of the subset, not of the pipeline.
+
+It also settles, by accident, the one change session 3 was carrying. Session 3
+had `repeat_threshold=0.2` and session 1 did not. The 10 -> 19 epoch slope is
++0.0031/epoch, so session 3's extra epoch alone should have put it at 0.5999;
+it scored 0.59783. Repeat-factor sampling is worth about **-0.002** here --
+inside the noise, but certainly not the gain it was included for.
+
+The gap between held-out and the leaderboard does not widen with training:
+0.072 at nine epochs, 0.073 at ten, 0.061 at nineteen. Longer training
+generalises better rather than memorising the split.
+
+### The resume that never resumed
+
+The run was designed as one long training split across sessions, because a
+Kaggle session is capped at twelve hours. It was not. `find_checkpoint()`
+looked one level deep under `/kaggle/input`, while `find_weights()` -- the same
+job, for the prediction kernels -- had a recursive fallback. Kaggle does not
+mount a kernel's output at a stable depth; `data_root()` says so in its own
+docstring and searches rather than guessing. So every prediction kernel found
+its checkpoint and every training session failed to, and because `None` means
+"no previous session", each one restarted from COCO and reported a healthy
+curve from epoch 1:
+
+```
+[22:52:23]   training starts at epoch 1 of 34 (resume=False)
+```
+
+That line was printed, correctly, every time. The comment above
+`find_checkpoint` had already named the failure mode -- "a resume that silently
+restarts from epoch 0 looks like a slow run rather than a failure, which is why
+the starting epoch is logged explicitly". The alarm was built and never read.
+
+Sessions 1, 2 and 3 were therefore three runs of 9, 19 and 10 epochs rather
+than one run of 38, and the best model is the longest single session rather
+than their sum. At +0.0031/epoch, still undecayed at epoch 19, 38 epochs
+extrapolates to roughly 0.68 -- against the 0.6643 that separates fourth place
+from the baseline cluster. The bug is worth something like 0.03 to 0.05 mAP.
+
+`find_checkpoint` now searches the way `find_weights` does, and a candidate may
+set `require_resume`, which turns a missing checkpoint into an error before
+training starts rather than a silent restart. A failed resume now costs
+minutes.
+
+### The inference side is closed
+
+Three independent probes, all negative, and each failure has a cause rather
+than a guess.
+
+| probe | arms | best result |
+| --- | --- | --- |
+| inference settings (letterbox, imgsz, max_det) | 7 | nothing outside 0.0002 |
+| TTA + Weighted Boxes Fusion | 11 | **-0.0196** |
+| neighbourhood rescoring, no rows removed | 16 | +0.0002 |
+
+Upscaling costs 0.02 to 0.07 (1024 -> 0.4076, 1280 -> 0.3847, 1536 -> 0.3362)
+because a DETR decoder's query priors are tuned to the training scale.
+
+Fusion costs about 0.023 before any augmentation helps: the control arm fuses a
+single view with *itself* and still drops 180000 boxes to 166765. RT-DETR is
+NMS-free and the submission keeps all 300 queries per frame to fill the tail
+COCO integrates over, so any clustering deletes rows and deleted rows are pure
+loss. The extra views do work -- three views beat the self-fusion control by
++0.0035, which is the real gain from averaging coordinates -- and it is nowhere
+near enough to pay for the merge. Note that ultralytics' `augment=True` is a
+no-op on this detector: `RTDETRDetectionModel.predict` accepts the flag and
+never reads it, so an earlier sweep's "TTA" arm measured the identical forward
+pass as its baseline.
+
+Rescoring kept every row and every coordinate and changed only the ranking, so
+nothing could be lost to deletion. The diagnostic explains the result before
+the sweep does:
+
+```
+corr(confidence, true IoU)   = +0.808
+corr(agreement,  true IoU)   = +0.429
+corr(agreement,  confidence) = +0.574
+```
+
+IoU-Net, GFL, VarifocalNet and Cascade-DETR all rest on classification
+confidence correlating *weakly* with box tightness. Here it correlates at
++0.808, because RT-DETR already performs IoU-aware query selection -- the thing
+those papers add is inside the architecture. Neighbourhood agreement is a
+strictly worse estimator of the same quantity and mostly redundant with it.
+
+So the residual localization error -- 16.6% of held-out boxes, against 1.3%
+missed and 0.1% misclassified -- is a limit of the trained model rather than of
+how its output is decoded. It moves with training, and with nothing else tried
+here.
+
 ## Credentials
 
 `KAGGLE_API_TOKEN` is read from the environment. Nothing in this repository
