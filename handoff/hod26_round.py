@@ -844,7 +844,7 @@ def write(path, preds, clip_to: dict[int, tuple[int, int]] | None = None) -> int
 
 ROUND_CONFIG = json.loads(r'''
 {
-  "round": "hod26-team-b",
+  "round": "hod26-team",
   "candidates": [],
   "submit": {
     "candidate": {
@@ -924,7 +924,7 @@ ROUND_CONFIG = json.loads(r'''
       "require_resume": true
     },
     "use_all_train": false,
-    "predict": "if_complete",
+    "predict": true,
     "session_hours": 11.0
   }
 }

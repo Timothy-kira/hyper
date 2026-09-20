@@ -59,6 +59,9 @@ def main() -> None:
     ap.add_argument("--kernel-source", action="append", default=[],
                     help="a previous kernel whose output this run continues from; "
                          "its /kaggle/working lands under /kaggle/input/<name>")
+    ap.add_argument("--dataset-source", action="append", default=[],
+                    help="an extra Kaggle dataset to mount beside the planar "
+                         "frames, e.g. a checkpoint another account resumes from")
     args = ap.parse_args()
 
     cfg = json.loads(args.round_config.read_text())
@@ -81,7 +84,7 @@ def main() -> None:
         "enable_gpu": True,
         "enable_internet": True,
         "competition_sources": [],
-        "dataset_sources": ["xishengfeng/hod26-planar"],
+        "dataset_sources": ["xishengfeng/hod26-planar", *args.dataset_source],
         "kernel_sources": list(args.kernel_source),
     }, indent=2))
     print(f"wrote {script} ({script.stat().st_size} bytes)")
