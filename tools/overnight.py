@@ -156,6 +156,17 @@ def reached_of(slug: str, default: int) -> int:
         return default
 
 
+def finish_session3(s3: str, total: int, reached2: int) -> None:
+    """Wait on the extension, then evaluate and submit it."""
+    log(f"  {s3}: {wait_for(s3)}")
+    reached3 = reached_of(s3, total)
+    log(f"session 3 reached epoch {reached3}/{total}")
+    lb3 = submit_session(3, reached3, total)
+    log(f"session 3 leaderboard: {lb3}")
+    log(f"done. session 2 {state().get('session2_lb')} at epoch {reached2}, "
+        f"session 3 {lb3} at epoch {reached3}. quota {read_quota()}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--ab-slug", default="xishengfeng/hod26-streetab3")
@@ -189,6 +200,18 @@ def main() -> None:
     log(f"session 2 leaderboard: {lb2}")
 
     # 3. the extension
+    s3 = "xishengfeng/hod26-final-transformer-s3"
+    # Attach to a session already in flight rather than pushing over it. A
+    # second push replaces the running kernel and restarts it from the epoch it
+    # resumed at, throwing away everything it has done since -- and the
+    # allowance that paid for those hours does not come back. This is the step
+    # the restart-safety of every other step was missing.
+    if state().get("session3_pushed") and KaggleRoundExecutor(s3).status() != "pending":
+        total = int(state().get("session3_total") or args.extend_to)
+        log(f"session 3 is already pushed and running; attaching to it "
+            f"(target epoch {total}) instead of pushing again")
+        return finish_session3(s3, total, reached2)
+
     q = read_quota()
     have = q[0] if q else float("inf")
     if have < args.min_quota:
@@ -199,7 +222,6 @@ def main() -> None:
     cand = full_candidate("transformer", total, over)
     log(f"session 3: epochs {reached2} -> {total}, {have:.1f} GPU-h available")
     log(f"  {json.dumps({k: cand['train'][k] for k in ('bbox_loss', 'bbox_alpha', 'vfl_beta', 'log_size_l1', 'repeat_threshold', 'schedule_epochs', 'epochs')})}")
-    s3 = "xishengfeng/hod26-final-transformer-s3"
     ex = KaggleRoundExecutor(s3, timeout_hours=11.9,
                              out_dir=REPO / "runs" / "final_transformer_s3",
                              kernel_sources=[s2])
@@ -214,14 +236,7 @@ def main() -> None:
                         "predict": False, "session_hours": budget}})
     log(f"  pushed {s3}")
     save(session3_pushed=True, session3_total=total)
-    log(f"  {s3}: {wait_for(s3)}")
-    reached3 = reached_of(s3, total)
-    log(f"session 3 reached epoch {reached3}/{total}")
-    lb3 = submit_session(3, reached3, total)
-    log(f"session 3 leaderboard: {lb3}")
-
-    log(f"done. session 2 {state().get('session2_lb')} at epoch {reached2}, "
-        f"session 3 {lb3} at epoch {reached3}. quota {read_quota()}")
+    finish_session3(s3, total, reached2)
 
 
 if __name__ == "__main__":
