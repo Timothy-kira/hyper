@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+import shutil
 import tempfile
 import types
 from pathlib import Path
@@ -128,6 +129,20 @@ def main() -> int:
     expect("full dataset accepted", out, "3000 train / 3000 xml / 1000 test")
     if "PREFLIGHT FAILED: require_resume" in out or "dataset not found" in out:
         fails.append(f"a healthy setup was rejected:\n{out}")
+
+    # Two attached checkpoints resolve to whichever sorts first, so handing a
+    # teammate a newer one while an older is still listed picks the older and
+    # says nothing. Same failure shape as the nested-mount bug above: the run
+    # looks healthy and the eleven hours are already spent.
+    second = inp / "hod26-ckpt-aaa"
+    second.mkdir()
+    (second / "final_last.pt").write_bytes(b"x")
+    m, lines = _load(src, inp, work)
+    out = _run(m, lines, cfg)
+    expect("two checkpoints attached is refused, not guessed", out,
+           "more than one checkpoint")
+    expect("  and it names the one it would have taken", out, "hod26-ckpt-aaa")
+    shutil.rmtree(second)
 
     print("\n".join(fails) if fails else "\npreflight catches every silent failure")
     return 1 if fails else 0

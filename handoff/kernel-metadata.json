@@ -10,7 +10,7 @@
   "competition_sources": [],
   "dataset_sources": [
     "xishengfeng/hod26-planar",
-    "xishengfeng/hod26-ckpt-s2"
+    "xishengfeng/hod26-ckpt-s4"
   ],
   "kernel_sources": []
 }

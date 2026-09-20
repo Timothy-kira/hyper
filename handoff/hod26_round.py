@@ -876,7 +876,7 @@ ROUND_CONFIG = json.loads(r'''
       "train": {
         "model": "rtdetr-l",
         "imgsz": 1024,
-        "epochs": 38,
+        "epochs": 40,
         "batch": 4,
         "lr0": 0.01,
         "mosaic": 1.0,
@@ -892,7 +892,7 @@ ROUND_CONFIG = json.loads(r'''
         "srf_k": 8,
         "srf_width": 2.0,
         "warmup_epochs": 5.0,
-        "schedule_epochs": 38,
+        "schedule_epochs": 40,
         "bbox_loss": "GIoU",
         "loss_gain": {},
         "bbox_alpha": 1.0,
@@ -1962,6 +1962,26 @@ def find_checkpoint(tag):
     return None
 
 
+def checkpoint_sources(tag):
+    """Every mount that could satisfy find_checkpoint, not just the one it picks.
+
+    find_checkpoint returns the first match in sorted order, so two attached
+    checkpoints resolve to whichever sorts first with nothing in the log to
+    say a choice was made. "Silently resumed from the wrong session" is the
+    same class of failure as "silently did not resume at all", which is what
+    cost sessions 1 to 3; preflight refuses instead of picking.
+    """
+    found = []
+    for base in sorted(INPUT.glob("*")):
+        if _looks_like_dataset(base):
+            continue
+        for name in (f"{tag}_last.pt", "last.pt"):
+            if (base / name).exists() or next(base.glob(f"**/{name}"), None):
+                found.append(base)
+                break
+    return found
+
+
 def stage_checkpoint(tag):
     """Put a previous session's state where ultralytics expects to resume from.
 
@@ -2956,7 +2976,15 @@ def preflight(round_cfg):
                            q.name: sorted(x.name for x in q.glob("**/*.pt"))[:6]
                            for q in sorted(INPUT.glob("*"))}))
         else:
-            note.append(f"resume from {ck}")
+            srcs = checkpoint_sources("final")
+            if len(srcs) > 1:
+                bad.append(
+                    "more than one checkpoint is attached and the resume takes "
+                    "whichever sorts first, which would be "
+                    f"{srcs[0].name}. Detach all but the one to resume from. "
+                    "Attached: " + ", ".join(q.name for q in srcs))
+            else:
+                note.append(f"resume from {ck}")
     if sub.get("weights_from"):
         if find_weights(sub["weights_from"]) is None:
             bad.append(f"weights_from={sub['weights_from']} not found under "

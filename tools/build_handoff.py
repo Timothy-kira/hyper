@@ -5,17 +5,25 @@ Kaggle charges GPU time to whoever starts the session, so a second account's
 allowance is only reachable by its owner pressing Run. Nothing here works
 around that; it makes pressing Run the only thing they have to do.
 
-The run does not start over. Session 2's checkpoint sits at epoch 19 and is
+The run does not start over. Session 4's checkpoint sits at epoch 21 and is
 shared as a small private dataset, so the eleven hours this costs buy epochs
-20 to 38 rather than 1 to 19 -- half the compute for the same finish, and one
+22 to 40 rather than 1 to 19 -- half the compute for a longer finish, and one
 session instead of two. Everything below exists because that resume is also
 the thing that silently failed three times: find_checkpoint searched one level
 under /kaggle/input, missed a nested mount, returned None, and None means
 "first session". require_resume turns that into an error in the first minute.
 
-The held-out 600 stay held out. Session 4 showed folding them in raises the
-validation score by construction and moves the leaderboard by 0.0003, while
-costing the only honest measurement left.
+Session 4 rather than session 2 for the two epochs, not the score: the two are
+0.00029 apart on the leaderboard against a run-to-run noise floor of about
+0.001, so they are the same model, but 21 epochs is 21 epochs.
+
+The held-out 600 go back to being held out even so. Session 4 trained on all
+3000 frames, which is why its own validation number is not comparable -- but
+what matters here is that the submission is predicted from best.pt, selected
+on the validation split. Kept contaminated, that selection runs for nineteen
+more epochs and picks whichever weights best memorise frames already seen.
+Session 4 saw those 600 for two epochs; nineteen without washes that out well
+enough for the selection to mean something again.
 """
 
 from __future__ import annotations
@@ -32,9 +40,9 @@ sys.path.insert(0, str(REPO))
 from tools.final_runs import full_candidate  # noqa: E402
 
 OUT = REPO / "handoff"
-CKPT_DATASET = "xishengfeng/hod26-ckpt-s2"
-RESUME_FROM = 19          # the epoch session 2's final_last.pt stopped on
-TOTAL = 38                # 19 more epochs, about eleven hours
+CKPT_DATASET = "xishengfeng/hod26-ckpt-s4"
+RESUME_FROM = 21          # the epoch session 4's final_last.pt stopped on
+TOTAL = 40                # 19 more epochs, about eleven hours
 SESSION_HOURS = 11.0
 
 

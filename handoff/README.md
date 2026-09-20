@@ -12,7 +12,7 @@ the session, so it only works with you pressing the button.
 Our best submission is **0.62613**, rank 58 of 251. First place is 0.67943.
 
 Every run so far restarted from scratch because of a bug in how sessions
-handed checkpoints to each other, so our best model is a single 19-epoch run.
+handed checkpoints to each other, so our best model is a single short run.
 Three independent runs give the curve:
 
 | epochs | leaderboard |
@@ -21,13 +21,13 @@ Three independent runs give the curve:
 | 10 | 0.59783 |
 | 19 | 0.62584 |
 
-**+0.0031 per epoch, and still not flattening at 19.** Reaching 38 extrapolates
-to roughly **0.68**, the top of the leaderboard.
+**+0.0031 per epoch, and still not flattening at 19.** Reaching 40 extrapolates
+to roughly **0.69**, the top of the leaderboard.
 
-**You are not training from scratch.** Our epoch-19 checkpoint is attached, so
-your eleven hours buy epochs **20 to 38** — half the compute for the same
-finish. Our own allowance does not refresh until 09-26, two days after the
-deadline, which is why this cannot be run on our side.
+**You are not training from scratch.** Our epoch-21 checkpoint is attached, so
+your eleven hours buy epochs **22 to 40** — half the compute for the finish.
+Our own allowance does not refresh until 09-26, two days after the deadline,
+which is why this cannot be run on our side.
 
 ## Before you start
 
@@ -38,23 +38,27 @@ deadline, which is why this cannot be run on our side.
    collaborator on each; they are private, so a 404 means the invitation has
    not landed yet.
    - <https://www.kaggle.com/datasets/xishengfeng/hod26-planar> (6.1 GB, the frames)
-   - <https://www.kaggle.com/datasets/xishengfeng/hod26-ckpt-s2> (330 MB, the checkpoint)
+   - <https://www.kaggle.com/datasets/xishengfeng/hod26-ckpt-s4> (330 MB, the checkpoint)
 
    **If either 404s, stop.** Nothing below works without both.
 
 ## Running it
 
 1. kaggle.com → **Create → New Notebook**.
-2. Get the script. It is 134 kB, so downloading beats pasting — a cell that
+2. Get the script. It is 135 kB, so downloading beats pasting — a cell that
    large tends to lag the editor or truncate:
 
    <https://raw.githubusercontent.com/Timothy-kira/hyper/claude/kaggle-cli-setup-ppjny1/handoff/hod26_round.py>
 
    Save it, then **File → Import Notebook** and upload it. (If import gives
    you trouble: one code cell, paste the whole file in, nothing else.)
-3. Right panel → **Input → Add Input → Datasets**, and add **both**:
-   `hod26-planar` and `hod26-ckpt-s2`. Missing the second one means it has
-   nothing to resume from and it will refuse to start.
+3. Right panel → **Input → Add Input → Datasets**, and add **exactly these two**:
+   `hod26-planar` and `hod26-ckpt-s4`.
+
+   If you see an older `hod26-ckpt-s2` listed, **do not add it**. Two attached
+   checkpoints and the run would resume from whichever sorts first, which is
+   the wrong one. It refuses to start rather than guess, but it is simpler not
+   to attach it.
 4. Right panel → **Session options → Accelerator → GPU T4 x2**.
 5. Same panel → **Internet → On**. Required: the COCO pretrained weights are
    fetched at startup, and without them the model trains from random
@@ -68,8 +72,8 @@ You want to see these two things:
 
 ```
 preflight passed
-resuming from /kaggle/input/hod26-ckpt-s2/final_last.pt -> ...
-training starts at epoch 20 of 38 (resume=True)
+resuming from /kaggle/input/hod26-ckpt-s4/final_last.pt -> ...
+training starts at epoch 22 of 40 (resume=True)
 ```
 
 - If it prints `PREFLIGHT FAILED` lines instead, **nothing has been spent**.
@@ -80,11 +84,17 @@ training starts at epoch 20 of 38 (resume=True)
 Then one line per epoch, roughly every 35 minutes:
 
 ```
-epoch 24/38  loss 0.201/0.275/0.044  mAP50 0.9438  mAP50-95 0.6840  lr 1.65e-04  ...
+epoch 24/40  loss 0.201/0.275/0.044  mAP50 0.9438  mAP50-95 0.6903  lr 1.65e-04  ...
 ```
 
-`mAP50-95` is the number that matters. It should be near **0.687** at epoch 20
-and climbing.
+`mAP50-95` is the number that matters.
+
+**Expect the first one to read about 0.69, not the 0.727 in the checkpoint's
+own history. That drop is correct and you should not report it as a problem.**
+The previous session had folded the 600 validation frames into its training
+set, which inflates the score by construction; this run holds them out again,
+so the number goes back to measuring something real. From there it should
+climb.
 
 ### While it runs
 
@@ -103,7 +113,7 @@ and climbing.
    are shared across the team, so it does not matter who submits; we have 3 a
    day.
 
-Send us the last line of the log either way — `fit done at epoch N/38;
+Send us the last line of the log either way — `fit done at epoch N/40;
 holdout mAP=...` tells us where the run got to and what it is worth.
 
 ## If something goes wrong
@@ -111,7 +121,8 @@ holdout mAP=...` tells us where the run got to and what it is worth.
 | what you see | what it means |
 | --- | --- |
 | `PREFLIGHT FAILED: dataset not found` | `hod26-planar` not attached, or the invitation not accepted |
-| `PREFLIGHT FAILED: require_resume` | `hod26-ckpt-s2` not attached — step 3, the second dataset |
+| `PREFLIGHT FAILED: require_resume` | `hod26-ckpt-s4` not attached — step 3 |
+| `PREFLIGHT FAILED: more than one checkpoint` | both `-s2` and `-s4` attached; remove `-s2` |
 | `PREFLIGHT FAILED: no GPU visible` | accelerator still off |
 | `could not fetch rtdetr-l.pt` | Internet off |
 | `expected 3000 train / 3000 xml / 1000 test` | the dataset mounted but is incomplete; tell us |
