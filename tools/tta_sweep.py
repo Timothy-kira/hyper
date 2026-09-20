@@ -66,6 +66,36 @@ ARMS = {
     "all3_80_keepconf": {"views": ["id", "hflip", "shift3"], "iou": 0.80, "rescale": False},
     "all3_90_keepconf": {"views": ["id", "hflip", "shift3"], "iou": 0.90, "rescale": False},
     "all3_90": {"views": ["id", "hflip", "shift3"], "iou": 0.90},
+
+    # Rescoring by how tightly the views agree. Averaging coordinates only
+    # pays to the extent the views' errors are independent, and one checkpoint
+    # seen from several angles is exactly the case where they are not -- so
+    # the more valuable signal in the same forward passes may be the
+    # disagreement, which is informative whether or not the errors are
+    # independent. It estimates the thing confidence is known not to carry:
+    # COCO AP integrates a ranking within each class, and a loose box ranked
+    # above a tight one costs AP even when both are found. A trained
+    # IoU-prediction head is the usual answer; this is the same measurement
+    # taken with the model itself, the way Soft Teacher jitters a box and
+    # reads the variance of the regressions. beta sets how hard it bites.
+    "all3_90_agree05": {"views": ["id", "hflip", "shift3"], "iou": 0.90,
+                        "rescale": False, "rescore": {"beta": 0.5, "singleton": 0.5}},
+    "all3_90_agree10": {"views": ["id", "hflip", "shift3"], "iou": 0.90,
+                        "rescale": False, "rescore": {"beta": 1.0, "singleton": 0.5}},
+    "all3_90_agree20": {"views": ["id", "hflip", "shift3"], "iou": 0.90,
+                        "rescale": False, "rescore": {"beta": 2.0, "singleton": 0.5}},
+    # Same, but a singleton keeps its confidence instead of being discounted:
+    # separates "agreement helps" from "penalising lone boxes helps".
+    "all3_90_agree10_nofloor": {"views": ["id", "hflip", "shift3"], "iou": 0.90,
+                                "rescale": False,
+                                "rescore": {"beta": 1.0, "singleton": 1.0}},
+    "hflip_90_agree10": {"views": ["id", "hflip"], "iou": 0.90, "rescale": False,
+                         "rescore": {"beta": 1.0, "singleton": 0.5}},
+    # Box voting on a single view's own queries, which is where this idea
+    # started: Gidaris & Komodakis let each box in a neighbourhood vote for
+    # the location with its score as the weight, one model, no augmentation.
+    "vote_only_90_agree10": {"views": ["id"], "iou": 0.90, "rescale": False,
+                             "rescore": {"beta": 1.0, "singleton": 1.0}},
 }
 
 

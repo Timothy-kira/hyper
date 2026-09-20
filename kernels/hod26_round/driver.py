@@ -1378,7 +1378,7 @@ def _unapply_view(xyxy, ops, w, h):
     return xyxy
 
 
-def _wbf_cluster(boxes, scores, n_views, iou_thr, rescale):
+def _wbf_cluster(boxes, scores, n_views, iou_thr, rescale, rescore=None):
     """Weighted Boxes Fusion over one frame's detections of one class.
 
     Boxes are taken in descending confidence. Each either joins the cluster it
@@ -1387,12 +1387,28 @@ def _wbf_cluster(boxes, scores, n_views, iou_thr, rescale):
     score is the mean of its members', optionally scaled by how many of the
     views found it -- a box only one view saw is, on the evidence, less certain
     than one all of them saw.
+
+    `rescore` turns the cluster's internal agreement into a second signal.
+    Averaging coordinates only pays off to the extent the views' errors are
+    independent, and for one checkpoint seen from several angles they are not;
+    but how tightly a cluster's members agree is informative whether or not
+    their errors are independent, and it estimates the one thing the
+    confidence does not carry. Detection confidence is known to correlate
+    weakly with localization quality, which costs AP directly because the
+    metric integrates a *ranking* over each class -- a loose box ranked above
+    a tight one is a real loss even when both are found. The usual fix is a
+    trained IoU-prediction head; this is the same measurement taken with the
+    model itself, the way Soft Teacher measures pseudo-box reliability by
+    jittering a box and looking at the variance of the regressions.
+
+    Agreement is the mean IoU between each joining member and the cluster as
+    it stood, which needs no second pass over the members.
     """
     order = np.argsort(-scores)
     boxes, scores = boxes[order], scores[order]
-    fused, fscore, weight, count = [], [], [], []
+    fused, fscore, weight, count, agree = [], [], [], [], []
     for b, s in zip(boxes, scores):
-        j = -1
+        j, best_iou = -1, 0.0
         if fused:
             fa = np.asarray(fused)
             xx1 = np.maximum(fa[:, 0], b[0])
@@ -1405,25 +1421,35 @@ def _wbf_cluster(boxes, scores, n_views, iou_thr, rescale):
             iou = inter / np.maximum(union, 1e-9)
             k = int(np.argmax(iou))
             if iou[k] >= iou_thr:
-                j = k
+                j, best_iou = k, float(iou[k])
         if j < 0:
             fused.append(b.astype(np.float64))
             fscore.append(float(s))
             weight.append(float(s))
             count.append(1)
+            agree.append(0.0)
             continue
         w = weight[j] + s
         fused[j] = (fused[j] * weight[j] + b * s) / max(w, 1e-9)
         count[j] += 1
         fscore[j] += (s - fscore[j]) / count[j]
+        agree[j] += best_iou
         weight[j] = w
     out = np.asarray(fscore, dtype=np.float64)
+    n = np.asarray(count)
     if rescale:
-        out = out * np.minimum(np.asarray(count), n_views) / n_views
+        out = out * np.minimum(n, n_views) / n_views
+    if rescore:
+        # A singleton has nothing to agree with. Scoring it 0 would delete the
+        # tail of the metric, so it takes a floor and is judged on confidence.
+        q = np.where(n > 1, np.asarray(agree) / np.maximum(n - 1, 1),
+                     float(rescore.get("singleton", 0.5)))
+        out = out * np.clip(q, 0.0, 1.0) ** float(rescore.get("beta", 1.0))
     return np.asarray(fused, dtype=np.float64), out
 
 
-def wbf(per_view, n_views, iou_thr=0.65, rescale=True, max_det=300):
+def wbf(per_view, n_views, iou_thr=0.65, rescale=True, max_det=300,
+        rescore=None):
     """Fuse several views' rows into one set, per frame and per class.
 
     `per_view` is a list of row lists, each row (pid, cls, score, x1, y1, x2, y2)
@@ -1439,7 +1465,7 @@ def wbf(per_view, n_views, iou_thr=0.65, rescale=True, max_det=300):
     for (pid, cls), (boxes, scores) in grouped.items():
         fb, fs = _wbf_cluster(np.asarray(boxes, dtype=np.float64),
                               np.asarray(scores, dtype=np.float64),
-                              n_views, iou_thr, rescale)
+                              n_views, iou_thr, rescale, rescore)
         by_frame.setdefault(pid, []).extend(
             (pid, cls, float(s), float(b[0]), float(b[1]), float(b[2]),
              float(b[3])) for b, s in zip(fb, fs))
@@ -1541,6 +1567,19 @@ def tta_sweep(model, cand, root, spec):
     cached, _ = predict_views(model, cand, root / "train" / "images", val_ids, needed)
     rows_by_view = dict(zip(needed, cached))
 
+    # Keep the raw per-view boxes. Every fusion question asked afterwards --
+    # another threshold, another rescoring exponent, a view combination nobody
+    # thought of -- is then CPU work on a laptop instead of another GPU
+    # session, and the allowance does not refresh before the deadline. As
+    # float32 this is a few tens of megabytes; as JSON it would be gigabytes.
+    np.savez_compressed(
+        WORK / "tta_views.npz",
+        views=np.array(needed),
+        **{f"rows_{v}": np.asarray(rows_by_view[v], dtype=np.float64)
+           for v in needed})
+    log(f"  wrote tta_views.npz ({sum(len(r) for r in cached)} raw boxes "
+        f"over {len(needed)} views)")
+
     out = {}
     base = evaluate(anns, rows_by_view["id"], per_class=True)
     out["base"] = {**base, "boxes": len(rows_by_view["id"]),
@@ -1550,7 +1589,7 @@ def tta_sweep(model, cand, root, spec):
         t0 = time.time()
         fused = wbf([rows_by_view[v] for v in a["views"]], len(a["views"]),
                     iou_thr=a.get("iou", 0.65), rescale=a.get("rescale", True),
-                    max_det=cand["infer"]["max_det"])
+                    max_det=cand["infer"]["max_det"], rescore=a.get("rescore"))
         scored = evaluate(anns, fused, per_class=True)
         out[name] = {**scored, "boxes": len(fused), "arm": a,
                      "delta": round(scored["mAP"] - base["mAP"], 5),
@@ -1682,7 +1721,8 @@ def predict_test_set(model, cand, root):
         preds = wbf(per_view, len(views),
                     iou_thr=cand["infer"].get("wbf_iou", 0.65),
                     rescale=cand["infer"].get("wbf_rescale", True),
-                    max_det=cand["infer"]["max_det"])
+                    max_det=cand["infer"]["max_det"],
+                    rescore=cand["infer"].get("wbf_rescore"))
     else:
         preds, sizes = predict_test(model, cand, test_dir, test_ids)
     shutil.rmtree(SCRATCH / "test_images", ignore_errors=True)
