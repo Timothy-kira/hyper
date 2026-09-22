@@ -198,3 +198,153 @@ Two calibrations worth keeping:
 
 Eighteen epochs moved the four deficit classes by 0.003-0.009 each. Whatever is
 holding them is not something more epochs of this recipe will fix.
+
+## Session 6 — the four-lever fine-tune, and what it actually did
+
+`qwyi123/hod26-combo`, pushed 23:42 UTC 2026-09-20, resumed session 5's
+`final_last.pt` (epoch 40) for twelve more epochs (41 → 52) with four changes
+at once: `log_size_l1=True`, `bbox_loss="DIoU"`, `loss_gain={"bbox":2,
+"giou":5}`, `repeat_threshold=0.1`. `use_all_train=False` and `predict=False`,
+so the held-out 600 stayed the ruler and nothing was spent on a submission
+before it was scored. This run also carried the `best_fitness` fix
+(`167db4f`) for the first time on a live session — the log said so directly:
+
+```
+best.pt selection restarts from this run's own scale (the checkpoint's
+0.72706 was measured on a validation split it had trained on)
+training starts at epoch 41 of 52 (resume=True)
+```
+
+`repeat sampling (t=0.1): +68 frames, stone_block x2.7, orange x1.4,
+egg_wood x1.4, e-bike x1.3` — the rarity lever landed on the right class.
+
+### Epoch trajectory (ultralytics' own validation)
+
+| epoch | mAP50 | mAP50-95 |
+| --- | --- | --- |
+| 41 | 0.9477 | 0.6915 |
+| 42 | 0.9492 | 0.6949 |
+| 43 | 0.9487 | 0.6924 |
+| 44 | 0.9465 | 0.6933 |
+| 45 | 0.9450 | 0.6900 |
+| 46 | 0.9473 | 0.6925 |
+| 47 | 0.9486 | 0.6955 |
+| 48 | 0.9481 | 0.6932 |
+| 49 | 0.9489 | 0.6927 |
+| 50 | 0.9492 | 0.6932 |
+| 51 | 0.9460 | 0.6929 |
+| 52 | 0.9440 | 0.6923 |
+
+`fit done at epoch 52/52; holdout mAP=0.6953` — `best.pt`'s own number, this
+time honestly this run's own best epoch rather than an inherited one.
+
+### The submission and what it actually moved
+
+Scored separately with pycocotools (`tools/predict_from_run.py --weights
+final_best.pt`, no TTA): **held-out mAP 0.6956**, submitted as "hod26-combo
+final_best.pt epoch52 holdout0.69528" → **leaderboard 0.62994**, a new team
+best, +0.0004 over session 5's 0.62954.
+
+Per-class, against epoch 40:
+
+| class | epoch 40 | epoch 52 | delta |
+| --- | --- | --- | --- |
+| stone_block | 0.3221 | 0.3233 | +0.0012 |
+| people | 0.4150 | 0.4062 | **-0.0088** |
+| e-bike | 0.4492 | 0.4697 | +0.0205 |
+| car | 0.5895 | 0.5641 | **-0.0254** |
+| table_tennis | 0.7188 | 0.7151 | -0.0037 |
+| orange | 0.7124 | 0.7261 | +0.0137 |
+| car_toy | 0.7508 | 0.7514 | +0.0006 |
+| badminton | 0.7638 | 0.7541 | -0.0097 |
+| charger_head | 0.7645 | 0.7584 | -0.0061 |
+| banana | 0.7575 | 0.7612 | +0.0037 |
+| rubik | 0.7655 | 0.7657 | +0.0002 |
+| egg_wood | 0.7810 | 0.7717 | -0.0093 |
+| egg | 0.7842 | 0.7832 | -0.0010 |
+| orange_plastic | 0.7700 | 0.7852 | +0.0152 |
+| apple | 0.7797 | 0.7895 | +0.0098 |
+| banana_plastic | 0.7915 | 0.7940 | +0.0025 |
+| egg_plastic | 0.8024 | 0.8007 | -0.0017 |
+| apple_plastic | 0.7790 | 0.8013 | +0.0223 |
+
+**The four classes the run was aimed at (stone_block, people, e-bike, car)
+moved net -0.0125** — worse, not better, as a group. `e-bike` improved
+(+0.0205), `car` got markedly worse (-0.0254), and the other two barely
+moved. The classes that moved most, in either direction, were mostly
+untargeted ones already at 0.71-0.80 (`apple_plastic` +0.0223, `orange_plastic`
++0.0152, `car` -0.0254) — consistent with per-class noise on a 600-frame
+holdout (car has 126 instances, apple_plastic 86; a handful of boxes crossing
+an IoU threshold moves AP by several points at that count) rather than with
+the loss changes doing what they were aimed at.
+
+**Read this as: twelve epochs of this combination, at a learning rate already
+down to 2.9e-5 to 1.17e-4, did not show the intended effect.** It does not
+mean the diagnosis (`DIAGNOSIS.md`) is wrong — 98.3%/99.9% found/classified
+and a 0.8697 median matched IoU concentrated in four elongated/rare classes is
+a direct measurement, not a guess. It means this specific fix, at this length,
+starting this late in a cosine schedule, did not move those classes. A retry
+with more epochs, a higher reopened learning rate, or the four levers
+isolated one at a time (rather than combined, which was a deliberate
+one-shot trade for a single submission) would tell you which of them, if any,
+is doing something.
+
+## What happened after session 6 (not in this repo, not committed)
+
+Two more things were tried on the `qwyi123` account before quota ran out.
+Neither is in this codebase, and neither should be repeated without more care.
+
+**Test-time augmentation.** `hod26-predict` v3 added TTA (`id`, `hflip`
+views, WBF merge at `iou=0.65`) on top of session 6's `final_best.pt`. The
+held-out score with TTA was 0.6956 -- *the same or fractionally higher* than
+the non-TTA scoring of the same checkpoint. The submission scored
+**0.58168** -- a 0.048 collapse. Held-out going up while the leaderboard
+collapses means the TTA/WBF merge path does something different on the real
+1000-frame test set than it does on the held-out 600 -- a bug in that path,
+most likely in how the WBF box coordinates are rescaled back for the test
+image sizes, not evidence that TTA itself hurts here. **Do not resubmit
+anything from a TTA/WBF path on this pipeline without finding that bug
+first.**
+
+**A spectral supervised-contrastive loss.** A from-scratch addition (kernel
+`hod26-supcon`, never merged into this repo) attached an InfoNCE contrastive
+loss to the adapter's ROI features for the three hardest classes
+(`stone_block`, `people`, `e-bike`), alongside a new `bg_residual` channel
+mode and hard-class-weighted SMOTE. It resumed from session 6's
+`final_best.pt` with `ft_freeze="adapter_decoder"`. It trained for real
+epochs, then crashed at its first validation pass:
+
+```
+File ".../ultralytics/engine/validator.py", line 259, in __call__
+    self.loss[k] += v
+KeyError: 'loss_giou'
+```
+
+The custom criterion's returned loss dict does not have the same keys the
+validator's `loss_names` expects -- almost certainly because the added
+contrastive term changed what `RTDETRDetectionLoss` (or the wrapper around
+it) returns without updating the validator's key list to match, or a
+mismatch between the training-time and eval-time key set for DETR's
+per-layer auxiliary losses. It failed in DDP, both ranks, after real training
+time -- burning close to the account's last GPU-hours. The idea (a
+contrastive push on the adapter features for exactly the classes the
+diagnosis names) is not dismissed, just unresolved; anyone picking it back up
+should reproduce the crash on one card first, without DDP, to get a plain
+traceback before touching either 16-band code or DDP's cloudpickle path.
+
+## Final state, this account
+
+- **Best submission: 0.62994** (session 6, epoch 52, held-out pycocotools
+  0.6956). Banked, safe, already on the leaderboard.
+- **Do not use** submission 56460799 (TTA, 0.58168) or anything from
+  `hod26-supcon` (never finished).
+- **GPU quota: 1.71 of 30 hours left**, refreshing 2026-09-26 -- after the
+  competition deadline. This account is done; nothing further should be
+  pushed from here.
+- **Handoff:** `handoff/README.md` now points a fresh account back at the
+  same epoch-21 checkpoint (`hod26-ckpt-s4`) this account started from, with
+  every fix from sessions 5 and 6 (dual-GPU, `best_fitness` reset, honest
+  holdout scoring, rank-0-only writers) baked into the script it downloads.
+  It also carries the corrected expectation: this exact resume barely moves
+  the score on its own (epoch 22 to 40 net +0.0003), so a fresh session
+  should read `DIAGNOSIS.md` before deciding what, if anything, to change.
