@@ -206,6 +206,96 @@ def main() -> int:
 
         m.INPUT = tmp
         check("preflight finds the MAE checkpoint", m.find_mae_checkpoint() == ck)
+        (tmp / "v2").mkdir()
+        torch.save({"encoder": enc.state_dict(), "config": {"dim": 32, "depth": 2, "heads": 4}},
+                   tmp / "v2" / "pretrain2_mae.pt")
+        try:
+            m.find_mae_checkpoint()
+            amb = False
+        except RuntimeError:
+            amb = True
+        check("two MAE checkpoints attached -> error, not a silent pick", amb)
+        check("  ... unless one is named", m.find_mae_checkpoint("pretrain2_mae.pt").name == "pretrain2_mae.pt")
+
+        # ---- accelerations -------------------------------------------------
+        # Chunked per-layer checkpointing: same outputs and gradients as one
+        # checkpoint around the whole encoder.
+        from hod26.s3t.front import S3TFront
+        encx = SpectralEncoder(dim=32, depth=4, heads=4)
+        xq = torch.rand(2, 16, 48, 40)
+        res = []
+        for chunks in (0, 8, 5):
+            fr = S3TFront(encx, scale=0.5, ckpt_chunks=chunks).train()
+            for p_ in fr.parameters():
+                p_.grad = None
+            o = fr(xq)
+            o.float().pow(2).mean().backward()
+            res.append((o.detach(), torch.cat([p_.grad.flatten() for p_ in encx.parameters()
+                                               if p_.grad is not None])))
+        check("chunked per-layer checkpoints == whole-encoder checkpoint (outputs)",
+              all(torch.allclose(res[0][0], r[0], atol=1e-5) for r in res[1:]))
+        check("chunked per-layer checkpoints == whole-encoder checkpoint (gradients)",
+              all(torch.allclose(res[0][1], r[1], atol=1e-5) for r in res[1:]))
+
+        # RT-DETR's own attention on SDPA: same outputs.
+        net4 = RTDETRDetectionModel("rtdetr-l.yaml", ch=3, nc=18, verbose=False).eval()
+        x3 = torch.rand(1, 3, 160, 224)
+        inp11 = torch.randn(1, 256, 5, 7)
+        dec_mha = copy.deepcopy([x for x in net4.modules() if type(x) is torch.nn.MultiheadAttention][-1])
+        qd = torch.randn(10, 2, 256)
+        maskd = torch.zeros(10, 10, dtype=torch.bool)
+        maskd[:3, 5:] = True
+        with torch.no_grad():
+            before = net4(x3)
+            aifi0 = net4.model[11](inp11)
+            dec0 = dec_mha(qd, qd, qd, attn_mask=maskd)[0]
+        done = m.enable_transformer_accel(net4, fp32_loss=True, nc=18)
+        dec_mha.__class__ = m.SDPAMultiheadAttention
+        with torch.no_grad():
+            after = net4(x3)
+            aifi1 = net4.model[11](inp11)
+            dec1 = dec_mha(qd, qd, qd, attn_mask=maskd)[0]
+        check("every nn.MultiheadAttention swapped to the SDPA path",
+              done["mha_to_sdpa"] > 0 and not any(type(x) is torch.nn.MultiheadAttention for x in net4.modules()),
+              str(done))
+        check("  ... AIFI and the (masked) decoder self-attention give the same outputs",
+              torch.allclose(aifi0, aifi1, atol=1e-5) and torch.allclose(dec0, dec1, atol=1e-5))
+        # The detector's 300 outputs: same set (a random-init model has many
+        # tied scores, so their order may differ).
+        srt = lambda t: t.reshape(-1, t.shape[-1]).sort(0).values  # noqa: E731
+        check("  ... and the same set of detections",
+              torch.allclose(srt(flat(before)[0]), srt(flat(after)[0]), atol=1e-4))
+        # fp32 loss under autocast: runs, returns fp32, survives pickling.
+        net4.train()
+        bimg = torch.rand(2, 3, 160, 224)
+        batch = {"img": bimg, "batch_idx": torch.tensor([0., 0., 1.]), "cls": torch.tensor([[1.], [3.], [5.]]),
+                 "bboxes": torch.tensor([[.3, .3, .2, .2], [.6, .5, .1, .3], [.5, .5, .4, .4]])}
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            lsum, items = net4.loss(batch)
+        check("loss under autocast is computed in fp32", lsum.dtype == torch.float32 and torch.isfinite(lsum).all(),
+              str(lsum.dtype))
+        back4 = pickle.loads(pickle.dumps(net4))
+        check("  ... the fp32 wrapper and the SDPA class pickle", type(back4.criterion).__name__ == "FP32Criterion")
+
+        # Parallel rendering: a frame renders the same in a forked worker.
+        from hod26.voc import Annotation, Box
+        (tmp / "fr").mkdir()
+        from hod26.cube import to_planar
+        from PIL import Image
+        for pid in (1, 2, 3):
+            Image.fromarray(to_planar(rng.integers(200, 4000, (40, 60, 16)).astype(np.uint16))).save(tmp / "fr" / f"{pid}.png")
+        anns_f = {pid: Annotation(pid, 60, 40, 16, (Box(1, 5, 5, 25, 20),)) for pid in (1, 2, 3)}
+        index_f = {pid: tmp / "fr" / f"{pid}.png" for pid in (1, 2, 3)}
+        outs = []
+        for run in range(2):
+            root_f = tmp / f"ds{run}"
+            m.materialize(cand, index_f, [1, 2], [3], anns_f, root_f)
+            outs.append(sorted((q.relative_to(root_f).as_posix(), q.read_bytes())
+                               for q in root_f.rglob("*") if q.is_file() and q.suffix != ".yaml"))
+        check("parallel rendering writes every frame + augmented copy, identically twice",
+              len(outs[0]) == len(outs[1]) and outs[0] == outs[1] and
+              sum(1 for n_, _ in outs[0] if n_.startswith("images/train/")) == 4,
+              f"{len(outs[0])} files")
 
     print("\n".join(fails) if fails else "\nS3T-DETR checks pass")
     return 1 if fails else 0

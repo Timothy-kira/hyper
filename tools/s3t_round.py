@@ -40,17 +40,26 @@ AUGMENT = {"sg_window": 7, "sg_polyorder": 2, "sg_chain": True,
            "smote_alpha": 0.3, "cutmix_prob": 0.4, "cutmix_blocks": 24, "copies": 1}
 
 
-def s3t_candidate(total: int = TOTAL) -> dict:
+def s3t_candidate(total: int = TOTAL, batch: int = 2, mae_file: str | None = None,
+                  compile_blocks: bool = False) -> dict:
     cand = full_candidate("transformer", total, {
         "channels.mode": "s3t_level",
         "train.spectral_stem": "s3t",
         # The encoder runs at native cube scale on top of an fp32 RT-DETR at
         # 1024; 2 per card keeps the pair inside a T4. nbs stays 64, so the
         # optimizer still steps on an effective batch of 64.
-        "train.batch": 2,
+        "train.batch": batch,
     })
     cand["train"].update(s3t_scale=0.5, s3t_require_pretrain=True, s3t_widen=True, s3t_context=True,
+                         # Memory and speed (see handoff/S3T.md, "OOM"): per-layer,
+                         # 8-chunk checkpoints in the S3T front; AMP on the whole
+                         # detector with the loss and Hungarian matching kept in fp32.
+                         # normalize() turns AMP off for RT-DETR; this is set after it.
+                         s3t_ckpt_chunks=8, s3t_compile=False, amp=True, amp_fp32_loss=True,
                          mosaic=1.0, fliplr=0.5, scale=0.5, close_mosaic=3)
+    cand["train"]["s3t_compile"] = bool(compile_blocks)
+    if mae_file:
+        cand["train"]["s3t_mae_file"] = mae_file
     cand["augment"].update(AUGMENT)
     return cand
 
@@ -60,12 +69,18 @@ def main() -> None:
     ap.add_argument("--slug", default="TEAMMATE/hod26-s3t-detr")
     ap.add_argument("--out-dir", type=Path, default=OUT)
     ap.add_argument("--total", type=int, default=TOTAL)
-    ap.add_argument("--mae-kernel", default=MAE_KERNEL)
+    ap.add_argument("--mae-kernel", action="append", default=None,
+                    help="pretraining notebook(s) to mount; default the v1 notebook")
+    ap.add_argument("--mae-file", default=None,
+                    help="which *_mae.pt to use when several are mounted, e.g. pretrain2_mae.pt")
+    ap.add_argument("--batch", type=int, default=2, help="images per GPU")
+    ap.add_argument("--compile-blocks", action="store_true",
+                    help="torch.compile the S3T blocks (measure with the probe first)")
     args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cfg = args.out_dir / "round-config.json"
     cfg.write_text(json.dumps({"round": "hod26-s3t-detr", "candidates": [], "submit": {
-        "candidate": s3t_candidate(args.total),
+        "candidate": s3t_candidate(args.total, args.batch, args.mae_file, args.compile_blocks),
         "use_all_train": False,          # keep the 600 held out: they are the ruler
         "predict": True,                 # a submission comes out wherever the clock stops
         "session_hours": SESSION_HOURS,
@@ -73,7 +88,8 @@ def main() -> None:
     }}, indent=2))
     subprocess.run([sys.executable, str(REPO / "tools" / "build_kernel.py"),
                     "--round-config", str(cfg), "--out-dir", str(args.out_dir),
-                    "--slug", args.slug, "--kernel-source", args.mae_kernel,
+                    "--slug", args.slug,
+                    *[a for k in (args.mae_kernel or [MAE_KERNEL]) for a in ("--kernel-source", k)],
                     "--machine-shape", "NvidiaTeslaT4x2"], check=True)
     cfg.unlink()
 

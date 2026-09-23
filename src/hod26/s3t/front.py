@@ -69,10 +69,17 @@ class S3TFront(nn.Module):
     """
 
     def __init__(self, encoder: SpectralEncoder, projection=None, scale: float = 0.5,
-                 grad_ckpt: bool = True, amp: bool = True, widen: bool = True):
+                 grad_ckpt: bool = True, amp: bool = True, widen: bool = True,
+                 ckpt_chunks: int = 8):
         super().__init__()
         n, d = encoder.n_bands, encoder.dim
         self.enc, self.scale, self.grad_ckpt, self.amp = encoder, scale, grad_ckpt, amp
+        # 0: one checkpoint around the whole encoder (the form that OOM'd: its
+        # backward recomputes every layer at once, ~13 GB per 1024^2 image).
+        # N > 0: checkpoint each layer separately, and split the per-position
+        # layers (spectral blocks, the pool, the stem) into N chunks of
+        # positions, so a backward holds one chunk of one layer at a time.
+        self.ckpt_chunks = int(ckpt_chunks)
         self.widen = widen
         # Channels this front hands the stem: 3 (projection) + d when widened.
         self.out_channels = 3 + d if widen else 3
@@ -102,9 +109,49 @@ class S3TFront(nn.Module):
                                   align_corners=False, antialias=True)
         feats = level_features(level)
         with torch.autocast("cuda", dtype=torch.float16, enabled=self.amp and x.is_cuda):
-            if self.grad_ckpt and self.training and torch.is_grad_enabled():
+            ckpt = self.grad_ckpt and self.training and torch.is_grad_enabled()
+            if ckpt and self.ckpt_chunks > 0:
+                return self._encode_chunked(feats).float()
+            if ckpt:
                 return torch.utils.checkpoint.checkpoint(self.enc, feats, use_reentrant=False).float()
             return self.enc(feats).float()
+
+    def _encode_chunked(self, feats):
+        """SpectralEncoder.forward, checkpointed layer by layer and chunk by chunk.
+
+        Same modules, same order, same arithmetic as enc(feats); only what is
+        kept for backward changes. Spectral blocks, the band pool and the band
+        embedding act on each position independently, so they run on slices of
+        the position axis; SpatialMix needs the whole grid and is checkpointed
+        whole (it is the cheaper layer).
+        """
+        from torch.utils.checkpoint import checkpoint
+        from .spectral import SpatialMix
+
+        enc, n = self.enc, self.ckpt_chunks
+        b, f, c, h, w = feats.shape
+
+        def stem(z):
+            y = enc.stem(z.transpose(1, 2).reshape(b * c, f, h, w))
+            return y
+
+        y = checkpoint(stem, feats, use_reentrant=False)
+        gh, gw = y.shape[-2:]
+        t = y.view(b, c, enc.dim, gh * gw).permute(0, 3, 1, 2) + enc.band_pe   # (B, S, C, D)
+
+        def per_chunk(fn, t):
+            s = t.shape[1]
+            step = -(-s // n)
+            return torch.cat([checkpoint(fn, t[:, i:i + step], use_reentrant=False)
+                              for i in range(0, s, step)], 1)
+
+        for layer in enc.layers:
+            if isinstance(layer, SpatialMix):
+                t = checkpoint(layer, t, None, (gh, gw), use_reentrant=False)
+            else:
+                t = per_chunk(layer, t)
+        p = per_chunk(lambda z: enc.norm(enc.pool(z)), t)                   # (B, S, D)
+        return p.transpose(1, 2).reshape(b, enc.dim, gh, gw)
 
     def forward(self, x):
         f = self._encode(x)                                     # (B, D, h, w)

@@ -311,6 +311,51 @@ def repeat_factors(train_ids, anns, threshold: float):
     return out
 
 
+_MAT: dict = {}
+
+
+def _emit(root, split, stem, img, boxes, a):
+    n = write_frame(root / "images" / split / stem, img)
+    lines = []
+    for b in boxes:
+        cx = (b.x1 + b.x2) / 2 / a.width
+        cy = (b.y1 + b.y2) / 2 / a.height
+        bw = (b.x2 - b.x1) / a.width
+        bh = (b.y2 - b.y1) / a.height
+        lines.append(f"{b.cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+    (root / "labels" / split / f"{stem}.txt").write_text("\n".join(lines))
+    return n
+
+
+def _render_frame(job):
+    """Render one frame (and, for train, its augmented copies and repeats)."""
+    split, pid = job
+    cv2.setNumThreads(1)          # one process per core already; no nested pools after fork
+    m = _MAT
+    root, a = m["root"], m["anns"][pid]
+    cube = load_planar(m["index"][pid])
+    # The unaugmented frame is always written; validation is never augmented,
+    # so the score keeps measuring the real distribution.
+    img = build_channels(cube, m["channels"])
+    frame = _emit(root, split, str(pid), img, a.boxes, a)
+    if split == "train":
+        # Augmented copies are re-rendered; repeats are file copies. A repeat is
+        # not a wasted duplicate: ultralytics augments at load time -- mosaic,
+        # flip, scale -- so the same frame listed twice trains on two different
+        # images. Re-rendering it would only add our own spectral augmentation
+        # on top, which is what the copies setting is for.
+        rng = np.random.default_rng((0, int(pid)))
+        for k in range(m["copies"]):
+            c2, b2 = augment_cube(cube, list(a.boxes), m["aug"], m["donors"], m["pool"], rng)
+            _emit(root, split, f"{pid}_a{k}", build_channels(c2, m["channels"]), b2, a)
+        for k in range(m["reps"][pid] - 1):
+            for src, dst in ((frame, frame.with_name(f"{pid}_r{k}{frame.suffix}")),
+                             (root / "labels" / split / f"{pid}.txt",
+                              root / "labels" / split / f"{pid}_r{k}.txt")):
+                shutil.copyfile(src, dst)
+    return img.shape[2]
+
+
 def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
     """Write the YOLO dataset this candidate trains on, reusing it if rendered.
 
@@ -332,47 +377,26 @@ def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
     wants_aug = bool(aug.get("sg_window") or aug.get("smote_alpha") or aug.get("cutmix_prob"))
     donors = class_donors(index, anns, train_ids) if aug.get("smote_alpha") else {}
     pool = [index[p] for p in train_ids] if aug.get("cutmix_prob") else []
-    rng = np.random.default_rng(0)
-
-    def emit(root, split, stem, img, boxes, a):
-        n = write_frame(root / "images" / split / stem, img)
-        lines = []
-        for b in boxes:
-            cx = (b.x1 + b.x2) / 2 / a.width
-            cy = (b.y1 + b.y2) / 2 / a.height
-            bw = (b.x2 - b.x1) / a.width
-            bh = (b.y2 - b.y1) / a.height
-            lines.append(f"{b.cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
-        (root / "labels" / split / f"{stem}.txt").write_text("\n".join(lines))
-        return n
-
     reps = repeat_factors(train_ids, anns, float(cand["train"].get("repeat_threshold", 0.0)))
-    n_ch = 3
-    for split, ids in (("train", train_ids), ("val", val_ids)):
-        for pid in ids:
-            cube = load_planar(index[pid])
-            a = anns[pid]
-            # The unaugmented frame is always written; validation is never
-            # augmented, so the score keeps measuring the real distribution.
-            img = build_channels(cube, cand["channels"])
-            n_ch = img.shape[2]
-            frame = emit(root, split, str(pid), img, a.boxes, a)
 
-            if split == "train":
-                # Augmented copies are re-rendered; repeats are file copies.
-                # A repeat is not a wasted duplicate: ultralytics augments at
-                # load time -- mosaic, flip, scale, HSV -- so the same frame
-                # listed twice trains on two different images. Re-rendering it
-                # would only add our own spectral augmentation on top, which is
-                # what the copies setting is for and is separate from balance.
-                for k in range(copies if wants_aug else 0):
-                    c2, b2 = augment_cube(cube, list(a.boxes), aug, donors, pool, rng)
-                    emit(root, split, f"{pid}_a{k}", build_channels(c2, cand["channels"]), b2, a)
-                for k in range(reps[pid] - 1):
-                    for src, dst in ((frame, frame.with_name(f"{pid}_r{k}{frame.suffix}")),
-                                     (root / "labels" / split / f"{pid}.txt",
-                                      root / "labels" / split / f"{pid}_r{k}.txt")):
-                        shutil.copyfile(src, dst)
+    # One process per CPU, forked so they inherit everything below without
+    # pickling it. Each frame's augmentation draws from its own generator,
+    # seeded by the frame id, so the result does not depend on scheduling.
+    _MAT.clear()
+    _MAT.update(index=index, anns=anns, channels=cand["channels"], aug=aug, donors=donors,
+                pool=pool, copies=copies if wants_aug else 0, reps=reps, root=root)
+    jobs = [("train", p) for p in train_ids] + [("val", p) for p in val_ids]
+    workers = max(1, min(os.cpu_count() or 1, 8))
+    t_r = time.time()
+    if workers > 1:
+        import multiprocessing as _mp
+        with _mp.get_context("fork").Pool(workers) as mp_pool:
+            chans = mp_pool.map(_render_frame, jobs, chunksize=8)
+    else:
+        chans = [_render_frame(j) for j in jobs]
+    _MAT.clear()
+    n_ch = chans[0] if chans else 3
+    log(f"  rendering: {len(jobs)} frames on {workers} processes in {time.time() - t_r:.0f}s")
 
     for split, ids in (("train", train_ids), ("val", val_ids)):
         n = len(list((root / "images" / split).glob("*.png"))) + \
@@ -474,6 +498,46 @@ if _nn is not None:
 
         def forward(self, x):
             return self.block(self.front(x))
+    class SDPAMultiheadAttention(_nn.MultiheadAttention):
+        """nn.MultiheadAttention that never asks for the attention weights.
+
+        ultralytics calls AIFI's and the decoder's attention without
+        need_weights=False, so PyTorch materialises the full weight matrix
+        instead of dispatching to scaled_dot_product_attention's fused kernels.
+        Same parameters, same output; the class is swapped in place.
+        """
+
+        def forward(self, query, key, value, key_padding_mask=None, need_weights=True,
+                    attn_mask=None, average_attn_weights=True, is_causal=False):
+            return super().forward(query, key, value, key_padding_mask=key_padding_mask,
+                                   need_weights=False, attn_mask=attn_mask,
+                                   average_attn_weights=average_attn_weights, is_causal=is_causal)
+
+    class FP32Criterion(_nn.Module):
+        """The detector's loss computed in fp32 under an AMP forward.
+
+        ultralytics warns that RT-DETR's bipartite matching can produce NaN in
+        fp16, and HungarianMatcher does not cast back itself. Everything before
+        the loss runs in fp16; the matching and the loss do not. A Module,
+        because the model registers its criterion as a child module.
+        """
+
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+
+        @staticmethod
+        def _f(x):
+            if isinstance(x, (tuple, list)):
+                return type(x)(FP32Criterion._f(v) for v in x)
+            return x.float() if hasattr(x, "is_floating_point") and x.is_floating_point() else x
+
+        def forward(self, preds, targets, **kw):
+            import torch as _t
+            dev = "cuda" if _t.cuda.is_available() else "cpu"
+            with _t.autocast(dev, enabled=False):
+                kw = {k: self._f(v) for k, v in kw.items()}
+                return self.inner(self._f(preds), targets, **kw)
 else:                                                # pragma: no cover
     SpectralFront = None
 
@@ -658,16 +722,26 @@ def visible_gpus():
         return 0
 
 
-def find_mae_checkpoint():
-    """The S3T encoder pretrained by MAE, wherever its kernel output is mounted."""
+def find_mae_checkpoint(name=None):
+    """The S3T encoder pretrained by MAE, wherever its kernel output is mounted.
+
+    Exactly one, or an error: with two pretraining notebooks attached (v1's
+    pretrain_mae.pt and v2's pretrain2_mae.pt) picking by sort order would
+    silently train the detector on whichever path sorts first. name (the
+    candidate's train.s3t_mae_file) selects one by file name.
+    """
     hits = sorted(INPUT.rglob("*_mae.pt")) if INPUT.exists() else []
-    hits.sort(key=lambda p: (0 if "pretrain" in p.name else 1, str(p)))
+    if name:
+        hits = [h for h in hits if h.name == name]
+    if len(hits) > 1:
+        raise RuntimeError(f"{len(hits)} MAE checkpoints attached ({[str(h) for h in hits]}); "
+                           f"set train.s3t_mae_file to the one to use")
     return hits[0] if hits else None
 
 
 def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5,
                       inject=(19, 14, 10), dim=64, depth=4, heads=4, widen=True,
-                      context=True, ctx_layer=11, **_):
+                      context=True, ctx_layer=11, ckpt_chunks=8, compile_blocks=False, **_):
     """S3T encoder in front of the pretrained first block, plus side injections.
 
     The encoder is loaded from the MAE checkpoint when one is given. inject
@@ -691,7 +765,19 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
         log(f"  S3T encoder: MAE weights from {mae_ckpt} (step {ck.get('step')})")
     else:
         log("  S3T encoder: NO pretrained weights -- random initialisation")
-    front = S3TFront(enc, projection=projection, scale=scale, widen=widen)
+    front = S3TFront(enc, projection=projection, scale=scale, widen=widen,
+                     ckpt_chunks=ckpt_chunks)
+    if compile_blocks:
+        # Fuse each block's LayerNorm/GELU/residual chains (nn.Module.compile,
+        # in place, so DDP and pickling see ordinary modules). No fallback: a
+        # failure surfaces as an error at the first step.
+        from torch import nn as _tnn
+        n_c = 0
+        for m in enc.modules():
+            if type(m).__name__ in ("SpectralBlock", "SpatialMix", "SpectralPool"):
+                m.compile()
+                n_c += 1
+        log(f"  S3T blocks compiled in place: {n_c}")
     dev = next(block.parameters()).device
     if widen:
         # 3 -> 3 + D input channels on the pretrained stem's first conv, the
@@ -721,11 +807,37 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
     net.__dict__["_hod26_mixer"] = front.base
     net.__dict__["_hod26_mixer_init"] = front.base.weight.detach().clone()
     n_enc = sum(p.numel() for p in enc.parameters())
+    log(f"  S3T memory: per-layer checkpoints, per-position layers in {ckpt_chunks} chunks"
+        if ckpt_chunks else "  S3T memory: one checkpoint around the whole encoder")
     log(f"  S3T front: {n_enc / 1e6:.2f}M-param spectral Transformer at {scale}x input "
         f"scale, {'3+' + str(enc.dim) if widen else '16->3'} channels into the pretrained "
         f"{type(block).__name__}, zero-init side injections at layers {list(inject)}"
         + (f"; P3/P4 read AIFI's global context (layer {ctx_layer}, {ctx_ch}-d)" if context else ""))
     return True
+
+
+def enable_transformer_accel(net, fp32_loss=True, nc=None):
+    """Put every attention in the detector on SDPA, and its loss on fp32.
+
+    Returns what it did, for the acceleration table the run prints.
+    """
+    import torch
+    n_mha = 0
+    for m in net.modules():
+        if type(m) is torch.nn.MultiheadAttention:
+            m.__class__ = SDPAMultiheadAttention
+            n_mha += 1
+    wrapped = False
+    if fp32_loss:
+        if getattr(net, "criterion", None) is None:
+            # get_model runs before ultralytics sets net.nc; the criterion needs it.
+            if nc is not None and not hasattr(net, "nc"):
+                net.nc = int(nc)
+            net.criterion = net.init_criterion()
+        if not isinstance(net.criterion, FP32Criterion):
+            net.criterion = FP32Criterion(net.criterion)
+        wrapped = True
+    return {"mha_to_sdpa": n_mha, "fp32_loss": wrapped}
 
 
 def install_spectral_adapter(net, n_bands, projection=None, ckpt_name=None,
@@ -953,7 +1065,7 @@ def restore_state(net, src):
 def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                   bbox_loss="GIoU", loss_gain=None, is_rtdetr=True,
                   bbox_alpha=1.0, vfl_beta=0.0, log_size_l1=False,
-                  reset_best_fitness=True):
+                  reset_best_fitness=True, accel=None):
     """A trainer that seeds the head from COCO by name and installs the adapter.
 
     Both have to happen inside get_model, and for the same reason: ultralytics
@@ -975,6 +1087,35 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
     """
 
     class HOD26Trainer(base_cls):
+        def build_optimizer(self, *args, **kwargs):
+            opt = super().build_optimizer(*args, **kwargs)
+            if not accel or not accel.get("fused_optimizer"):
+                return opt
+            import torch
+            cls = type(opt)
+            # Rebuilt from the same groups (each carries its own lr, momentum /
+            # betas and weight decay), with the fused CUDA kernel. No fallback.
+            fused = cls(opt.param_groups, lr=opt.defaults["lr"], fused=True)
+            done = getattr(self, "_hod26_accel", {}) or {}
+            table = [
+                ("AMP fp16 (+GradScaler)", bool(getattr(self, "amp", False)),
+                 "ultralytics check_amp result" if not getattr(self, "amp", False) else ""),
+                ("loss + Hungarian matching in fp32", bool(done.get("fp32_loss")), ""),
+                ("RT-DETR attention via SDPA", done.get("mha_to_sdpa", 0) > 0,
+                 f"{done.get('mha_to_sdpa', 0)} nn.MultiheadAttention swapped"),
+                (f"fused {cls.__name__}", True, ""),
+                ("cudnn.benchmark", bool(torch.backends.cudnn.benchmark), ""),
+                ("FlashAttention / TF32 / bf16", False, "not supported on T4 (sm75)"),
+            ]
+            if is_main_rank():
+                log("  acceleration table:")
+                for name, on, why in table:
+                    log(f"    {'ON ' if on else 'off'}  {name}" + (f"  ({why})" if why else ""))
+            if accel.get("require_amp") and not getattr(self, "amp", False):
+                raise RuntimeError("AMP was requested but ultralytics turned it off "
+                                   "(check_amp failed); stopping instead of training in fp32")
+            return fused
+
         def _setup_scheduler(self):
             """Shape the LR curve over the whole run, not over this session.
 
@@ -1071,6 +1212,10 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                                   bbox_alpha, vfl_beta, log_size_l1, loss_gain)
             if adapter:
                 install_spectral_adapter(net, **adapter)
+            if accel:
+                done = enable_transformer_accel(net, fp32_loss=accel.get("fp32_loss", True),
+                                                nc=self.data["nc"])
+                self.__dict__["_hod26_accel"] = done
                 # Resuming rebuilds the model from its yaml, which has no
                 # adapter in it. Only once the front end is back does the
                 # checkpoint's every tensor have a key to land on.
@@ -1517,7 +1662,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
         # ignored entirely when srf_k selects the two-stage front end.
         proj = PDA_PROJECTIONS.get(str(tr.get("adapter_penalty", "0")), LDA_16_TO_3)
         if tr.get("spectral_stem") == "s3t":
-            mae = find_mae_checkpoint()
+            mae = find_mae_checkpoint(tr.get("s3t_mae_file"))
             if mae is None and tr.get("s3t_require_pretrain", True):
                 raise RuntimeError("spectral_stem=s3t needs the MAE checkpoint "
                                    f"(*_mae.pt) attached under {INPUT}")
@@ -1525,7 +1670,9 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                        "mae_ckpt": str(mae) if mae else None,
                        "scale": float(tr.get("s3t_scale", 0.5)),
                        "widen": bool(tr.get("s3t_widen", True)),
-                       "context": bool(tr.get("s3t_context", True))}
+                       "context": bool(tr.get("s3t_context", True)),
+                       "ckpt_chunks": int(tr.get("s3t_ckpt_chunks", 8)),
+                       "compile_blocks": bool(tr.get("s3t_compile", False))}
         elif tr.get("spectral_stem", "adapter") == "adapter":
             adapter = {"n_bands": tr["in_channels"], "projection": proj,
                        "ckpt_name": tr["model"], "srf_k": tr.get("srf_k", 0),
@@ -1540,7 +1687,14 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                                 is_rtdetr=tr["model"].startswith("rtdetr"),
                                 bbox_alpha=float(tr.get("bbox_alpha", 1.0)),
                                 vfl_beta=float(tr.get("vfl_beta", 0.0)),
-                                log_size_l1=bool(tr.get("log_size_l1", False)))
+                                log_size_l1=bool(tr.get("log_size_l1", False)),
+                                accel=({"fp32_loss": bool(tr.get("amp_fp32_loss", True)),
+                                        "fused_optimizer": True,
+                                        "require_amp": bool(tr.get("amp", False))}
+                                       if tr.get("spectral_stem") == "s3t" else None))
+    if tr.get("spectral_stem") == "s3t":
+        import torch
+        torch.backends.cudnn.benchmark = True
     # One card or both, decided by what the session actually has rather than by
     # what the metadata asked for: a request for two that lands on one must not
     # take the run down with it. Per-card batch stays at tr["batch"], so each
@@ -2351,13 +2505,17 @@ def preflight(round_cfg):
             else:
                 note.append(f"resume from {ck}")
     if (cand.get("train") or {}).get("spectral_stem") == "s3t":
-        mae = find_mae_checkpoint()
+        try:
+            mae = find_mae_checkpoint((cand.get("train") or {}).get("s3t_mae_file"))
+        except RuntimeError as exc:
+            bad.append(str(exc))
+            mae = "ambiguous"
         if mae is None and (cand.get("train") or {}).get("s3t_require_pretrain", True):
             bad.append("spectral_stem=s3t but no MAE checkpoint (*_mae.pt) is "
                        "attached. Add the pretraining notebook's output "
                        "(qwyi123/hod26-s3t-mae-pretrain) as an input. Attached: "
                        + str([q.name for q in sorted(INPUT.glob('*'))]))
-        elif mae is not None:
+        elif mae is not None and mae != "ambiguous":
             note.append(f"S3T MAE encoder {mae}")
     if sub.get("weights_from"):
         if find_weights(sub["weights_from"]) is None:
