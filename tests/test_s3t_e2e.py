@@ -107,6 +107,38 @@ def ddp_worker_emulation(check):
                 def train(self):                           # the parent stops here and spawns
                     blob = cloudpickle.dumps({"trainer": cls, "args": vars(self.args),
                                               "model": self.model, "callbacks": self.callbacks})
+                    # The worker is another interpreter: it can import this
+                    # script only as hod26_kernel, unpickles with cloudpickle and
+                    # saves checkpoints with plain pickle (ultralytics save_model).
+                    import subprocess
+                    import sys as _sys
+                    blobf = tmp / "ddp_state.pt"
+                    blobf.write_bytes(blob)
+                    kdir = tmp / "kmod"
+                    kdir.mkdir(exist_ok=True)
+                    (kdir / "hod26_kernel.py").write_text(Path(k.__file__).read_text())
+                    code = (
+                        "import sys, io, copy\n"
+                        f"sys.path[:0] = [{str(kdir)!r}] + {_sys.path!r}\n"
+                        "import torch, cloudpickle, types, importlib\n"
+                        # In production the kernel is __main__ and cloudpickle sends
+                        # its functions by value; here it is a named module, so give
+                        # the worker its functions under that name -- but not its
+                        # classes, which must resolve through hod26_kernel.
+                        "hk = importlib.import_module('hod26_kernel')\n"
+                        f"shim = types.ModuleType({k.__name__!r})\n"
+                        "[setattr(shim, n, v) for n, v in vars(hk).items()"
+                        " if callable(v) and not isinstance(v, type)]\n"
+                        f"sys.modules[{k.__name__!r}] = shim\n"
+                        f"st = cloudpickle.loads(open({str(blobf)!r}, 'rb').read())\n"
+                        "m = st['model']\n"
+                        "buf = io.BytesIO(); torch.save({'ema': copy.deepcopy(m).half()}, buf); buf.seek(0)\n"
+                        "back = torch.load(buf, map_location='cpu', weights_only=False)['ema']\n"
+                        "print('WORKER_SAVE_OK', type(back.model[0].front).__name__,"
+                        " type(back.model[-1].decoder).__name__)\n")
+                    r = subprocess.run([_sys.executable, "-c", code], capture_output=True, text=True,
+                                       timeout=900)
+                    seen["worker_save"] = r.stdout + r.stderr[-1500:]
                     state = cloudpickle.loads(blob)
                     cfg = DEFAULT_CFG_DICT.copy()
                     cfg.update(save_dir="")
@@ -163,6 +195,9 @@ def ddp_worker_emulation(check):
                 "fused AdamW", "cudnn.benchmark", "mosaic canvas reuse")
         off = [w_ for w_ in want if not any(on and w_ in n for n, on, _ in table)]
         check("DDP worker: every requested acceleration ON in the worker's table", not off, str(off))
+        check("DDP worker (separate process): unpickles the model and saves a checkpoint "
+              "with plain pickle", "WORKER_SAVE_OK S3TXFront FDRDecoder" in seen.get("worker_save", ""),
+              seen.get("worker_save", "")[-1500:])
         check("DDP worker: finite loss through the DDP-wrapped model",
               seen.get("loss") is not None and seen["loss"] == seen["loss"], str(seen.get("loss")))
 

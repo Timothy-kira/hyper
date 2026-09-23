@@ -3286,5 +3286,33 @@ def main():
     log(f"round complete: {sum(r['score'] is not None for r in results)}/{len(results)} succeeded")
 
 
+def _register_kernel_classes():
+    """Every class this script defines, under the stable module name hod26_kernel.
+
+    A checkpoint names its classes by module; this script is __main__ here and
+    hod26_kernel in the DDP workers (materialise_kernel_module). cloudpickle
+    sends a __main__ class to the workers *by value*, and the worker's own
+    torch.save (plain pickle) then cannot name it -- the first S3T-X smoke died
+    exactly so, on S3TXFront, at the first checkpoint. Registering all of them
+    (the inlined S3T modules included, not a hand-kept list) makes every class
+    travel by reference to a module the worker can import.
+    """
+    import sys as _sys
+    import types as _types
+    mod = _sys.modules.setdefault("hod26_kernel", _types.ModuleType("hod26_kernel"))
+    here = __name__
+    n = 0
+    for name, obj in list(globals().items()):
+        if isinstance(obj, type) and obj.__module__ == here and not name.startswith("__"):
+            if here != "hod26_kernel":
+                obj.__module__ = "hod26_kernel"
+            setattr(mod, name, obj)
+            n += 1
+    return n
+
+
+_register_kernel_classes()
+
+
 if __name__ == "__main__":
     main()
