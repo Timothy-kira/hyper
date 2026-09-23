@@ -417,6 +417,98 @@ def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
     return yaml
 
 
+def render_fingerprint(cand, train_ids, val_ids):
+    """Everything a rendered dataset depends on: channels, augmentation, repeat
+    factors and the exact split. channels_key names the directory; this is
+    what a prerendered one must match to be used."""
+    spec = {"channels": cand["channels"], "augment": cand.get("augment", {}),
+            "repeat_threshold": float(cand["train"].get("repeat_threshold", 0.0)),
+            "train": sorted(int(i) for i in train_ids), "val": sorted(int(i) for i in val_ids)}
+    return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()
+
+
+def find_prerendered(cand, train_ids, val_ids):
+    """A dataset rendered by the render notebook (render_only), mounted under INPUT.
+
+    None when none is attached (render here, as before). A mounted one for this
+    channel spec whose fingerprint differs is an error: silently training on a
+    render made for another configuration is the failure this guards.
+    """
+    key = channels_key(cand)
+    want = render_fingerprint(cand, train_ids, val_ids)
+    for man in sorted(INPUT.rglob("render_manifest.json")) if INPUT.exists() else []:
+        try:
+            m = json.loads(man.read_text())
+        except Exception:                                        # noqa: BLE001
+            continue
+        if m.get("key") != key:
+            continue
+        if m.get("fingerprint") != want:
+            raise RuntimeError(
+                f"prerendered dataset {man.parent} is for a different configuration "
+                f"(fingerprint {m.get('fingerprint', '?')[:12]} != {want[:12]}): its "
+                f"channels/augment/split do not match this run. Re-run the render "
+                f"notebook with this candidate, or detach it to render here.")
+        return man.parent
+    return None
+
+
+def adopt_prerendered(src, root):
+    """Use a mounted render: images linked (read-only input), labels copied so
+    ultralytics can write its label cache beside them."""
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+    (root / "images").mkdir()
+    for split in ("train", "val"):
+        (root / "images" / split).symlink_to(src / "images" / split, target_is_directory=True)
+    shutil.copytree(src / "labels", root / "labels")
+    for c in (root / "labels").glob("*.cache"):
+        c.unlink()
+    text = (src / "data.yaml").read_text().splitlines()
+    text = [f"path: {root}" if ln.startswith("path:") else ln for ln in text]
+    (root / "data.yaml").write_text("\n".join(text) + "\n")
+    m = json.loads((src / "render_manifest.json").read_text())
+    log(f"  using prerendered dataset {src} ({m.get('counts')}, rendered in "
+        f"{m.get('seconds', 0):.0f}s by the render notebook): no rendering here")
+    return root / "data.yaml"
+
+
+def submission_split(root, sub):
+    """(train_ids, val_ids) for a submission run -- the render notebook, the
+    preflight and the training all derive it here, so their fingerprints agree."""
+    ann_dir = root / "train" / "annotations"
+    ids = require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
+    train_ids, val_ids = split_ids(ids)
+    if sub.get("use_all_train", True):
+        train_ids, val_ids = ids, val_ids[:60]
+    return train_ids, val_ids
+
+
+def run_render(round_cfg):
+    """render_only: materialise the submission candidate's dataset into the
+    output, with a manifest, for the training kernel to mount."""
+    sub = round_cfg["submit"]
+    cand = sub["candidate"]
+    root = data_root()
+    train_ids, val_ids = submission_split(root, sub)
+    ann_dir = root / "train" / "annotations"
+    anns = {pid: parse(ann_dir / f"{pid}.xml") for pid in set(train_ids) | set(val_ids)}
+    index = frame_index(root, "train", sorted(set(train_ids) | set(val_ids)))
+    out = WORK / f"ds_{channels_key(cand)}"
+    t0 = time.time()
+    materialize(cand, index, train_ids, val_ids, anns, out)
+    counts = {sp: len(list((out / "images" / sp).glob("*.tiff"))) + len(list((out / "images" / sp).glob("*.png")))
+              for sp in ("train", "val")}
+    (out / "render_manifest.json").write_text(json.dumps({
+        "key": channels_key(cand), "fingerprint": render_fingerprint(cand, train_ids, val_ids),
+        "counts": counts, "seconds": time.time() - t0, "channels": cand["channels"],
+        "augment": cand.get("augment", {})}, indent=1))
+    for c in (out / "labels").glob("*.cache"):
+        c.unlink()
+    log(f"RENDER DONE: {out.name} {counts} in {time.time() - t0:.0f}s")
+
+
 # ------------------------------------------------------------ evaluate ------
 def predict_kwargs(cand):
     """Inference arguments, omitting NMS IoU for detectors that have no NMS."""
@@ -2032,12 +2124,14 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
 
 
 def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
-                  reserve_seconds=300):
+                  reserve_seconds=300, root=None, prerendered=True):
 
-    root = SCRATCH / f"ds_{channels_key(cand)}"
+    root = root or SCRATCH / f"ds_{channels_key(cand)}"
     log(f"  scratch {SCRATCH} ({free_gb(SCRATCH):.1f} GB free), "
         f"output {WORK} ({free_gb(WORK):.1f} GB free)")
-    yaml = materialize(cand, index, train_ids, val_ids, anns, root)
+    pre = find_prerendered(cand, train_ids, val_ids) if prerendered else None
+    yaml = (adopt_prerendered(pre, root) if pre is not None
+            else materialize(cand, index, train_ids, val_ids, anns, root))
     tr, inf = cand["train"], cand["infer"]
 
     # Defensive clamp: a candidate that reached here without normalization must
@@ -2741,11 +2835,9 @@ def run_submission(round_cfg):
     ann_dir = root / "train" / "annotations"
     test_dir = root / "test" / "images"
 
-    ids = require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
-    train_ids, val_ids = split_ids(ids)
-    if round_cfg["submit"].get("use_all_train", True):
-        # Config was already selected on val; refit on everything for the final run.
-        train_ids, val_ids = ids, val_ids[:60]   # a token val set keeps YOLO happy
+    # use_all_train: config was already selected on val; refit on everything,
+    # with a token val set that keeps YOLO happy.
+    train_ids, val_ids = submission_split(root, round_cfg["submit"])
     log(f"submission fit: {len(train_ids)} train / {len(val_ids)} val")
 
     anns = {pid: parse(ann_dir / f"{pid}.xml") for pid in set(train_ids) | set(val_ids)}
@@ -2826,9 +2918,12 @@ def preflight(round_cfg):
     import shutil as _sh
     bad, note = [], []
 
+    render_only = bool((round_cfg.get("submit") or {}).get("render_only"))
     try:
         import torch
-        if not torch.cuda.is_available():
+        if render_only:
+            note.append("render only: no GPU needed")
+        elif not torch.cuda.is_available():
             bad.append("no GPU visible: the notebook's accelerator is off. "
                        "Settings -> Accelerator -> GPU T4 x2 before running.")
         else:
@@ -2922,7 +3017,16 @@ def preflight(round_cfg):
                     "Attached: " + ", ".join(q.name for q in srcs))
             else:
                 note.append(f"resume from {ck}")
-    if (cand.get("train") or {}).get("spectral_stem") == "s3t":
+    if cand and not render_only and not sub.get("weights_from"):
+        # A mounted render must be the one this run would make -- checked now,
+        # not after the MAE, the model and the DDP spawn.
+        try:
+            pre = find_prerendered(cand, *submission_split(data_root(), sub))
+            note.append(f"prerendered dataset {pre}" if pre else
+                        "no prerendered dataset attached: rendering here")
+        except Exception as exc:                                 # noqa: BLE001
+            bad.append(str(exc))
+    if (cand.get("train") or {}).get("spectral_stem") == "s3t" and not render_only:
         try:
             mae = find_mae_checkpoint((cand.get("train") or {}).get("s3t_mae_file"))
         except RuntimeError as exc:
@@ -2977,6 +3081,8 @@ def main():
     preflight(round_cfg)
 
     if round_cfg.get("submit"):
+        if round_cfg["submit"].get("render_only"):
+            return run_render(round_cfg)
         if round_cfg["submit"].get("weights_from"):
             return run_from_checkpoint(round_cfg)
         return run_submission(round_cfg)

@@ -123,6 +123,69 @@ def main() -> int:
         lines = [ln for ln in (work / "final_metrics.jsonl").read_text().splitlines() if ln.strip()]
         check("per-epoch metrics logged", len(lines) >= 1)
 
+    # ---- the render notebook, then a training session that mounts its output
+    with tempfile.TemporaryDirectory() as td:
+        import os
+        import shutil
+        import stat
+        tmp = Path(td)
+        data = synth_dataset(tmp / "input" / "hod26-planar")
+        cand = s3t_candidate(total=1, batch=2, mae_file="pretrain3_mae.pt", arch="xca")
+        cand["train"].update(epochs=2, imgsz=128, amp=False, s3t_compile=False, workers=0, nbs=2)
+        sub = {"candidate": cand, "use_all_train": False, "predict": True, "session_hours": 1.0}
+
+        r = load_kernel(tmp / "render_work", data)
+        r.run_render({"round": "render", "candidates": [], "submit": dict(sub, render_only=True)})
+        ds = next((tmp / "render_work").glob("ds_*"))
+        check("render_only writes the dataset and its manifest", (ds / "render_manifest.json").exists()
+              and (ds / "data.yaml").exists())
+        mount = tmp / "input" / "hod26-s3t-render" / ds.name
+        mount.parent.mkdir(parents=True)
+        shutil.copytree(ds, mount)
+        for dirpath, dirnames, filenames in os.walk(mount):     # read-only, like /kaggle/input
+            for f in filenames:
+                os.chmod(Path(dirpath) / f, stat.S_IRUSR | stat.S_IRGRP)
+            os.chmod(dirpath, stat.S_IRUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP)
+
+        k = load_kernel(tmp / "work", data)
+        k.INPUT = tmp / "input"
+        mae_dir = k.INPUT / "hod26-s3t-mae-pretrain3" / "s3t_mae"
+        mae_dir.mkdir(parents=True)
+        enc = XCAEncoder()
+        torch.save({"encoder": enc.state_dict(), "config": enc.config(), "step": 1},
+                   mae_dir / "pretrain3_mae.pt")
+        said = []
+        base_log = k.log
+        k.log = lambda msg: (said.append(str(msg)), base_log(msg))
+        pre = k.find_prerendered(cand, *k.submission_split(k.data_root(), sub))
+        check("the mounted render is found and matches", pre == mount, str(pre))
+        k.run_submission({"round": "e2e", "candidates": [], "submit": sub})
+        check("training used the mounted render (no rendering in the session)",
+              any("using prerendered dataset" in m for m in said)
+              and not any("rendering:" in m for m in said))
+        check("  and still trained, kept best/last and predicted",
+              (k.WORK / "final_best.pt").exists() and (k.WORK / "final_last.pt").exists()
+              and (k.WORK / "submission.csv").exists())
+
+        other = dict(cand, augment=dict(cand["augment"], copies=2))
+        try:
+            k.find_prerendered(other, *k.submission_split(k.data_root(), sub))
+            refused = False
+        except RuntimeError:
+            refused = False
+        # a different augment is a different channels_key: not this render at all
+        check("a different configuration does not pick this render up",
+              k.find_prerendered(other, *k.submission_split(k.data_root(), sub)) is None)
+        man = json.loads((mount / "render_manifest.json").read_text())
+        try:
+            k.find_prerendered(cand, *k.submission_split(k.data_root(), dict(sub, use_all_train=True)))
+            refused = False
+        except RuntimeError:
+            refused = True
+        check("same channels but another split: refused, not silently used", refused, man["key"])
+        for dirpath, dirnames, filenames in os.walk(mount):
+            os.chmod(dirpath, 0o755)
+
     print(f"\n{len(fails)} failure(s)" if fails else "\nS3T-X end-to-end session passed")
     return 1 if fails else 0
 

@@ -98,6 +98,11 @@ def main() -> None:
                     help="torch.compile the S3T blocks (measure with the probe first)")
     ap.add_argument("--arch", choices=["xca", "tokens"], default="xca",
                     help="xca: S3T-X (MAE v3); tokens: the band-token encoder (MAE v1/v2)")
+    ap.add_argument("--render-only", action="store_true",
+                    help="build the CPU render notebook: materialise this candidate's dataset "
+                         "into its output (no GPU, no training)")
+    ap.add_argument("--render-kernel", default=None,
+                    help="a render notebook to mount; its dataset is used instead of rendering")
     args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cfg = args.out_dir / "round-config.json"
@@ -109,12 +114,15 @@ def main() -> None:
         "predict": True,                 # a submission comes out wherever the clock stops
         "session_hours": SESSION_HOURS,
         "require_gpus": 2,
+        "render_only": bool(args.render_only),
     }}, indent=2))
     subprocess.run([sys.executable, str(REPO / "tools" / "build_kernel.py"),
                     "--round-config", str(cfg), "--out-dir", str(args.out_dir),
                     "--slug", args.slug,
-                    *[a for k in (args.mae_kernel or [MAE_KERNEL]) for a in ("--kernel-source", k)],
-                    "--machine-shape", "NvidiaTeslaT4x2"], check=True)
+                    *([] if args.render_only else
+                      [a for k in (args.mae_kernel or [MAE_KERNEL]) for a in ("--kernel-source", k)]),
+                    *(["--kernel-source", args.render_kernel] if args.render_kernel else []),
+                    "--machine-shape", "cpu" if args.render_only else "NvidiaTeslaT4x2"], check=True)
     cfg.unlink()
 
 

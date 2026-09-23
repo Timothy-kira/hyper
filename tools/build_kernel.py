@@ -74,7 +74,7 @@ def main() -> None:
     # take NvidiaTeslaT4x2 -- verified by pushing a probe kernel that reported
     # torch.cuda.device_count() == 2.
     ap.add_argument("--machine-shape", default="NvidiaTeslaT4",
-                    help="Kaggle accelerator, e.g. NvidiaTeslaT4x2 for two T4s")
+                    help="Kaggle accelerator, e.g. NvidiaTeslaT4x2 for two T4s; 'cpu' for none")
     args = ap.parse_args()
 
     cfg = json.loads(args.round_config.read_text())
@@ -94,8 +94,8 @@ def main() -> None:
         "language": "python",
         "kernel_type": "script",
         "is_private": True,
-        "enable_gpu": True,
-        "machine_shape": args.machine_shape,
+        **({"enable_gpu": False} if args.machine_shape.lower() in ("cpu", "none") else
+           {"enable_gpu": True, "machine_shape": args.machine_shape}),
         "enable_internet": True,
         "competition_sources": [],
         "dataset_sources": ["xishengfeng/hod26-planar", *args.dataset_source],
