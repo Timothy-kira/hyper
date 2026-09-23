@@ -345,8 +345,16 @@ def main() -> int:
         # nbs = batch: an optimizer step every batch. At the real nbs of 64 a
         # run this short makes one step, at warmup step 0 where every lr is 0.
         tr.update(epochs=2, imgsz=128, amp=False, s3t_compile=False, workers=0, nbs=2)
+        # The real schedule, compressed into two epochs: heads and the new
+        # modules from the first, everything but the stem from the second.
+        tr["unfreeze"] = {**{pt: [0, 0, 1.0] for pt in ("head", "new", "mixer")},
+                          **{pt: [1, 1, 1.0] for pt in ("decoder", "neck", "s3t_enc")},
+                          "backbone": [1, 1, 0.1]}
         round_cfg = {"round": "e2e", "candidates": [], "submit": {
             "candidate": cand, "use_all_train": False, "predict": True, "session_hours": 1.0}}
+        said_run = []
+        base_log = k.log
+        k.log = lambda msg: (said_run.append(str(msg)), base_log(msg))
         k.run_submission(round_cfg)
 
         work = k.WORK
@@ -372,7 +380,16 @@ def main() -> int:
         enc_w = torch.load(k.INPUT / "hod26-s3t-mae-pretrain3" / "s3t_mae" / "pretrain3_mae.pt",
                            weights_only=True)["encoder"]["blocks.0.attn.qkv.weight"]
         d_enc = float((front.enc.blocks[0].attn.qkv.weight.float() - enc_w).abs().max())
-        check("the MAE encoder is fine-tuned, not frozen", d_enc > 0, f"{d_enc}")
+        check("the MAE encoder is fine-tuned once its stage comes", d_enc > 0, f"{d_enc}")
+        check("BatchNorm frozen in the saved model",
+              all(type(b).__name__ == "FrozenBatchNorm2d"
+                  for b in net.modules() if isinstance(b, torch.nn.BatchNorm2d)))
+        check("staged unfreezing announced, per-epoch multipliers logged",
+              any("staged unfreezing" in m for m in said_run)
+              and any(m.startswith("  unfreeze epoch 2:") and "backbone 0.1" in m for m in said_run),
+              str([m for m in said_run if "unfreeze" in m][:4]))
+        check("the loader runs at imgsz, the model upsamples on the GPU",
+              any("S3T-X input: loader at 1/2" in m for m in said_run))
         opt = torch.load(work / "final_last.pt", map_location="cpu", weights_only=False)["optimizer"]
         check("the optimizer is really fused (every group)",
               all(g.get("fused") is True for g in opt["param_groups"]),

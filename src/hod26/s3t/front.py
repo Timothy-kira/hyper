@@ -272,13 +272,23 @@ class S3TXFront(nn.Module):
 
     Every new path starts at zero: step 0 is the pretrained detector on the
     projection, exactly.
+
+    upsample: the data loader delivers the input at 1/upsample of the
+    detector's resolution and the 2x happens here, on the GPU. The cube is
+    493x241 natively, so a 512 loader loses nothing; rendering, mosaic and
+    affine augmentation at 1024 cost the 4 vCPUs of a T4 pair 3.5x more per
+    sample (145 vs 41 ms) and left the GPUs 40% idle. The 16->3 projection is
+    applied first and only its 3 channels are resized (a 1x1 conv commutes with
+    bilinear interpolation), and the encoder, which wants native scale, reads
+    the loader's input directly (scale * upsample = 1: no resize at all).
     """
 
     def __init__(self, encoder, projection=None, scale: float = 0.5, grad_ckpt: bool = True,
-                 amp: bool = True, stem_ch: int = 48, train_encoder: bool = True):
+                 amp: bool = True, stem_ch: int = 48, train_encoder: bool = True, upsample: int = 1):
         super().__init__()
         n, d = encoder.n_bands, encoder.dim
         self.enc, self.scale, self.amp = encoder, scale, amp
+        self.upsample = int(upsample)
         encoder.grad_ckpt = bool(grad_ckpt)
         self.train_encoder = bool(train_encoder)
         if not self.train_encoder:
@@ -306,9 +316,10 @@ class S3TXFront(nn.Module):
         # Features in fp32 whatever the model's dtype: the ring means and the
         # per-band statistics are sums over many pixels.
         level = x.float() * LEVEL_SPAN + LEVEL_LO
-        if self.scale != 1.0:
-            level = F.interpolate(level, scale_factor=self.scale, mode="bilinear",
-                                  align_corners=False, antialias=True)
+        s = self.scale * getattr(self, "upsample", 1)
+        if s != 1.0:
+            level = F.interpolate(level, scale_factor=s, mode="bilinear",
+                                  align_corners=False, antialias=s < 1)
         feats = observed_features(level)
         wdt = self.fuse.weight.dtype
         amp = self.amp and x.is_cuda
@@ -352,7 +363,11 @@ class S3TXFront(nn.Module):
     def forward(self, x):
         f, pyr = self._encode(x)
         self.__dict__["_side"], self.__dict__["_pyr"] = f, pyr
-        return self.base(x)
+        y = self.base(x)
+        u = getattr(self, "upsample", 1)
+        if u > 1:
+            y = F.interpolate(y, scale_factor=u, mode="bilinear", align_corners=False)
+        return y
 
 
 def widen_first_conv(block: nn.Module, extra: int) -> nn.Conv2d:

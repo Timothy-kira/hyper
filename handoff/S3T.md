@@ -126,6 +126,54 @@ v3 **先 mask，再算特征**（`observed_features`）：
 - **log-size L1**：宽高在 log 空间做 L1。
 - DEIM 的 Dense O2O 就是 mosaic，本来就开着。
 
+## 保留 COCO 和 MAE 的预训练权重：分阶段解冻（2026-09-23 晚）
+
+之前的正式训练**没有**保护预训练权重：
+- 所有参数用同一个 lr。ultralytics 的 `optimizer=auto` 选了 AdamW，lr 4.55e-4；
+- 骨干网络的 lr 是官方 RT-DETR 微调配置的 45 倍，官方配置里骨干是 0.1×，stem 冻结；
+- BatchNorm 在 train 模式下，每卡只有 2 张图，COCO 的 running statistics 几百步之后就被覆盖了。
+
+现在（`train.unfreeze`、`train.frozen_bn`）：
+
+| 部分 | 包括 | 从第几个 epoch 开始（从 1 数） | lr 倍数 |
+| --- | --- | --- | --- |
+| head | 分类头和框回归头（decoder 6 层 + encoder query 选择），denoising 的类别 embedding | 1 | 1 |
+| new | 所有零初始化的新层：S3T 融合、金字塔、P3/P4/P5 注入、D-FINE 分布头 | 1 | 1 |
+| mixer | 16→3 波段投影 | 1 | 1 |
+| decoder | 预训练的 decoder 层、input_proj、query_pos_head、enc_output | 3（第 3 个 epoch 0.5，第 4 个起 1） | 1 |
+| neck | 预训练的 hybrid encoder（AIFI + CCFM） | 3（同上，爬升 2 个 epoch） | 1 |
+| s3t_enc | MAE 预训练的 S3T-X 编码器 | 3（同上） | 1 |
+| backbone | HGNetv2 stage 1–4（COCO） | 6（分 3 个 epoch 爬到 0.1） | 0.1 |
+| stem、骨干里的 BN 缩放和偏移 | | 不训练 | 0 |
+
+- **BatchNorm 全部固定用 COCO 的 running statistics**（`FrozenBatchNorm2d`，一直是 eval 模式）。它的缩放和偏移仍按所在部分的 lr 训练，骨干里的除外。
+- 实现方式是**给每个 part 的 lr 乘一个倍数**，不用 `requires_grad`：
+  - DDP 只在包装模型时给需要梯度的参数注册 hook；
+  - ultralytics 看到被冻结的浮点参数，还会把 `requires_grad` 改回 True。
+- 倍数只在 `optimizer.step()` 那一步生效（step 前的 pre-hook 乘上，post-hook 还原），warmup 和 scheduler 写入的 lr 都不受影响。
+- 在 AdamW 下，倍数为 0 就是精确冻结：更新量和 decoupled weight decay 都乘以 lr。
+- 第 1–5 个 epoch 本来就在 warmup 里，lr 还在往上爬，所以解冻是渐进的。
+- 日志里：开头有一行 `staged unfreezing (part: first epoch, ramp epochs, LR x; params)`，每个 epoch 有一行 `unfreeze epoch N: head 1, new 1, ..., backbone 0.0333, stem 0, frozen_norm 0`。
+- 测试 `tests/test_unfreeze.py`：
+  - 每个参数恰好属于一个 part；
+  - 每个阶段只有该动的部分在动，冻结的部分变化量精确为 0.0，动的幅度不超过 lr × 倍数；
+  - lr 能还原，LambdaLR 正常；
+  - optimizer state_dict 能往返（续训）；
+  - BN 的统计量不变；
+  - deepcopy、pickle、fuse 都正常。
+
+## 数据加载：loader 用 512，GPU 上放大 2 倍（2026-09-23 晚）
+
+上一次正式训练第 1 个 epoch 用了 1055 秒，两张卡的 GPU 利用率只有 53% 和 61%，瓶颈在 CPU（4 个 vCPU）。
+- 16 通道的 mosaic 在 1024 下，单核每个样本 145 ms，在 512 下是 41 ms。
+- 原始 cube 是 493×241，1024 本来就是把它放大约 2 倍，所以 loader 用 512 **不丢任何原始像素**。
+- `S3TXFront(upsample=2)`：
+  - 先做 16→3 投影，只把 3 个通道在 GPU 上双线性放大 2 倍（1×1 卷积和双线性插值可以交换）；
+  - 检测器看到的仍然是 1024；
+  - S3T 编码器直接读 512 的输入（scale × upsample = 1，不做任何缩放）。
+- 训练、验证和预测都是 imgsz 512（`predict_kwargs` 会传入）。渲染好的数据集不用改，指纹和 imgsz 无关。
+- 日志：`S3T-X input: loader at 1/2 of the detector's resolution ...`。
+
 ## 保留 best.pt 和 last.pt
 
 输出目录（`/kaggle/working`）里会有：

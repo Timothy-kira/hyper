@@ -154,7 +154,16 @@ x ← x + γ2 · MLP(LN(x))       # 4D 中间维度
 
 ### 5.2 检测微调
 
-- **从 COCO 开始**（不接旧 checkpoint）：RT-DETR-L，imgsz 1024，每卡 batch 2，双卡 DDP，nbs=64，48 epoch。
+- **从 COCO 开始**（不接旧 checkpoint）：RT-DETR-L，检测器分辨率 1024，每卡 batch 2，双卡 DDP，nbs=64。
+- **数据加载**：loader 用 512，`S3TXFront` 在 GPU 上把 3 通道投影放大 2 倍再给检测器。原始 cube 是 493×241，所以不丢像素。S3T 编码器直接读 512 的输入。
+- **保留预训练权重**：
+  - 分阶段解冻，按 part 设 lr 倍数：
+    - 第 1–2 个 epoch：只训练分类/框回归头和零初始化的新层；
+    - 从第 3 个 epoch 起加入 decoder、neck 和 MAE 编码器；
+    - 从第 6 个 epoch 起加入骨干，lr 0.1×；
+    - stem 一直冻结。
+  - BatchNorm 全程使用 COCO 的 running statistics（每卡 2 张图，train 模式下的统计量只是噪声）。
+  - 做法参照官方 RT-DETR/D-FINE 微调 HGNetv2 的配置（freeze stem、freeze norm、backbone lr 0.1×）。详见 `handoff/S3T.md`。
 - **加速**：
   - AMP fp16，loss 和匈牙利匹配强制 fp32（ultralytics 提醒过它在 fp16 下可能出 NaN）；
   - RT-DETR 的 `nn.MultiheadAttention` 换成走 SDPA 的版本（mem-efficient kernel）；

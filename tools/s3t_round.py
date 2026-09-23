@@ -43,6 +43,20 @@ AUGMENT = {"sg_window": 7, "sg_polyorder": 2, "sg_chain": True,
            "smote_alpha": 0.3, "cutmix_prob": 0.4, "cutmix_blocks": 24, "copies": 1}
 
 
+# Staged unfreezing (handoff/S3T.md, "keeping the pretrained weights"), per
+# part: [first epoch (0-based), ramp epochs, LR multiplier]; a part left out
+# never trains. First the weights that say what and where (the heads) and the
+# modules that start at zero; then the pretrained decoder, neck and MAE encoder,
+# ramped in while the warmup is still raising the LR; then the COCO backbone at
+# a tenth of the LR, as the official RT-DETR / D-FINE fine-tuning configs do.
+# The stem and the backbone's BatchNorm stay frozen (freeze_norm there too).
+UNFREEZE = {
+    "head": [0, 0, 1.0], "new": [0, 0, 1.0], "mixer": [0, 0, 1.0],
+    "decoder": [2, 2, 1.0], "neck": [2, 2, 1.0], "s3t_enc": [2, 2, 1.0],
+    "backbone": [5, 3, 0.1],
+}
+
+
 def s3t_candidate(total: int = TOTAL, batch: int = 2, mae_file: str | None = None,
                   compile_blocks: bool = False, arch: str = "tokens") -> dict:
     cand = full_candidate("transformer", total, {
@@ -66,10 +80,19 @@ def s3t_candidate(total: int = TOTAL, batch: int = 2, mae_file: str | None = Non
         # compiled blocks and no checkpoints are the fastest measured (0.50
         # s/step, 5.3 GB); the encoder is small enough to keep its activations.
         cand["train"].update(s3t_arch="xca", s3t_grad_ckpt=False, s3t_compile=True)
+        # The loader was the bottleneck (4 vCPUs; the GPUs sat at 53-61% in the
+        # first formal epoch): a 16-channel mosaic at 1024 costs 145 ms/sample
+        # on one core, at 512 41 ms. The cubes are 493x241, so a 512 loader
+        # keeps every native pixel; the front upsamples 2x on the GPU and the
+        # detector still sees 1024 (the encoder reads the 512 input directly).
+        cand["train"].update(imgsz=512, s3t_upsample=2)
     # Head and losses (handoff/S3T.md, "head"): D-FINE's distribution refinement
     # on the pretrained decoder, DEIM's MAL for the classes, log-space w/h L1.
     # Mosaic already gives DEIM's dense one-to-one supervision.
     cand["train"].update(fdr=True, mal=True, log_size_l1=True)
+    # Keep COCO and the MAE pretraining: staged unfreezing, and BatchNorm on
+    # COCO's running statistics (2 images/card train-mode statistics are noise).
+    cand["train"].update(unfreeze={k: list(v) for k, v in UNFREEZE.items()}, frozen_bn=True)
     # Speed over bitwise reproducibility: deterministic=True would turn on
     # cudnn.deterministic and torch's deterministic algorithms, which limit
     # cudnn.benchmark's choices and swap in slower backward kernels (the
