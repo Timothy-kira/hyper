@@ -21,6 +21,12 @@ see. Two paths out of the spectral encoder:
 Both new outputs start at zero, so step 0 is the projection alone and the
 pretrained detector sees a sane image; the spectral features are phased in by
 gradient rather than dropped in at full strength.
+
+S3TXFront is the same idea for the S3T-X encoder (xca.py), wired where the
+grids already agree: its stride-4 output joins the HGStem output (stride 4)
+through a zero-init 1x1 instead of being upsampled to the input and pushed
+through a widened full-resolution conv, and a learned strided pyramid replaces
+the average pooling for the side injections.
 """
 
 from __future__ import annotations
@@ -172,6 +178,11 @@ class S3TFront(nn.Module):
         p = per_chunk(lambda z: enc.norm(enc.pool(z)), t)                   # (B, S, D)
         return p.transpose(1, 2).reshape(b, enc.dim, gh, gw)
 
+    def side_at(self, size):
+        """The spectral features on a detector level's grid, or None before a forward."""
+        f = self.__dict__.get("_side")
+        return None if f is None else F.adaptive_avg_pool2d(f, size)
+
     def forward(self, x):
         f = self._encode(x)                                     # (B, D, h, w)
         self.__dict__["_side"] = f
@@ -180,6 +191,117 @@ class S3TFront(nn.Module):
             return torch.cat([self.base(x), up.to(x.dtype)], 1)   # (B, 3 + D, H, W)
         up = F.interpolate(self.head(f), size=x.shape[-2:], mode="bilinear", align_corners=False)
         return self.base(x) + up
+
+
+class SpectralPyramid(nn.Module):
+    """Stride-4 spectral features -> strides 8, 16, 32 (the detector's P3, P4, P5).
+
+    Strided 3x3 convolutions rather than average pooling: a target a few pixels
+    wide is averaged into its background by a pool, and the grey classes differ
+    from their background only in spectrum. Each level ends in a per-pixel
+    LayerNorm so every injection sees unit-scale input.
+    """
+
+    def __init__(self, dim: int, levels: int = 3):
+        super().__init__()
+        self.down = nn.ModuleList(nn.Conv2d(dim, dim, 3, stride=2, padding=1) for _ in range(levels))
+        self.norm = nn.ModuleList(nn.LayerNorm(dim) for _ in range(levels))
+
+    def forward(self, f):
+        from .xca import ln_nhwc
+        out = []
+        for conv, ln in zip(self.down, self.norm):
+            f = F.gelu(conv(f))
+            out.append(ln_nhwc(f, ln))
+        return out
+
+
+class S3TXFront(nn.Module):
+    """S3T-X in front of the detector: fused where the grids already agree.
+
+    (B, 16, H, W) in [0, 1] -> (B, 3, H, W): the plain 16 -> 3 projection, for
+    the pretrained stem, unchanged. The spectral features never pass through
+    three channels and are never upsampled:
+
+    * the encoder runs at `scale` (0.5: native pixel scale) with stride 2, so
+      its grid is the input's stride 4 -- exactly the grid of RT-DETR's HGStem
+      output. `fuse_stem` adds them there through a zero-initialised 1x1 conv
+      (D -> the stem's 48 channels); the wrapper around the stem calls it.
+    * a learned pyramid takes them to strides 8/16/32 for the side injections
+      (`side_at`), which may first read AIFI's global context (ContextInject).
+
+    Every new path starts at zero: step 0 is the pretrained detector on the
+    projection, exactly.
+    """
+
+    def __init__(self, encoder, projection=None, scale: float = 0.5, grad_ckpt: bool = True,
+                 amp: bool = True, stem_ch: int = 48, train_encoder: bool = True):
+        super().__init__()
+        n, d = encoder.n_bands, encoder.dim
+        self.enc, self.scale, self.amp = encoder, scale, amp
+        encoder.grad_ckpt = bool(grad_ckpt)
+        self.train_encoder = bool(train_encoder)
+        if not self.train_encoder:
+            for p_ in encoder.parameters():
+                p_.requires_grad_(False)
+        self.out_channels = 3
+        self.base = nn.Conv2d(n, 3, 1, bias=False)
+        with torch.no_grad():
+            if projection is not None:
+                self.base.weight.copy_(torch.as_tensor(projection, dtype=torch.float32).view(3, n, 1, 1))
+            else:
+                self.base.weight.fill_(1.0 / n)
+        self.pyramid = SpectralPyramid(d)
+        self.fuse = nn.Conv2d(d, stem_ch, 1)
+        nn.init.zeros_(self.fuse.weight)
+        nn.init.zeros_(self.fuse.bias)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for k in ("_side", "_pyr", "_ctx"):
+            state.pop(k, None)
+        return state
+
+    def _encode(self, x):
+        level = x * LEVEL_SPAN + LEVEL_LO
+        if self.scale != 1.0:
+            level = F.interpolate(level, scale_factor=self.scale, mode="bilinear",
+                                  align_corners=False, antialias=True)
+        feats = level_features(level)
+        with torch.autocast("cuda", dtype=torch.float16, enabled=self.amp and x.is_cuda):
+            if not self.train_encoder:
+                with torch.no_grad():
+                    f = self.enc(feats)
+            else:
+                f = self.enc(feats)
+            return f, self.pyramid(f)
+
+    def side_at(self, size):
+        pyr = self.__dict__.get("_pyr")
+        if pyr is None:
+            return None
+        size = tuple(size)
+        for p_ in pyr:
+            if tuple(p_.shape[-2:]) == size:
+                return p_
+        # an input size the strides do not divide: the finest level at least
+        # as large as the target, pooled onto it
+        big = [p_ for p_ in pyr if p_.shape[-2] >= size[0] and p_.shape[-1] >= size[1]]
+        return F.adaptive_avg_pool2d(big[-1] if big else pyr[0], size)
+
+    def fuse_stem(self, y):
+        """HGStem output (B, 48, H/4, W/4) plus the spectral features on the same grid."""
+        f = self.__dict__.get("_side")
+        if f is None:
+            return y
+        if f.shape[-2:] != y.shape[-2:]:
+            f = F.interpolate(f, size=y.shape[-2:], mode="bilinear", align_corners=False)
+        return y + self.fuse(f).to(y.dtype)
+
+    def forward(self, x):
+        f, pyr = self._encode(x)
+        self.__dict__["_side"], self.__dict__["_pyr"] = f, pyr
+        return self.base(x)
 
 
 def widen_first_conv(block: nn.Module, extra: int) -> nn.Conv2d:
@@ -224,10 +346,10 @@ class Inject(nn.Module):
 
     def forward(self, x):
         y = self.layer(x)
-        f = self.front.__dict__.get("_side")
+        f = self.front.side_at(y.shape[-2:])
         if f is None:
             return y
-        return y + self.proj(F.adaptive_avg_pool2d(f, y.shape[-2:]).to(y.dtype))
+        return y + self.proj(f.to(y.dtype))
 
 
 
@@ -285,11 +407,11 @@ class ContextInject(Inject):
 
     def forward(self, x):
         y = self.layer(x)
-        f = self.front.__dict__.get("_side")
-        if f is None:
-            return y
         h, w = y.shape[-2:]
-        fp = F.adaptive_avg_pool2d(f, (h, w)).to(y.dtype)          # (B, D, h, w)
+        fp = self.front.side_at((h, w))
+        if fp is None:
+            return y
+        fp = fp.to(y.dtype)                                          # (B, D, h, w)
         ctx = self.front.__dict__.get("_ctx")
         if ctx is not None:
             b, d = fp.shape[:2]

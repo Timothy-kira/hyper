@@ -59,16 +59,21 @@ mae = find_mae_checkpoint(MAE_FILE)
 say(f"MAE encoder: {mae}")
 
 
-def build_net(chunks, compile_blocks, s3t=True, scale=0.5, fast=False, freeze=False):
+def build_net(chunks, compile_blocks, s3t=True, scale=0.5, fast=False, freeze=False,
+              arch="tokens", grad_ckpt=True):
     # Built the way RTDETRTrainer.get_model builds it: the 18-class graph from
     # the yaml, then every shape-compatible COCO tensor loaded into it.
     net = RTDETRDetectionModel("rtdetr-l.yaml", ch=3, nc=18, verbose=False)
     net.load(COCO, verbose=False)
     if s3t:
+        # Speed and memory do not depend on the weights: an architecture with
+        # no MAE checkpoint yet is measured on its random initialisation.
+        ck = str(mae) if mae and arch == "tokens" else None
         install_spectral_adapter(net, 16, projection=LDA_16_TO_3, kind="s3t",
-                                 mae_ckpt=str(mae) if mae else None, scale=scale, widen=True,
+                                 mae_ckpt=ck, scale=scale, widen=True,
                                  context=True, ckpt_chunks=chunks, compile_blocks=compile_blocks,
-                                 fast_kernels=fast, train_encoder=not freeze)
+                                 fast_kernels=fast, train_encoder=not freeze, arch=arch,
+                                 grad_ckpt=grad_ckpt)
     done = enable_transformer_accel(net, fp32_loss=True, nc=18)
     return net.to(dev).train(), done
 
@@ -149,8 +154,9 @@ def run(cfg):
     try:
         s3t = cfg.get("s3t", True)
         ch = 16 if s3t else 3
-        net, done = build_net(cfg["chunks"], cfg["compile"], s3t, cfg.get("scale", 0.5),
-                              cfg.get("fast", False), cfg.get("freeze", False))
+        net, done = build_net(cfg.get("chunks", 8), cfg["compile"], s3t, cfg.get("scale", 0.5),
+                              cfg.get("fast", False), cfg.get("freeze", False),
+                              cfg.get("arch", "tokens"), cfg.get("ckpt", True))
         rec["accel"] = done
         opt = torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=1e-5, fused=CUDA)
         scaler = torch.amp.GradScaler("cuda", enabled=cfg["amp"] and CUDA)
@@ -212,15 +218,20 @@ say("PROBE DONE")
 '''
 
 CONFIGS = [
-    # the configuration that OOM'd, for reference
-    {"name": "fp32  whole-ckpt  b1", "amp": False, "chunks": 0, "batch": 1, "compile": False, "steps": 5},
-    {"name": "fp32  chunks8     b2", "amp": False, "chunks": 8, "batch": 2, "compile": False, "steps": 8},
-    {"name": "AMP   chunks8     b2", "amp": True, "chunks": 8, "batch": 2, "compile": False, "steps": 25,
-     "profile": True},
-    {"name": "AMP   chunks8     b4", "amp": True, "chunks": 8, "batch": 4, "compile": False, "steps": 12},
-    {"name": "AMP   chunks16    b4", "amp": True, "chunks": 16, "batch": 4, "compile": False, "steps": 8},
-    {"name": "AMP   chunks8     b2  compiled", "amp": True, "chunks": 8, "batch": 2, "compile": True,
-     "steps": 12},
+    # S3T-X (arch xca) against the plain detector, in the same session. All AMP
+    # with the loss in fp32, SDPA attention, fused AdamW.
+    {"name": "plain RT-DETR           b2", "s3t": False, "amp": True, "batch": 2, "compile": False,
+     "steps": 25},
+    {"name": "plain RT-DETR           b4", "s3t": False, "amp": True, "batch": 4, "compile": False,
+     "steps": 15},
+    {"name": "S3T-X eager  ckpt       b2", "arch": "xca", "amp": True, "batch": 2, "compile": False,
+     "ckpt": True, "steps": 25, "profile": True},
+    {"name": "S3T-X eager  no-ckpt    b2", "arch": "xca", "amp": True, "batch": 2, "compile": False,
+     "ckpt": False, "steps": 25},
+    {"name": "S3T-X compiled no-ckpt  b2", "arch": "xca", "amp": True, "batch": 2, "compile": True,
+     "ckpt": False, "steps": 25, "profile_ops": True},
+    {"name": "S3T-X compiled ckpt     b4", "arch": "xca", "amp": True, "batch": 4, "compile": True,
+     "ckpt": True, "steps": 15},
 ]
 
 
@@ -228,12 +239,13 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--slug", required=True)
     ap.add_argument("--out-dir", type=Path, default=REPO / "kernels" / "s3t_detr_probe" / "build")
-    ap.add_argument("--mae-kernel", default="qwyi123/hod26-s3t-mae-pretrain")
+    ap.add_argument("--mae-kernel", default="",
+                    help="a pretraining notebook to attach (only the band-token encoder needs one)")
     ap.add_argument("--mae-file", default=None)
     ap.add_argument("--imgsz", type=int, default=1024)
     ap.add_argument("--configs", default=None,
-                    help="JSON list replacing the default configurations (keys: name, amp, chunks, "
-                         "batch, compile, steps, [s3t], [scale], [profile])")
+                    help="JSON list replacing the default configurations (keys: name, amp, batch, "
+                         "compile, steps, [arch], [ckpt], [chunks], [s3t], [scale], [profile])")
     args = ap.parse_args()
     cand = s3t_candidate(total=2)
     src = build({"round": "probe", "candidates": [], "submit": {"candidate": cand}})
@@ -251,7 +263,7 @@ def main() -> None:
         "code_file": "s3t_detr_probe.py", "language": "python", "kernel_type": "script",
         "is_private": True, "enable_gpu": True, "machine_shape": "NvidiaTeslaT4",
         "enable_internet": True, "competition_sources": [], "dataset_sources": [],
-        "kernel_sources": [args.mae_kernel],
+        "kernel_sources": [args.mae_kernel] if args.mae_kernel else [],
     }, indent=2))
     print(f"wrote {args.out_dir / 's3t_detr_probe.py'}  slug={args.slug}")
 

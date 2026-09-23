@@ -175,6 +175,12 @@ class S3TMAE2(nn.Module):
         keep_px = keep_tok.view(b, 1, 1, gh, 1, gw, 1).expand(b, 1, 1, gh, s, gw, s)
         x_in = (x * keep_px.reshape(b, 1, 1, h, w)).masked_fill(bm[:, None, :, None, None], 0.0)
 
+        pred = self._predict(x_in, keep_tok, idx, bm, gh, gw)       # (B, S, C, s*s)
+        loss, parts = self._loss(pred, x, keep_tok, bm, gh, gw)
+        return loss, parts, pred, idx, bm
+
+    def _predict(self, x_in, keep_tok, idx, bm, gh, gw):
+        S = gh * gw
         t, _ = self.enc.tokens(x_in, idx, bm)                     # (B, Sv, C, D)
         pooled = self.enc.norm(self.enc.pool(t))
         z = self.proj(t) + self.proj_pool(pooled)[:, :, None, :]
@@ -182,7 +188,7 @@ class S3TMAE2(nn.Module):
         vis = keep_tok.bool()[:, :, None, None]
         z = torch.where(vis, dense, self.mask_token.to(dense.dtype)) + self.dec_pe
         # Global context: every position, visible or not, sees every other.
-        g = self.to_glob(z.mean(2)) + sincos_2d(gh, gw, self.glob_dim, x.device, z.dtype)
+        g = self.to_glob(z.mean(2)) + sincos_2d(gh, gw, self.glob_dim, x_in.device, z.dtype)
         for blk in self.glob:
             g = blk(g)
         z = z + self.from_glob(g)[:, :, None, :]
@@ -190,6 +196,10 @@ class S3TMAE2(nn.Module):
         z = self.spec(z)
         pred = self.head(self.dec_norm(z))                          # (B, S, C, s*s)
 
+        return pred
+
+    def _loss(self, pred, x, keep_tok, bm, gh, gw):
+        b, S, c = pred.shape[0], pred.shape[1], pred.shape[2]
         tgt = self.target(x)
         sd = tgt.std((2, 3), keepdim=True) + 0.05
         hole_s = (~keep_tok.bool())[:, :, None].expand(b, S, c)       # masked positions, all bands
@@ -211,7 +221,7 @@ class S3TMAE2(nn.Module):
             parts = {"norm_s": norm_s.detach(), "l1_s": l1_s.detach(), "norm_b": norm_b.detach(),
                      "l1_b": l1_b.detach(), "grad": grad.detach()}
             parts.update(self.references(pred.detach(), tgt, keep_tok, bm, hole_s, hole_b, gh, gw))
-        return loss, parts, pred, idx, bm
+        return loss, parts
 
     @torch.no_grad()
     def references(self, pred, tgt, keep_tok, bm, hole_s, hole_b, gh, gw):

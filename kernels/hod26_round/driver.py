@@ -497,7 +497,12 @@ if _nn is not None:
             self.block = block
 
         def forward(self, x):
-            return self.block(self.front(x))
+            y = self.block(self.front(x))
+            # S3T-X joins the stem's output (both at stride 4); the older
+            # fronts have already joined at its input.
+            fuse = getattr(self.front, "fuse_stem", None)
+            return y if fuse is None else fuse(y)
+
     class SDPAMultiheadAttention(_nn.MultiheadAttention):
         """nn.MultiheadAttention that never asks for the attention weights.
 
@@ -742,32 +747,46 @@ def find_mae_checkpoint(name=None):
 def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5,
                       inject=(19, 14, 10), dim=64, depth=4, heads=4, widen=True,
                       context=True, ctx_layer=11, ckpt_chunks=8, compile_blocks=False,
-                      fast_kernels=False, train_encoder=True, **_):
+                      fast_kernels=False, train_encoder=True, arch="tokens", grad_ckpt=True,
+                      windows=(16, 16, None, None), **_):
     """S3T encoder in front of the pretrained first block, plus side injections.
 
-    The encoder is loaded from the MAE checkpoint when one is given. inject
-    names the hybrid encoder's input projections (P3, P4, P5 in rtdetr-l); each
-    gets the pooled spectral features through a zero-initialised 1x1 conv.
+    The encoder is loaded from the MAE checkpoint when one is given; its config
+    decides the architecture (arch "xca": S3T-X, fused at the stem's output;
+    "tokens": the band-token encoder, joined at the stem's widened input).
+    inject names the hybrid encoder's input projections (P3, P4, P5 in
+    rtdetr-l); each gets the spectral features through a zero-initialised 1x1.
     """
     import torch
 
     block = net.model[0]
     if isinstance(block, SpectralFront):
         return False                      # already installed (resumed model)
-    cfg = {"dim": dim, "depth": depth, "heads": heads}
+    cfg = {"arch": arch, "dim": dim, "depth": depth, "heads": heads, "windows": list(windows)}
     state = None
     if mae_ckpt:
         ck = torch.load(mae_ckpt, map_location="cpu", weights_only=True)
         cfg.update(ck.get("config") or {})
+        if cfg.get("arch", "tokens") != arch:
+            raise RuntimeError(f"MAE checkpoint {mae_ckpt} is arch={cfg.get('arch', 'tokens')!r}, "
+                               f"the run asks for arch={arch!r}")
         state = ck["encoder"]
-    enc = SpectralEncoder(dim=cfg["dim"], depth=cfg["depth"], heads=cfg["heads"])
+    enc = build_encoder(cfg)
     if state is not None:
-        missing, unexpected = enc.load_state_dict(state, strict=True), None
+        enc.load_state_dict(state, strict=True)
         log(f"  S3T encoder: MAE weights from {mae_ckpt} (step {ck.get('step')})")
     else:
         log("  S3T encoder: NO pretrained weights -- random initialisation")
-    front = S3TFront(enc, projection=projection, scale=scale, widen=widen,
-                     ckpt_chunks=ckpt_chunks, fast_kernels=fast_kernels, train_encoder=train_encoder)
+    xca = cfg.get("arch") == "xca"
+    if xca:
+        stem_ch = [m for m in block.modules() if isinstance(m, torch.nn.Conv2d)][-1].out_channels
+        front = S3TXFront(enc, projection=projection, scale=scale, grad_ckpt=grad_ckpt,
+                          stem_ch=stem_ch, train_encoder=train_encoder)
+        widen = False
+    else:
+        front = S3TFront(enc, projection=projection, scale=scale, widen=widen,
+                         ckpt_chunks=ckpt_chunks, fast_kernels=fast_kernels,
+                         train_encoder=train_encoder)
     if compile_blocks:
         # Fuse each block's LayerNorm/GELU/residual chains (nn.Module.compile,
         # in place, so DDP and pickling see ordinary modules). No fallback: a
@@ -775,7 +794,7 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
         from torch import nn as _tnn
         n_c = 0
         for m in enc.modules():
-            if type(m).__name__ in ("SpectralBlock", "SpatialMix", "SpectralPool"):
+            if type(m).__name__ in ("SpectralBlock", "SpatialMix", "SpectralPool", "XCABlock"):
                 m.compile()
                 n_c += 1
         log(f"  S3T blocks compiled in place: {n_c}")
@@ -808,6 +827,15 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
     net.__dict__["_hod26_mixer"] = front.base
     net.__dict__["_hod26_mixer_init"] = front.base.weight.detach().clone()
     n_enc = sum(p.numel() for p in enc.parameters())
+    if xca:
+        log(f"  S3T-X: cross-covariance attention, windows {enc.windows}, channels_last; "
+            f"{'per-block checkpoints' if grad_ckpt else 'no checkpoints'}; encoder "
+            f"{'trained' if train_encoder else 'FROZEN (feature extractor)'}")
+        log(f"  S3T-X front: {n_enc / 1e6:.2f}M-param encoder at {scale}x input scale, "
+            f"stride-4 output joined to {type(block).__name__}'s {front.fuse.out_channels}-ch output "
+            f"(zero-init 1x1); learned pyramid -> zero-init injections at layers {list(inject)}"
+            + (f"; P3/P4 read AIFI's global context (layer {ctx_layer}, {ctx_ch}-d)" if context else ""))
+        return True
     log(f"  S3T memory: per-layer checkpoints, per-position layers in {ckpt_chunks} chunks"
         if ckpt_chunks else "  S3T memory: one checkpoint around the whole encoder")
     log(f"  S3T kernels: {'16-token attention as batched matmul, depthwise conv channels_last' if fast_kernels else 'SDPA attention, NCHW depthwise conv'}; "
