@@ -207,42 +207,36 @@ def main():
     if cuda:
         # Largest per-GPU batch that fits, halving from --batch on OOM, agreed
         # across ranks. A wrong guess used to kill the whole session at step 1.
-        # Probe through torch.compile when it is on: the compiled graph fuses
-        # the elementwise chains and needed a quarter of eager's memory in the
-        # smoke run (3.6 GB vs 13.8 GB at 8 crops), so an eager probe would
-        # shrink the batch for nothing.
-        probe = model
-        if args.compile:
-            try:
-                probe = torch.compile(model)
-            except Exception as e:                               # noqa: BLE001
-                log(f"memory probe: compile unavailable, probing eager ({e})")
+        # Eager probe. It overestimates what the compiled step needs (the
+        # compiled graph fuses elementwise chains), so the batch it picks is safe
+        # for both -- and it is what the eager fallback below will actually use.
+        # Probing through torch.compile was tried and tripped a guard when the
+        # DDP-wrapped model was compiled a second time.
+        import gc
         bs = args.batch
         while True:
+            ok = True
             try:
                 torch.cuda.reset_peak_memory_stats(device)
                 xp = torch.randn(bs, 3, 16, args.crop, args.crop, device=device)
                 with torch.autocast("cuda", dtype=amp_dtype):
-                    lp, *_ = probe(xp)
+                    lp, *_ = model(xp)
                 lp.backward()
-                peak = torch.cuda.max_memory_allocated(device) / 2**30
-                fits = peak < 0.75 * torch.cuda.get_device_properties(device).total_memory / 2**30
             except torch.OutOfMemoryError:
-                fits, peak = False, float("nan")
-            except Exception as e:                               # noqa: BLE001
-                if probe is model:
-                    raise
-                log(f"memory probe: compiled probe failed ({type(e).__name__}), probing eager")
-                probe = model
-                continue
+                ok = False
+            # Outside the except block, so the traceback (and every tensor its
+            # frames hold) is gone before the peak is read and the cache emptied.
+            peak = torch.cuda.max_memory_allocated(device) / 2**30
             model.zero_grad(set_to_none=True)
             xp = lp = None
+            gc.collect()
             torch.cuda.empty_cache()
-            log(f"memory probe ({'compiled' if probe is not model else 'eager'}): {bs} crops/GPU "
-                f"-> peak {peak:.2f} GB {'fits' if fits else 'too big'}")
+            fits = ok and peak < 0.75 * torch.cuda.get_device_properties(device).total_memory / 2**30
+            log(f"memory probe (eager): {bs} crops/GPU -> peak {peak:.2f} GB "
+                f"{'fits' if fits else 'too big'}")
             if fits or bs <= args.crops_per_frame:
                 break
-            bs //= 2
+            bs = max(args.crops_per_frame, (bs // 2) // args.crops_per_frame * args.crops_per_frame)
         t = torch.tensor([bs], device=device)
         if WORLD > 1:
             dist.all_reduce(t, op=dist.ReduceOp.MIN)
@@ -255,7 +249,6 @@ def main():
                 drop_last=True, prefetch_factor=4 if args.workers > 0 else None)
             log(f"batch reduced to {frames_per_step * args.crops_per_frame} crops/GPU/step")
         report["batch_per_gpu"] = frames_per_step * args.crops_per_frame
-        probe = None
         torch.cuda.reset_peak_memory_stats(device)
 
     net = model
@@ -308,21 +301,30 @@ def main():
             for g in opt.param_groups:
                 g["lr"] = lr_at(step)
             t_step = time.time()
+            failed = None
             try:
                 with torch.autocast(device.type, dtype=amp_dtype, enabled=cuda):
                     loss, parts, *_ = run(xb)
                 scaler.scale(loss).backward()
             except Exception as e:                               # noqa: BLE001
-                if compiled and step == 0:
-                    log(f"torch.compile: failed on first step, falling back to eager "
-                        f"({type(e).__name__}: {str(e).splitlines()[0][:160]})")
-                    run, compiled = net, False
-                    opt.zero_grad(set_to_none=True)
-                    with torch.autocast(device.type, dtype=amp_dtype, enabled=cuda):
-                        loss, parts, *_ = run(xb)
-                    scaler.scale(loss).backward()
-                else:
+                if not (compiled and step == 0):
                     raise
+                failed = f"{type(e).__name__}: {str(e).splitlines()[0][:160]}"
+            if failed:
+                # Retried outside the except block: inside it the traceback
+                # keeps the failed attempt's activations alive, and the eager
+                # retry then ran out of memory on top of them.
+                import gc
+                log(f"torch.compile: failed on first step, falling back to eager ({failed})")
+                run, compiled = net, False
+                loss = parts = None
+                opt.zero_grad(set_to_none=True)
+                gc.collect()
+                if cuda:
+                    torch.cuda.empty_cache()
+                with torch.autocast(device.type, dtype=amp_dtype, enabled=cuda):
+                    loss, parts, *_ = run(xb)
+                scaler.scale(loss).backward()
             scaler.unscale_(opt)
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt)

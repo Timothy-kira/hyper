@@ -47,7 +47,9 @@ class SpectralAttention(nn.Module):
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         n, c, d = t.shape
         q, k, v = self.qkv(t).view(n, c, 3, self.heads, self.hd).permute(2, 0, 3, 1, 4)
-        o = F.scaled_dot_product_attention(q, k, v)
+        # Contiguous on purpose: inductor's SDPA lowering asserted on the strided
+        # views (stride 96 where it traced 32) in the first 2xT4 pretrain.
+        o = F.scaled_dot_product_attention(q.contiguous(), k.contiguous(), v.contiguous())
         return self.proj(o.transpose(1, 2).reshape(n, c, d))
 
 
