@@ -303,18 +303,29 @@ class S3TXFront(nn.Module):
         return state
 
     def _encode(self, x):
-        level = x * LEVEL_SPAN + LEVEL_LO
+        # Features in fp32 whatever the model's dtype: the ring means and the
+        # per-band statistics are sums over many pixels.
+        level = x.float() * LEVEL_SPAN + LEVEL_LO
         if self.scale != 1.0:
             level = F.interpolate(level, scale_factor=self.scale, mode="bilinear",
                                   align_corners=False, antialias=True)
         feats = observed_features(level)
-        with torch.autocast("cuda", dtype=torch.float16, enabled=self.amp and x.is_cuda):
+        wdt = self.fuse.weight.dtype
+        amp = self.amp and x.is_cuda
+        if not amp:
+            feats = feats.to(wdt)
+        # Under autocast the encoder's LayerNorms, normalisations and softmaxes
+        # run in fp32 even in an fp16 model (ultralytics validates and predicts
+        # with model.half()), so the output can come back fp32: hand it on in
+        # the dtype of the layers that consume it.
+        with torch.autocast("cuda", dtype=torch.float16, enabled=amp):
             if not self.train_encoder:
                 with torch.no_grad():
                     f = self.enc(feats)
             else:
                 f = self.enc(feats)
-            return f, self.pyramid(f)
+            pyr = self.pyramid(f.to(wdt) if not amp else f)
+        return f.to(wdt), [p_.to(wdt) for p_ in pyr]
 
     def side_at(self, size):
         pyr = self.__dict__.get("_pyr")
@@ -335,8 +346,8 @@ class S3TXFront(nn.Module):
         if f is None:
             return y
         if f.shape[-2:] != y.shape[-2:]:
-            f = F.interpolate(f, size=y.shape[-2:], mode="bilinear", align_corners=False)
-        return y + self.fuse(f).to(y.dtype)
+            f = F.interpolate(f.float(), size=y.shape[-2:], mode="bilinear", align_corners=False)
+        return y + self.fuse(f.to(self.fuse.weight.dtype)).to(y.dtype)
 
     def forward(self, x):
         f, pyr = self._encode(x)

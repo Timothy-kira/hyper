@@ -278,6 +278,22 @@ def detector_checks(enc):
             rt = str(e)[:200]
         check("weights load into a freshly built S3T-X model", rt is True, str(rt))
 
+        # ultralytics validates and predicts with model.half(); CPU has no fp16
+        # antialiased resize, so bf16 stands in: any fp32 tensor meeting a
+        # low-precision layer outside autocast fails the same way.
+        net5 = RTDETRDetectionModel("rtdetr-l.yaml", ch=3, nc=18, verbose=False)
+        m.install_bbox_loss(net5, 18, "GIoU", log_size=True, fdr=True, mal=True)
+        m.install_spectral_adapter(net5, 16, projection=m.LDA_16_TO_3, kind="s3t", mae_ckpt=str(ck),
+                                   scale=0.5, arch="xca")
+        net5 = net5.to(torch.bfloat16).eval()
+        try:
+            with torch.no_grad():
+                net5(torch.rand(1, 16, 128, 160).to(torch.bfloat16))
+            lowp = True
+        except Exception as e:                  # noqa: BLE001
+            lowp = f"{type(e).__name__}: {str(e)[:200]}"
+        check("low-precision model (validation / predict path) runs end to end", lowp is True, str(lowp))
+
         # The DDP path: ultralytics builds the model in the parent and hands each
         # worker a cloudpickled copy. Compilation does not survive that and
         # cudnn.benchmark is per process; ensure_accel, run in the worker's
