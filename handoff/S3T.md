@@ -13,7 +13,8 @@
 | 速度探针（T4，1024²，真实 loss） | **完成**，S3T-X 通过，见下 | `zetaoxia/hod26-s3t-detr-probe` v5–v7 |
 | MAE v3 预训练（S3T-X，修掉特征泄漏） | **完成**：6358 步，90.6 分钟，6 项检查全部 PASS | 公开 notebook `zetaoxia/hod26-s3t-mae-pretrain3`，输出 `s3t_mae/pretrain3_mae.pt` |
 | 检测：S3T-X 前端 + D-FINE + MAL + 数据增强 | **代码完成**，CPU 上端到端跑通（渲染 → 训练 → 保存 best/last → 重载 → submission.csv） | `tools/s3t_round.py` 生成 `handoff/s3t/hod26_round.py` |
-| 正式检测训练 | **运行中**：11:28 UTC 开始，从 COCO 训练 45 epoch，预计约 9.2 小时 | `zetaoxia/hod26-s3t-detr` v2 |
+| 全流程冒烟（smoke_only） | **通过**（14:45）：0.682 s/it，加速全开，训练 / 验证 / best+last / fp16 验证 / 预测 / submission 全部走通，用时 217 秒 | `zetaoxia/hod26-s3t-detr` |
+| 正式检测训练 | **运行中**：约 14:50 UTC 开始，从 COCO 训练 40 epoch（约 15 分钟一个），预计约 10 小时 | `zetaoxia/hod26-s3t-detr` |
 
 旧的 band-token 编码器（MAE v1/v2）已经停用。v2 那一轮是按用户要求中途删除的，原因见"为什么换成 S3T-X"。
 
@@ -166,6 +167,8 @@ ultralytics 的 `runs/` 目录在 scratch 盘上，session 结束不会保存，
 - **数据加载提速**：mosaic 画布改为每个加载进程复用一块缓冲区，不再每个样本新分配 67 MB。单核每个样本从 173 ms 降到 106 ms，输出逐字节一致。加速表里有这一行。
 - 每个 epoch 的日志多了两张卡的 GPU 利用率，用来判断瓶颈在 GPU 还是数据加载。
 
+**额度**：`kaggle quota` 显示每个账号每周 30 小时。不要用 SDK 的 `to_json()` 去读额度：timedelta 序列化时会丢掉"天"，30 小时会显示成 21600s。
+
 ## 你要做的（等 MAE v3 跑完）
 
 1. **检查额度**：约 11–12 小时 GPU。
@@ -232,7 +235,7 @@ MAE 预训练**不做**任何增强：只用官方的 4000 帧原图裁块。验
 | 时间（UTC） | 内容 |
 | --- | --- |
 | 09:54 – 11:26 | MAE v3 预训练（90.6 分钟，公开 notebook）✅ |
-| 11:28 – 约 21:00 | 检测训练 45 epoch（时钟保护会在超时前停下，并保存 best/last） |
+| 14:50 – 约 01:00 | 检测训练 40 epoch（开头先冒烟约 4 分钟；时钟保护会在超时前停下，并保存 best/last） |
 | 之后 | 同一个 session 里预测测试集，写 `submission.csv` |
 
 还有余量：如果第一轮结束后时间和额度都够，可以挂上 `final_last.pt` 再续一轮。
