@@ -20,3 +20,4 @@ work/
 kernels/s3t_smoke/build/
 kernels/s3t_pretrain/build/
 kernels/s3t_detr/build/
+kernels/s3t_pretrain2/build/

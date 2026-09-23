@@ -26,6 +26,7 @@ SOURCES = [
     "src/hod26/s3t/preprocess.py",
     "src/hod26/s3t/spectral.py",
     "src/hod26/s3t/mae.py",
+    "src/hod26/s3t/mae2.py",
     "tools/train_s3t_mae.py",
 ]
 
@@ -94,7 +95,7 @@ if MODE == "smoke":
     rc_b, b = variants.get(best, (1, None))
 else:
     rc_a, a = 0, {}
-    TAG = "pretrain"
+    TAG = PRETRAIN_TAG
     rc_b, b = run(TAG, 2, CONFIG + ["--minutes", str(DUAL_MINUTES), "--workers", W2,
                                     "--schedule", "time", "--save-every-min", "10"])
 say("=" * 70)
@@ -149,6 +150,10 @@ def main() -> None:
                     help="smoke: minutes per dual-GPU variant (eager / fused / graphs)")
     ap.add_argument("--mode", choices=["smoke", "pretrain"], default="smoke",
                     help="pretrain: the dual-GPU run only, time-budgeted cosine, periodic saves")
+    ap.add_argument("--tag", default="pretrain",
+                    help="pretrain: output is <tag>_mae.pt; give v2 its own name (pretrain2)")
+    ap.add_argument("--kernel-source", action="append", default=[],
+                    help="a notebook whose output is mounted, e.g. the v1 pretrain to continue from")
     ap.add_argument("--public", action="store_true",
                     help="publish the kernel (and so its output checkpoint) instead of private")
     ap.add_argument("--config", default="--batch 32 --crops-per-frame 8 --crop 128 "
@@ -159,6 +164,7 @@ def main() -> None:
             f"CONFIG = {json.dumps(args.config.split())}\n"
             f"DUAL_MINUTES = {args.dual_minutes}\n"
             f"MODE = {args.mode!r}\n"
+            f"PRETRAIN_TAG = {args.tag!r}\n"
             f"VARIANT_MINUTES = {args.variant_minutes}\n")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "s3t_smoke.py").write_text(head + BODY)
@@ -167,7 +173,7 @@ def main() -> None:
         "code_file": "s3t_smoke.py", "language": "python", "kernel_type": "script",
         "is_private": not args.public, "enable_gpu": True, "machine_shape": "NvidiaTeslaT4x2",
         "enable_internet": True, "competition_sources": [],
-        "dataset_sources": [args.dataset], "kernel_sources": [],
+        "dataset_sources": [args.dataset], "kernel_sources": list(args.kernel_source),
     }, indent=2))
     print(f"wrote {args.out_dir / 's3t_smoke.py'}  slug={args.slug}")
 
