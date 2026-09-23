@@ -98,6 +98,46 @@ def attention_kernels(net, batch, amp):
     return names
 
 
+def top_ops(net, batch, amp, n=30):
+    """Where one training step's GPU time goes: ops by self CUDA time, plus
+    the S3T front's share measured with record_function ranges."""
+    from torch.profiler import ProfilerActivity, profile, record_function
+    front = net.model[0]
+    orig = front.forward
+
+    def timed(x):
+        with record_function("S3T_FRONT_FWD"):
+            return orig(x)
+
+    front.forward = timed
+    try:
+        for _ in range(2):                                  # warm (compile, cudnn autotune)
+            with torch.autocast(dev.type, dtype=torch.float16, enabled=amp and CUDA):
+                l, _ = net.loss(batch)
+            l.sum().backward()
+        sync()
+        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+            with torch.autocast(dev.type, dtype=torch.float16, enabled=amp and CUDA):
+                l, _ = net.loss(batch)
+            l.sum().backward()
+            sync()
+    finally:
+        front.forward = orig
+    ka = prof.key_averages()
+    attr = "self_device_time_total" if hasattr(ka[0], "self_device_time_total") else "self_cuda_time_total"
+    tot = sum(getattr(e, attr) for e in ka) or 1
+    rows = sorted(ka, key=lambda e: getattr(e, attr), reverse=True)[:n]
+    out = [(e.key[:70], round(getattr(e, attr) / 1e3, 1), round(100 * getattr(e, attr) / tot, 1), e.count)
+           for e in rows]
+    say("   top GPU ops (self ms, % of step, calls):")
+    for k, ms, pct, c in out:
+        say(f"     {ms:8.1f} ms  {pct:5.1f}%  x{c:<5d} {k}")
+    fr = [e for e in ka if e.key == "S3T_FRONT_FWD"]
+    if fr:
+        say(f"   S3T front forward range: {getattr(fr[0], 'device_time_total', 0) / 1e3:.1f} ms GPU")
+    return out
+
+
 def run(cfg):
     name = cfg["name"]
     if CUDA:
@@ -136,6 +176,8 @@ def run(cfg):
                    final_scale=scales[-1], min_scale=min(scales))
         if cfg.get("profile"):
             rec["attention_kernels"] = attention_kernels(net, fake_batch(cfg["batch"], g, ch), cfg["amp"])
+        if cfg.get("profile_ops"):
+            rec["top_ops"] = top_ops(net, fake_batch(cfg["batch"], g, ch), cfg["amp"])
     except torch.OutOfMemoryError as e:
         rec.update(ok=False, error="OOM", peak_gb=peak())
     except Exception as e:                                        # noqa: BLE001
