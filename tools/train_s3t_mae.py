@@ -195,6 +195,42 @@ def main():
         log(f"optimizer: AdamW fused=off ({e})")
     scaler = torch.amp.GradScaler("cuda", enabled=cuda and amp_dtype == torch.float16)
 
+    if cuda:
+        # Largest per-GPU batch that fits, halving from --batch on OOM, agreed
+        # across ranks. A wrong guess used to kill the whole session at step 1.
+        bs = args.batch
+        while True:
+            try:
+                torch.cuda.reset_peak_memory_stats(device)
+                xp = torch.randn(bs, 3, 16, args.crop, args.crop, device=device)
+                with torch.autocast("cuda", dtype=amp_dtype):
+                    lp, *_ = model(xp)
+                lp.backward()
+                peak = torch.cuda.max_memory_allocated(device) / 2**30
+                fits = peak < 0.75 * torch.cuda.get_device_properties(device).total_memory / 2**30
+            except torch.OutOfMemoryError:
+                fits, peak = False, float("nan")
+            model.zero_grad(set_to_none=True)
+            xp = lp = None
+            torch.cuda.empty_cache()
+            log(f"memory probe: {bs} crops/GPU -> peak {peak:.2f} GB {'fits' if fits else 'too big'}")
+            if fits or bs <= args.crops_per_frame:
+                break
+            bs //= 2
+        t = torch.tensor([bs], device=device)
+        if WORLD > 1:
+            dist.all_reduce(t, op=dist.ReduceOp.MIN)
+        bs = int(t.item())
+        if bs != args.batch:
+            frames_per_step = max(1, bs // args.crops_per_frame)
+            dl = torch.utils.data.DataLoader(
+                ds, batch_size=frames_per_step, sampler=sampler, shuffle=sampler is None,
+                num_workers=args.workers, pin_memory=cuda, persistent_workers=args.workers > 0,
+                drop_last=True, prefetch_factor=4 if args.workers > 0 else None)
+            log(f"batch reduced to {frames_per_step * args.crops_per_frame} crops/GPU/step")
+        report["batch_per_gpu"] = frames_per_step * args.crops_per_frame
+        torch.cuda.reset_peak_memory_stats(device)
+
     net = model
     if WORLD > 1:
         net = torch.nn.parallel.DistributedDataParallel(

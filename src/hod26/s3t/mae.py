@@ -51,7 +51,7 @@ def band_mask(b: int, ratio: float, device, n_bands: int = N_BANDS, generator=No
 
 class S3TMAE(nn.Module):
     def __init__(self, encoder: SpectralEncoder | None = None, dec_dim: int = 32,
-                 dec_depth: int = 2, unit: int = 4, mask_ratio: float = 0.75,
+                 dec_depth: int = 1, unit: int = 4, mask_ratio: float = 0.75,
                  band_ratio: float = 0.15, w_l1: float = 0.5, w_grad: float = 0.5):
         super().__init__()
         self.enc = encoder or SpectralEncoder()
@@ -66,7 +66,9 @@ class S3TMAE(nn.Module):
         nn.init.trunc_normal_(self.mask_token, std=0.02)
         blocks = []
         for _ in range(dec_depth):
-            blocks += [SpatialMix(dec_dim), SpectralBlock(dec_dim, heads=2)]
+            # mlp=2: the decoder runs on every position (4x the encoder's), so it
+            # is where activation memory goes; it is thrown away after pretraining.
+            blocks += [SpatialMix(dec_dim), SpectralBlock(dec_dim, heads=2, mlp=2)]
         self.dec = nn.ModuleList(blocks)
         self.dec_norm = nn.LayerNorm(dec_dim)
         self.head = nn.Linear(dec_dim, s * s)          # the level of each pixel in the token

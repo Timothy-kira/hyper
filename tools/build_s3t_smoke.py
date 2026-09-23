@@ -62,7 +62,8 @@ def run(tag, nproc, extra):
            "--standalone", str(CODE / "tools" / "train_s3t_mae.py"),
            "--out", str(OUT), "--tag", tag] + extra
     say(f"launch {tag}: {' '.join(cmd[3:])}")
-    env = dict(os.environ, OMP_NUM_THREADS="1", PYTHONUNBUFFERED="1")
+    env = dict(os.environ, OMP_NUM_THREADS="1", PYTHONUNBUFFERED="1",
+               PYTORCH_ALLOC_CONF="expandable_segments:True")
     rc = subprocess.run(cmd, env=env).returncode
     rep = OUT / f"{tag}_report.json"
     return rc, (json.loads(rep.read_text()) if rep.exists() else None)
