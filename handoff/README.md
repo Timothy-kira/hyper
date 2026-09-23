@@ -27,14 +27,10 @@ handoff buys. **Do not expect this run to move the score much on its own.**
 
 A follow-up twelve-epoch fine-tune from that same epoch-40 checkpoint, with
 four loss/sampling changes aimed at a diagnosed bottleneck (see below), landed
-at **0.62994** — +0.0004 over the plain epoch-40 result, inside the noise
-floor. Worth stating plainly: **the four classes the changes targeted moved
-net *negative*** (stone_block +0.001, people −0.009, e-bike +0.021, car
-−0.025 — sum −0.013), while the macro number moved up by noise in classes
-that were not the target. Twelve epochs at a low, near-finished learning rate
-did not show the intended effect on the classes it was aimed at. That is a
-real result, not a null one — it says this combination, at this length and
-this point in the schedule, is not the fix, not that the diagnosis is wrong.
+at **0.62994** — a new team best, +0.0004 over the plain epoch-40 result.
+Its held-out score (pycocotools, repo code) was 0.69528 against epoch 40's
+0.6943. Both gains are inside the noise floor, so it is not proven to help —
+but **it did not lower anything**: leaderboard and held-out both moved up.
 
 **The diagnostic behind that fine-tune is solid, even though the fine-tune's
 result is not.** A CPU-only error decomposition (`handoff/DIAGNOSIS.md`, no
@@ -46,15 +42,18 @@ rare, not small. More epochs of the plain recipe will not fix that; a
 different loss shape or more of those classes' frames might. Read
 `handoff/DIAGNOSIS.md` before trying anything past a plain resume.
 
-**Two things were tried after the fine-tune and should not be repeated
-blind.** A test-time-augmentation (hflip) + weighted-box-fusion pass raised
-the *held-out* score (0.6956) but **collapsed the leaderboard score to
-0.58168** — held-out and leaderboard disagreeing in opposite directions like
-that means a bug in the TTA/merge path for the real test set, not a real
-capability loss; it was not resolved before quota ran out. Separately, an
-attempt to add a spectral contrastive loss for the three hardest classes
-(never merged into this repo) crashed at its first validation with a loss-key
-mismatch, after burning real training epochs. Neither is in the script below.
+**The 0.58168 on the submission list is not from this pipeline.** After the
+fine-tune, an experimental branch (`hod26-supcon`: a spectral contrastive loss
+for the three hardest classes, a new `bg_residual` channel mode, hard-class
+SMOTE — never merged into this repo) was built, and the prediction kernel that
+produced submission 56460799 was built from *that* branch's driver, with
+TTA (`id`+`hflip`, WBF `iou=0.65`) on top. It scored **0.58168**. Which part
+of that branch did the damage — TTA/WBF, `bg_residual`, or something else it
+changed — was not isolated before quota ran out; what is certain is that none
+of it is in the script below, and the committed changes are not implicated.
+The supcon training run itself also crashed at its first validation with a
+loss-key mismatch after burning real training time. Do not reuse either
+without starting from a plain traceback on one card.
 
 **Why this needs a fresh account.** The account that ran epoch 22 → 40 and
 the follow-up fine-tune has 1.71 of its 30 GPU-hours left, and Kaggle's weekly

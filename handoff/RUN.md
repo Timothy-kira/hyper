@@ -238,73 +238,55 @@ egg_wood x1.4, e-bike x1.3` — the rarity lever landed on the right class.
 `fit done at epoch 52/52; holdout mAP=0.6953` — `best.pt`'s own number, this
 time honestly this run's own best epoch rather than an inherited one.
 
-### The submission and what it actually moved
+### The submission
 
 Scored separately with pycocotools (`tools/predict_from_run.py --weights
-final_best.pt`, no TTA): **held-out mAP 0.6956**, submitted as "hod26-combo
-final_best.pt epoch52 holdout0.69528" → **leaderboard 0.62994**, a new team
-best, +0.0004 over session 5's 0.62954.
+final_best.pt`, repo code, no TTA): **held-out mAP 0.69528**, submitted as
+"hod26-combo final_best.pt epoch52 holdout0.69528" → **leaderboard 0.62994**,
+a new team best.
 
-Per-class, against epoch 40:
+| | held-out (pycocotools) | leaderboard |
+| --- | --- | --- |
+| session 5, epoch 40 | 0.6943 | 0.62954 |
+| **session 6, epoch 52, four levers** | **0.69528** | **0.62994** |
 
-| class | epoch 40 | epoch 52 | delta |
-| --- | --- | --- | --- |
-| stone_block | 0.3221 | 0.3233 | +0.0012 |
-| people | 0.4150 | 0.4062 | **-0.0088** |
-| e-bike | 0.4492 | 0.4697 | +0.0205 |
-| car | 0.5895 | 0.5641 | **-0.0254** |
-| table_tennis | 0.7188 | 0.7151 | -0.0037 |
-| orange | 0.7124 | 0.7261 | +0.0137 |
-| car_toy | 0.7508 | 0.7514 | +0.0006 |
-| badminton | 0.7638 | 0.7541 | -0.0097 |
-| charger_head | 0.7645 | 0.7584 | -0.0061 |
-| banana | 0.7575 | 0.7612 | +0.0037 |
-| rubik | 0.7655 | 0.7657 | +0.0002 |
-| egg_wood | 0.7810 | 0.7717 | -0.0093 |
-| egg | 0.7842 | 0.7832 | -0.0010 |
-| orange_plastic | 0.7700 | 0.7852 | +0.0152 |
-| apple | 0.7797 | 0.7895 | +0.0098 |
-| banana_plastic | 0.7915 | 0.7940 | +0.0025 |
-| egg_plastic | 0.8024 | 0.8007 | -0.0017 |
-| apple_plastic | 0.7790 | 0.8013 | +0.0223 |
+Both moved up, both inside the noise floor (0.0017 held-out, ~0.001
+leaderboard). So: not proven to help, and **did not lower the score**.
 
-**The four classes the run was aimed at (stone_block, people, e-bike, car)
-moved net -0.0125** — worse, not better, as a group. `e-bike` improved
-(+0.0205), `car` got markedly worse (-0.0254), and the other two barely
-moved. The classes that moved most, in either direction, were mostly
-untargeted ones already at 0.71-0.80 (`apple_plastic` +0.0223, `orange_plastic`
-+0.0152, `car` -0.0254) — consistent with per-class noise on a 600-frame
-holdout (car has 126 instances, apple_plastic 86; a handful of boxes crossing
-an IoU threshold moves AP by several points at that count) rather than with
-the loss changes doing what they were aimed at.
+No clean per-class breakdown of this run exists. An earlier version of this
+file had one, showing the four targeted classes moving net -0.0125 — that
+table was wrong to include. It came from `kaggle kernels output
+qwyi123/hod26-predict/2`, which silently returned the *latest* version (v3,
+the supcon-branch TTA kernel) rather than v2; its log contains the TTA lines,
+and v3's held-out is 0.6956, not v2's 0.69528. Those per-class numbers are the
+supcon branch's pipeline, not this run's, and say nothing about the four
+levers.
 
-**Read this as: twelve epochs of this combination, at a learning rate already
-down to 2.9e-5 to 1.17e-4, did not show the intended effect.** It does not
-mean the diagnosis (`DIAGNOSIS.md`) is wrong — 98.3%/99.9% found/classified
-and a 0.8697 median matched IoU concentrated in four elongated/rare classes is
-a direct measurement, not a guess. It means this specific fix, at this length,
-starting this late in a cosine schedule, did not move those classes. A retry
-with more epochs, a higher reopened learning rate, or the four levers
-isolated one at a time (rather than combined, which was a deliberate
-one-shot trade for a single submission) would tell you which of them, if any,
-is doing something.
+**Tooling note:** `kaggle kernels output <owner>/<slug>/<version>` does not
+reliably fetch that version — check the downloaded log before trusting it.
+`kaggle kernels pull` with a version suffix returns nothing at all.
+
+The epoch-by-epoch numbers above come from this run's own training log, so
+they are unaffected: 0.690-0.696 throughout, flat, no decline.
 
 ## What happened after session 6 (not in this repo, not committed)
 
 Two more things were tried on the `qwyi123` account before quota ran out.
 Neither is in this codebase, and neither should be repeated without more care.
 
-**Test-time augmentation.** `hod26-predict` v3 added TTA (`id`, `hflip`
-views, WBF merge at `iou=0.65`) on top of session 6's `final_best.pt`. The
-held-out score with TTA was 0.6956 -- *the same or fractionally higher* than
-the non-TTA scoring of the same checkpoint. The submission scored
-**0.58168** -- a 0.048 collapse. Held-out going up while the leaderboard
-collapses means the TTA/WBF merge path does something different on the real
-1000-frame test set than it does on the held-out 600 -- a bug in that path,
-most likely in how the WBF box coordinates are rescaled back for the test
-image sizes, not evidence that TTA itself hurts here. **Do not resubmit
-anything from a TTA/WBF path on this pipeline without finding that bug
-first.**
+**The 0.58168 submission.** `hod26-predict` v3 was built from the
+`hod26-supcon` branch's driver — its source contains `bg_residual` (9
+occurrences), `speccon` (23), `SupCon`, `smote_alpha_hard`; the repo's
+generated kernel contains none of them — and added TTA (`id`, `hflip`, WBF
+`iou=0.65`) to predict session 6's `final_best.pt`. It scored **0.58168**, a
+0.048 drop from the same checkpoint's 0.62994.
+
+The held-out 0.6956 in its log does not help locate the cause: it is scored
+*before* the TTA step, without TTA, so it measures that branch's
+preprocessing, not TTA. What is established is only that the drop came from
+the supcon-branch prediction code; whether TTA/WBF, `bg_residual`, or another
+change in that branch is responsible was not isolated. **Nothing from that
+kernel is in this repo, and no committed change is implicated.**
 
 **A spectral supervised-contrastive loss.** A from-scratch addition (kernel
 `hod26-supcon`, never merged into this repo) attached an InfoNCE contrastive
