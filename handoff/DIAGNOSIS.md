@@ -109,3 +109,125 @@ All three knobs exist and are flags; none has ever run at full scale.
 If those four classes reached the 90% tight the other fourteen already manage,
 their AP would go from 0.32-0.59 to roughly 0.75 — **about +0.045 macro**, which
 is the distance to the top of the leaderboard.
+
+## Correction: the deficit is spectral after all — against the background
+
+The sections above say the four deficit classes fail on box tightness and
+that "the spectral front end is working". The second claim was only half
+measured. It was true of the *material pairs* — apple vs apple_plastic and
+the like, where the question is whether two classes' spectra differ. It was
+never tested for the question that matters for a box edge: whether an
+object's spectrum differs from the **background right around it**. A
+teammate's observation was that for these four classes it does not. A
+CPU-only scan (`tools/build_spectral_scan.py`, kernel
+`qwyi123/hod26-spectral-scan`, 10063 annotated instances over all 3000
+frames, no GPU quota) confirms it.
+
+For each instance: a core (the box shrunk 15% per side) against a ring outside
+the box with every annotated box removed from it. Validated first on synthetic
+frames with known answers.
+
+### No class-wide spectral signature separates them from their background
+
+One spectral-shape rule per class, object mean vs its own ring mean, 5-fold
+cross-validated with frames grouped so none sits on both sides
+(`tools/spectral_vs_iou.py`). This is the question a detector actually faces —
+it gets one rule per class, not one per object:
+
+| class | AUC | | class | AUC |
+| --- | --- | --- | --- | --- |
+| **e-bike** | **0.570** | | badminton | 0.809 |
+| **stone_block** | **0.588** | | table_tennis | 0.820 |
+| **car** | **0.640** | | charger_head | 0.822 |
+| **people** | **0.682** | | banana_plastic | 0.862 |
+| car_toy | 0.703 | | rubik | 0.863 |
+| egg_wood | 0.798 | | apple | 0.970 |
+| banana | 0.803 | | apple_plastic / orange_plastic | 0.982 |
+| | | | egg_plastic / egg / orange | 0.989-0.996 |
+
+**The four deficit classes are exactly the bottom four of eighteen.** No
+other class falls below 0.70.
+
+### They are grey: the background's spectrum, scaled
+
+Per-band contrast (core - ring) / ring, class median, is flat across all 16
+bands for three of them — the object is the background's spectrum at a
+different brightness:
+
+| class | band 0 | band 7 | band 15 | log brightness ratio |
+| --- | --- | --- | --- | --- |
+| people | -0.34 | -0.35 | -0.27 | -0.39 (0.68x) |
+| e-bike | -0.29 | -0.31 | -0.32 | -0.37 (0.69x) |
+| stone_block | -0.13 | -0.13 | -0.06 | -0.11 (0.90x) |
+| car | +0.19 | +0.13 | -0.10 | +0.11 |
+
+Compare `orange_plastic`: -0.05, -0.69, +2.15 — a spectral signature, not a
+brightness change. Spectral angle between object and ring against the
+clutter within each: people 0.59, e-bike 0.60, car 0.88, stone_block 1.05;
+most controls 1.2-8.6. For three of the four, the angle to the background is
+*smaller than the spread inside the background itself*.
+
+### And the boundary is nearly invisible
+
+Across the box edge (2 px inside vs 2 px outside): spectral angle 0.76°
+(stone_block), 1.17° (e-bike), 1.20° (people), 2.39° (car), against 1.3-9.3°
+for the controls; brightness step 2-8% against up to 50%. With neither the
+spectrum nor the brightness marking the edge, the regression head has only
+spatial texture and shape to place it — which is why elongation predicted AP
+(r = -0.46) in the section above: shape is the only cue these classes have.
+
+### This explains part of the looseness, not all of it
+
+On the 1929 held-out instances against the epoch-40 model's boxes:
+
+- separability vs matched IoU, all instances: Spearman **r = +0.34**
+- deficit classes by separability tertile: least separable third **45.5%**
+  tight (IoU >= 0.75), middle 58.7%, most separable 58.1%
+- within any one class the correlation is weak (+0.13 to +0.26)
+
+Even the most separable third of the deficit instances is boxed tight only
+58% of the time, against 85-100% for the other fourteen classes. And
+`car_toy` and `badminton` separate from their backgrounds about as poorly per
+pixel (raw-16 AUC 0.895, 0.854) yet box tight 95%+. So spectral
+inseparability is a real part of the cause, and scene is the rest: street
+frames, more objects per frame, occlusion, rarity.
+
+### What it rules out, and what it does not
+
+- **The front end is not throwing the difference away.** Raw 16 bands vs the
+  8 SRF channels the network receives: 0.825 vs 0.798 (car), 0.829 vs 0.816
+  (people), 0.851 vs 0.817 (e-bike), 0.892 vs 0.880 (stone_block). A loss of
+  0.01-0.03. The information is not in the data to begin with.
+- **Spectral-side fixes cannot help these four.** Spectral SMOTE,
+  band selection, a better spectral adapter, a contrastive spectral loss
+  (the `hod26-supcon` idea) all push on a signal these classes do not carry.
+- **What remains is spatial and brightness.** They are darker than their
+  background (0.68-0.90x), and `per_image_norm` keeps that. Levers aimed at
+  shape and edges — resolution, the box-loss shape, more instances of these
+  scenes — are the ones that address a boundary that is only visible in
+  space.
+
+### Two caveats
+
+- **stone_block's ring may contain stone blocks.** The training set is known to
+  leave some unannotated (README: sample 558). The ring removes annotated
+  boxes only, so an unlabelled neighbour would sit in the "background" and make
+  stone_block look less separable than it is.
+- **Edge spectral angle correlates *negatively* with IoU within the deficit
+  classes** (-0.32 to -0.34). Not understood; one guess is crowding — an edge
+  that borders another person or vehicle shows a large angle and also a harder
+  box. Unverified.
+
+### Band order, found on the way
+
+Band-to-band correlation of normalised spectra, 400k pixels: index-adjacent
+pairs average 0.554, index-distant pairs -0.195, so index order is
+approximately spectral order — with two exceptions. **Band 4** correlates at
+about 0.1 with everything, and band 11 sits apart too. The correlation chain
+puts them at the ends: [15, 13, 14, 12, 10, 8, 9, 7, 6, 1, 0, 2, 3, 5, 4, 11].
+The Gaussian SRF bank (width 2 over *index*) averages band 4 with bands 2-6,
+diluting it — and band 4 is where `orange` (+1.29 vs ~0 for its neighbours),
+`orange_plastic` (+1.00 vs -0.6) and `banana_plastic` carry a distinctive
+contrast. Those classes already score well, so this is not urgent, but the
+SRF bank's premise that neighbouring indices are neighbouring wavelengths does
+not hold for band 4.

@@ -37,9 +37,14 @@ result is not.** A CPU-only error decomposition (`handoff/DIAGNOSIS.md`, no
 GPU quota, ~1 minute) on the held-out predictions found: 98.3% of ground truth
 is found, 99.9% of what is found is named correctly. The entire remaining gap
 is **box tightness** — median matched IoU 0.8697 — concentrated in four
-classes (`stone_block`, `people`, `e-bike`, `car`) that are elongated and/or
-rare, not small. More epochs of the plain recipe will not fix that; a
-different loss shape or more of those classes' frames might. Read
+classes (`stone_block`, `people`, `e-bike`, `car`). A second CPU scan found
+why they box loosely: **they are spectrally inseparable from the background
+around them** — grey objects whose spectrum is the background's at a
+different brightness, with almost no spectral or brightness step at the box
+edge. They are the bottom four of eighteen classes for a class-wide spectral
+rule separating object from background. So spectral-side fixes (spectral
+augmentation, band selection, contrastive spectral losses) cannot help them;
+what is left is spatial — shape, edges, resolution, the box loss. Read
 `handoff/DIAGNOSIS.md` before trying anything past a plain resume.
 
 **The 0.58168 on the submission list is not from this pipeline.** After the
