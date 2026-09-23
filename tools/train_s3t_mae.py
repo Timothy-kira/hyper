@@ -62,8 +62,8 @@ def find_root(given):
 class Crops(torch.utils.data.Dataset):
     """Unlabelled frames (train + test) -> k random crops of prepared features each."""
 
-    def __init__(self, files, crop, k, seed):
-        self.files, self.crop, self.k, self.seed = files, crop, k, seed
+    def __init__(self, files, crop, k, seed, flip=False):
+        self.files, self.crop, self.k, self.seed, self.flip = files, crop, k, seed, flip
 
     def __len__(self):
         return len(self.files)
@@ -78,9 +78,9 @@ class Crops(torch.utils.data.Dataset):
             y = int(rng.integers(0, h - c + 1))
             x = int(rng.integers(0, w - c + 1))
             p = f[:, :, y:y + c, x:x + c]
-            if rng.random() < 0.5:
+            if self.flip and rng.random() < 0.5:
                 p = p[..., ::-1]
-            if rng.random() < 0.5:
+            if self.flip and rng.random() < 0.5:
                 p = p[..., ::-1, :]
             out.append(np.ascontiguousarray(p))
         return torch.from_numpy(np.stack(out)).half()
@@ -128,6 +128,12 @@ def main():
     ap.add_argument("--compile", type=int, default=1)
     ap.add_argument("--tag", default="run")
     ap.add_argument("--limit-frames", type=int, default=0)
+    ap.add_argument("--flip", type=int, default=0,
+                    help="random flips of the crops (off: only official frames, only cropped)")
+    ap.add_argument("--schedule", choices=["step", "time"], default="step",
+                    help="cosine over --max-steps, or over the --minutes budget")
+    ap.add_argument("--save-every-min", type=float, default=0,
+                    help="also checkpoint every N minutes (0: only at the end)")
     args = ap.parse_args()
 
     cuda = torch.cuda.is_available()
@@ -162,8 +168,11 @@ def main():
     files = sorted((root / "train" / "images").glob("*.png")) + sorted((root / "test" / "images").glob("*.png"))
     if args.limit_frames:
         files = files[:args.limit_frames]
-    log(f"data: {root}  {len(files)} unlabelled frames (train + test images, no labels read)")
-    ds = Crops(files, args.crop, args.crops_per_frame, seed=RANK)
+    n_tr = len(list((root / "train" / "images").glob("*.png")))
+    log(f"data: {root}  {len(files)} unlabelled frames = all official images "
+        f"({n_tr} train + {len(files) - n_tr} test), no labels read, no generated images; "
+        f"random {args.crop}px crops, flips {'on' if args.flip else 'off'}")
+    ds = Crops(files, args.crop, args.crops_per_frame, seed=RANK, flip=bool(args.flip))
     sampler = torch.utils.data.DistributedSampler(ds, WORLD, RANK, shuffle=True, seed=0) if WORLD > 1 else None
     frames_per_step = max(1, args.batch // args.crops_per_frame)
     dl = torch.utils.data.DataLoader(
@@ -246,21 +255,27 @@ def main():
             log(f"torch.compile: off ({e})")
 
     warm = 30
-    cosine = args.max_steps < 100000
+    cosine = args.max_steps < 100000 or args.schedule == "time"
+    frac = 0.0            # fraction of the time budget spent, identical on every rank
 
     def lr_at(step):
-        # Step-based on every rank alike: a per-rank clock would give the ranks
-        # different learning rates and let their weights drift apart under DDP.
+        # Every rank must use the same lr, or their weights drift apart under
+        # DDP: the step count is shared, and the time fraction is all-reduced.
         if step < warm:
             return args.lr * (step + 1) / warm
         if not cosine:
             return args.lr
-        return args.lr * 0.5 * (1 + math.cos(math.pi * min(1.0, (step - warm) / max(1, args.max_steps - warm))))
+        if args.schedule == "time":
+            p = frac
+        else:
+            p = (step - warm) / max(1, args.max_steps - warm)
+        return args.lr * 0.5 * (1 + math.cos(math.pi * min(1.0, p)))
 
     step, epoch, hist = 0, 0, []
     seen = 0
     t_steady, seen_steady = None, 0
-    stop = torch.zeros(1, device=device)
+    stop = torch.zeros(2, device=device)
+    t_train0, last_save = time.time(), time.time()
     deadline = T0 + args.minutes * 60
     model.train()
     done = False
@@ -325,10 +340,18 @@ def main():
                 hist.append({"step": step, "loss": lv, "t": time.time() - T0,
                              "scale": scaler.get_scale() if scaler.is_enabled() else 1.0})
             stop[0] = float(time.time() > deadline or step >= args.max_steps)
+            stop[1] = (time.time() - t_train0) / max(1.0, deadline - t_train0)
             t_prev = time.time()
             if WORLD > 1:
                 dist.all_reduce(stop, op=dist.ReduceOp.MAX)
-            if stop.item() > 0:
+            frac = float(stop[1])
+            if args.save_every_min and RANK == 0 and time.time() - last_save > 60 * args.save_every_min:
+                torch.save({"encoder": enc.state_dict(), "step": step,
+                            "config": {"dim": args.dim, "depth": args.depth, "heads": args.heads}},
+                           out / f"{args.tag}_encoder_latest.pt")
+                last_save = time.time()
+                log(f"saved {args.tag}_encoder_latest.pt at step {step}")
+            if stop[0].item() > 0:
                 done = True
                 break
         epoch += 1

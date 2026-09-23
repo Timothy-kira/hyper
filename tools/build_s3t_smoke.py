@@ -70,10 +70,15 @@ def run(tag, nproc, extra):
 
 
 cpus = os.cpu_count() or 4
-rc_a, a = run("single", 1, CONFIG + ["--max-steps", "60", "--minutes", "6",
-                                     "--workers", str(max(1, cpus - 1))])
-rc_b, b = run("dual", 2, CONFIG + ["--minutes", str(DUAL_MINUTES),
-                                   "--workers", str(max(1, cpus // 2 - 1))])
+if MODE == "smoke":
+    rc_a, a = run("single", 1, CONFIG + ["--max-steps", "60", "--minutes", "6",
+                                         "--workers", str(max(1, cpus - 1))])
+else:
+    rc_a, a = 0, {}
+TAG = "dual" if MODE == "smoke" else "pretrain"
+rc_b, b = run(TAG, 2, CONFIG + ["--minutes", str(DUAL_MINUTES),
+                                "--workers", str(max(1, cpus // 2 - 1))]
+              + ([] if MODE == "smoke" else ["--schedule", "time", "--save-every-min", "10"]))
 
 say("=" * 70)
 verdict = []
@@ -81,7 +86,8 @@ def crit(name, ok, detail):
     verdict.append(ok)
     say(f"{'PASS' if ok else 'FAIL'}  {name:34s} {detail}")
 
-crit("single-GPU run finished", rc_a == 0 and a is not None, f"rc={rc_a}")
+if MODE == "smoke":
+    crit("single-GPU run finished", rc_a == 0 and a is not None, f"rc={rc_a}")
 crit("dual-GPU DDP run finished", rc_b == 0 and b is not None, f"rc={rc_b}")
 if b:
     hist = b.get("history") or []
@@ -94,14 +100,14 @@ if b:
     fell = bool(losses) and losses[-1] < 0.8 * losses[0]
     crit("loss falls", fell, f"{losses[0] if losses else None} -> {losses[-1] if losses else None}")
     crit("checkpoint round-trips", bool(b.get("checkpoint_roundtrip")), "")
-    crit("recon picture written", (OUT / "dual_recon.png").exists(), "")
+    crit("recon picture written", (OUT / f"{TAG}_recon.png").exists(), "")
     say(f"accel: compile={b.get('compiled')} amp={b.get('amp')} sdpa={b.get('sdpa')}")
     say(f"peak mem per GPU (GB): {b.get('peak_mem_gb')}")
     say(f"data wait: {b.get('data_wait_frac')}")
     if a and a.get("crops_per_s") and b.get("crops_per_s"):
         say(f"throughput: 1 GPU {a['crops_per_s']:.1f} crops/s, 2 GPU {b['crops_per_s']:.1f} "
             f"crops/s -> speedup {b['crops_per_s'] / a['crops_per_s']:.2f}x")
-say(f"SMOKE {'PASSED' if all(verdict) else 'FAILED'} in {(time.time() - T0) / 60:.1f} min")
+say(f"{MODE.upper()} {'PASSED' if all(verdict) else 'FAILED'} in {(time.time() - T0) / 60:.1f} min")
 '''
 
 
@@ -111,19 +117,24 @@ def main() -> None:
     ap.add_argument("--slug", default="qwyi123/hod26-s3t-mae-smoke")
     ap.add_argument("--dataset", default="xishengfeng/hod26-planar")
     ap.add_argument("--dual-minutes", type=float, default=11)
+    ap.add_argument("--mode", choices=["smoke", "pretrain"], default="smoke",
+                    help="pretrain: the dual-GPU run only, time-budgeted cosine, periodic saves")
+    ap.add_argument("--public", action="store_true",
+                    help="publish the kernel (and so its output checkpoint) instead of private")
     ap.add_argument("--config", default="--batch 32 --crops-per-frame 8 --crop 128 "
                                          "--dim 64 --depth 4 --heads 4 --compile 1")
     args = ap.parse_args()
     sources = {rel: (REPO / rel).read_text() for rel in SOURCES}
     head = (f"SOURCES = {json.dumps(sources)}\n"
             f"CONFIG = {json.dumps(args.config.split())}\n"
-            f"DUAL_MINUTES = {args.dual_minutes}\n")
+            f"DUAL_MINUTES = {args.dual_minutes}\n"
+            f"MODE = {args.mode!r}\n")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "s3t_smoke.py").write_text(head + BODY)
     (args.out_dir / "kernel-metadata.json").write_text(json.dumps({
         "id": args.slug, "title": args.slug.split("/")[-1].replace("-", " ").title(),
         "code_file": "s3t_smoke.py", "language": "python", "kernel_type": "script",
-        "is_private": True, "enable_gpu": True, "machine_shape": "NvidiaTeslaT4x2",
+        "is_private": not args.public, "enable_gpu": True, "machine_shape": "NvidiaTeslaT4x2",
         "enable_internet": True, "competition_sources": [],
         "dataset_sources": [args.dataset], "kernel_sources": [],
     }, indent=2))
