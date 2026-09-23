@@ -105,6 +105,69 @@ def sdpa_probe(device, hd):
     return res
 
 
+def compile_units(model):
+    """The modules whose small kernels dominate a step: every Transformer block
+    and spatial mix, in the encoder and the decoder."""
+    from hod26.s3t.spectral import SpatialMix, SpectralBlock
+    return [m for m in model.modules() if isinstance(m, (SpectralBlock, SpatialMix))]
+
+
+def compile_blocks(model, mode):
+    """Compile each block in place (nn.Module.compile).
+
+    Block by block rather than torch.compile(DDP(model)): the model DDP wraps
+    stays a plain module, so DDP's bucketing never meets a dynamo graph -- the
+    two whole-model attempts on 2x T4 both died on an inductor stride guard
+    there. Inside a block inductor still fuses LayerNorm, GELU, the residual
+    adds and the LayerScale multiplies into a few Triton kernels, and with
+    mode="reduce-overhead" each block also runs as a CUDA graph, removing the
+    per-kernel launch cost that a 0.25M-parameter model is dominated by.
+    """
+    units = compile_units(model)
+    for m in units:
+        m.compile(mode=None if mode == "default" else mode, dynamic=False)
+    return len(units)
+
+
+def uncompile(model):
+    for m in model.modules():
+        if getattr(m, "_compiled_call_impl", None) is not None:
+            m._compiled_call_impl = None
+
+
+class GpuUtil:
+    """Samples nvidia-smi in a thread; mean utilisation per GPU since start()."""
+
+    def __init__(self, every=2.0):
+        import threading
+        self.every, self.samples, self.on = every, [], False
+        self.t = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self):
+        import subprocess
+        while True:
+            if self.on:
+                try:
+                    out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu",
+                                          "--format=csv,noheader,nounits"],
+                                         capture_output=True, text=True, timeout=5).stdout
+                    self.samples.append([float(v) for v in out.split()])
+                except Exception:                                # noqa: BLE001
+                    pass
+            time.sleep(self.every)
+
+    def start(self):
+        self.samples, self.on = [], True
+        if not self.t.is_alive():
+            self.t.start()
+
+    def mean(self):
+        if not self.samples:
+            return None
+        n = min(len(s) for s in self.samples)
+        return [round(sum(s[i] for s in self.samples) / len(self.samples), 1) for i in range(n)]
+
+
 def pseudo_rgb(level, bands=(5, 8, 13)):
     x = level[list(bands)].float().cpu().numpy()
     lo, hi = np.percentile(x, 1), np.percentile(x, 99)
@@ -126,6 +189,12 @@ def main():
     ap.add_argument("--lr", type=float, default=1.5e-3)
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--compile", type=int, default=1)
+    ap.add_argument("--compile-mode", default="default",
+                    choices=["default", "reduce-overhead", "max-autotune-no-cudagraphs"],
+                    help="reduce-overhead adds CUDA graphs on top of kernel fusion")
+    ap.add_argument("--compile-scope", default="blocks", choices=["blocks", "whole"],
+                    help="blocks: compile each block in place (DDP-safe); "
+                         "whole: torch.compile(DDP(model)), the form that failed on 2x T4")
     ap.add_argument("--tag", default="run")
     ap.add_argument("--limit-frames", type=int, default=0)
     ap.add_argument("--flip", type=int, default=0,
@@ -258,12 +327,28 @@ def main():
             static_graph=True)
     run = net
     compiled = False
-    if args.compile and cuda:
+    if args.compile and (cuda or os.environ.get("S3T_COMPILE_CPU")):
         try:
-            run = torch.compile(net)
+            import torch._dynamo as dynamo   # "as": a bare import would make torch local here
+            # DDPOptimizer splits graphs at DDP bucket boundaries; it is the
+            # usual source of the stride-guard failures seen on 2x T4.
+            dynamo.config.optimize_ddp = False
+            if args.compile_scope == "blocks":
+                n = compile_blocks(model, args.compile_mode)
+                log(f"torch.compile: {n} blocks compiled in place, mode={args.compile_mode}, "
+                    f"optimize_ddp=off")
+            else:
+                run = torch.compile(net, mode=None if args.compile_mode == "default" else args.compile_mode)
+                log(f"torch.compile: whole model, mode={args.compile_mode}, optimize_ddp=off")
             compiled = True
         except Exception as e:                                   # noqa: BLE001
+            uncompile(model)
+            run = net
             log(f"torch.compile: off ({e})")
+    report["compile_mode"] = args.compile_mode if compiled else "eager"
+    report["compile_scope"] = args.compile_scope
+    graphs = compiled and args.compile_mode == "reduce-overhead"
+    util = GpuUtil() if cuda and RANK == 0 else None
 
     warm = 30
     cosine = args.max_steps < 100000 or args.schedule == "time"
@@ -302,12 +387,16 @@ def main():
                 g["lr"] = lr_at(step)
             t_step = time.time()
             failed = None
+            if graphs:
+                torch.compiler.cudagraph_mark_step_begin()
             try:
                 with torch.autocast(device.type, dtype=amp_dtype, enabled=cuda):
                     loss, parts, *_ = run(xb)
                 scaler.scale(loss).backward()
             except Exception as e:                               # noqa: BLE001
-                if not (compiled and step == 0):
+                # The first steps are where compilation (and CUDA-graph
+                # recording, which re-records on step 1-2) happens.
+                if not (compiled and step < 3):
                     raise
                 failed = f"{type(e).__name__}: {str(e).splitlines()[0][:160]}"
             if failed:
@@ -315,8 +404,10 @@ def main():
                 # keeps the failed attempt's activations alive, and the eager
                 # retry then ran out of memory on top of them.
                 import gc
-                log(f"torch.compile: failed on first step, falling back to eager ({failed})")
-                run, compiled = net, False
+                log(f"torch.compile: failed at step {step}, falling back to eager ({failed})")
+                uncompile(model)
+                run, compiled, graphs = net, False, False
+                report["compile_mode"] = f"eager (fallback: {failed[:120]})"
                 loss = parts = None
                 opt.zero_grad(set_to_none=True)
                 gc.collect()
@@ -341,6 +432,8 @@ def main():
                 if cuda:
                     torch.cuda.synchronize()
                 t_steady, seen_steady = time.time(), seen
+                if util:
+                    util.start()
             lv = float(loss.detach())
             if not math.isfinite(lv):
                 log(f"NON-FINITE loss at step {step}: {lv}")
@@ -352,6 +445,8 @@ def main():
                     span = time.time() - t_steady
                     rate = (f"  {(seen - seen_steady) / span:7.1f} crops/s"
                             f"  data-wait {100 * wait / span:4.1f}%")
+                    if util and util.mean():
+                        rate += f"  gpu-util {util.mean()}%"
                 mem = f"  mem {torch.cuda.max_memory_allocated(device) / 2**30:.2f}G" if cuda else ""
                 log(f"step {step:5d}  loss {lv:.4f}  (norm {float(parts['norm']):.3f} "
                     f"l1 {float(parts['l1']):.3f} grad {float(parts['grad']):.4f})  "
@@ -383,6 +478,7 @@ def main():
         "steps": step, "compiled": compiled, "amp": str(amp_dtype),
         "crops_per_s": (seen - seen_steady) / elapsed if t_steady and step > 20 else None,
         "data_wait_frac": wait / elapsed if t_steady and step > 20 else None,
+        "gpu_util": util.mean() if util else None,
         "peak_mem_gb": [torch.cuda.max_memory_allocated(device) / 2**30] if cuda else None,
         "loss_first": hist[0]["loss"] if hist else None,
         "loss_last": hist[-1]["loss"] if hist else None, "history": hist,

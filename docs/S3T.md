@@ -78,7 +78,7 @@ x ← x + γ2 · MLP(LN(x))       # 4D 中间维度
   - SDPA 实际走 mem-efficient 后端。FlashAttention 需要 sm80 以上，T4 是 sm75，用不了。
   - 编码器只计算可见位置。
   - fused AdamW、channels_last、pin_memory 并常驻 DataLoader worker。
-  - `torch.compile` 在 DDP 下两次触发 inductor 的 stride 断言，都自动退回到普通 eager 模式。退回后吞吐与冒烟测试中编译模式下的吞吐相当（约 51 vs 54 crops/s）。
+  - `torch.compile`：第一轮对 DDP 包装后的整个模型编译，两次都触发了 inductor 的 stride 断言，退回普通模式（退回后吞吐约 51 crops/s，冒烟测试中编译模式约 54 crops/s）。现已改为逐个 block 原地编译，并关掉 dynamo 的 `optimize_ddp`，可选再加 CUDA Graphs（`--compile-mode reduce-overhead`）来合并小 kernel、省掉 kernel 启动开销；冒烟测试 kernel 会在双卡上对比不编译、编译融合、编译融合加 CUDA Graphs 这三种方案的吞吐和 GPU 利用率。
 
 ### 5.2 检测微调
 
@@ -91,7 +91,7 @@ x ← x + γ2 · MLP(LN(x))       # 4D 中间维度
 - 检测微调代码只在 CPU 上测过（安装、前向、反向、深拷贝、保存与加载、融合都覆盖了），还没有在 GPU 上跑过。
 - 计划中"对齐阶段冻结 DETR"这一步没有实现。现在靠零初始化和从头开始的完整微调来代替。
 - 计划中给检测头加 P2 这一步没有实现，这需要改 RT-DETR 的解码器结构，风险太大。
-- `torch.compile` 在 DDP 下的 stride 断言还没有解决。
+- 逐 block 编译加 CUDA Graphs 只在 CPU 上验证过能正常训练，在 GPU 上的提速效果要等下一个账号跑冒烟测试确认。
 
 ## 引用
 

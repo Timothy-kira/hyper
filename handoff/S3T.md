@@ -76,6 +76,42 @@ preflight passed
 
 要比参照高出 **0.01 以上**才算有效（run-to-run 噪声约 0.0017）。这条线是从 COCO 开始训的，不是在我们 52 个 epoch 的模型上续训，所以 11 小时内**不一定能追上**。它真正的价值是看弱类（stone_block / people / e-bike / car）的 AP 有没有涨，日志末尾会打印每一类的 AP。
 
+## 可选：再跑一轮更长的 MAE 预训练（先做加速冒烟）
+
+现有的 `pretrain_mae.pt` 只在一个账号剩下的额度里训了约 1 小时。如果你的额度有富余，想再训一个更长的版本，**先花约 25 分钟跑一次加速冒烟测试**：
+
+```bash
+python3 tools/build_s3t_smoke.py --slug <你的账号>/hod26-s3t-mae-smoke
+kaggle kernels push -p kernels/s3t_smoke/build
+```
+
+它先用单卡跑一遍，作为速度参照；再用双卡把同一个预训练分别按三种方式各跑 4 分钟：
+
+| 方案 | 做法 |
+| --- | --- |
+| `eager` | 不编译，作为对照 |
+| `fused` | 用 `torch.compile` 逐个 block 编译，把 LayerNorm、GELU、残差相加这些小 kernel 合并成少数几个 Triton kernel |
+| `graphs` | 在 `fused` 的基础上再加 CUDA Graphs（`mode="reduce-overhead"`），把每个 block 录成一张图，省掉逐个 kernel 启动的开销 |
+
+日志末尾会给出每种方案的吞吐（crops/s）、GPU 利用率和显存，并写出 `fastest: dual_xxx`。
+
+**背景**：这个模型只有 0.25M 参数，每一步是大量很小的 kernel。第一轮双卡只比单卡快约 1.2 倍，而 `torch.compile` 两次都在 DDP 下触发 inductor 的 stride 断言，退回了不编译的普通模式。新代码做了三处改动：
+- 改为逐个 block 原地编译，DDP 包装的仍然是普通模型；
+- 关掉 dynamo 的 `optimize_ddp`；
+- 前 3 步编译失败时自动退回普通模式。
+
+CPU 上两进程 DDP 已验证逐 block 编译能正常训练、checkpoint 能完整存取；**GPU 上的效果还没测过**，冒烟测试就是为了测这个。
+
+然后按最快的那种方案跑正式预训练。例如 `graphs` 最快时：
+
+```bash
+python3 tools/build_s3t_smoke.py --mode pretrain --public --slug <你的账号>/hod26-s3t-mae-pretrain \
+  --dual-minutes 600 --config "--batch 20 --crops-per-frame 10 --crop 128 --dim 64 --depth 4 --heads 4 --compile 1 --compile-mode reduce-overhead"
+kaggle kernels push -p kernels/s3t_smoke/build
+```
+
+跑完后，把检测 kernel 的 `--mae-kernel` 指向你的新 notebook，重新生成检测 kernel：`python3 tools/s3t_round.py --mae-kernel <你的账号>/hod26-s3t-mae-pretrain`。
+
 ## 相关文件
 
 - `src/hod26/s3t/`：`preprocess.py`（对齐、先验特征、uint8 编码）、`spectral.py`（光谱 Transformer 编码器）、`mae.py`（MAE 预训练）、`front.py`（接到 DETR 上的前端和侧注入）

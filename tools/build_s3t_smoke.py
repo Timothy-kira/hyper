@@ -3,8 +3,9 @@
 The kernel carries the repo sources inline, writes them to disk (torchrun
 workers import them by path, like the DDP fix in the round driver), then runs:
 
-  A. 1 GPU,  compile on, ~60 steps  -- single-card throughput reference
-  B. 2 GPUs, compile on, time-boxed -- the DDP run under test
+  A. 1 GPU, compiled, ~80 steps       -- single-card throughput reference
+  B. 2 GPUs three ways, time-boxed     -- eager / fused (torch.compile per
+     block) / graphs (per-block compile + CUDA graphs), and names the fastest
 
 and prints a verdict line per pass criterion.
 
@@ -70,16 +71,27 @@ def run(tag, nproc, extra):
 
 
 cpus = os.cpu_count() or 4
+W1, W2 = str(max(1, cpus - 1)), str(max(1, cpus // 2 - 1))
+variants = {}
 if MODE == "smoke":
-    rc_a, a = run("single", 1, CONFIG + ["--max-steps", "60", "--minutes", "6",
-                                         "--workers", str(max(1, cpus - 1))])
+    # Single-card reference, then the same dual-card run three ways, so the
+    # log says which acceleration actually pays on this hardware.
+    rc_a, a = run("single", 1, CONFIG + ["--compile", "1", "--max-steps", "80",
+                                         "--minutes", "5", "--workers", W1])
+    for name, flags in (("eager", ["--compile", "0"]),
+                        ("fused", ["--compile", "1", "--compile-mode", "default"]),
+                        ("graphs", ["--compile", "1", "--compile-mode", "reduce-overhead"])):
+        variants[name] = run(f"dual_{name}", 2, CONFIG + flags + [
+            "--minutes", str(VARIANT_MINUTES), "--workers", W2])
+    ok = {k: v for k, v in variants.items() if v[0] == 0 and v[1]}
+    best = max(ok, key=lambda k: ok[k][1].get("crops_per_s") or 0) if ok else None
+    TAG = f"dual_{best}" if best else "dual_eager"
+    rc_b, b = variants.get(best, (1, None))
 else:
     rc_a, a = 0, {}
-TAG = "dual" if MODE == "smoke" else "pretrain"
-rc_b, b = run(TAG, 2, CONFIG + ["--minutes", str(DUAL_MINUTES),
-                                "--workers", str(max(1, cpus // 2 - 1))]
-              + ([] if MODE == "smoke" else ["--schedule", "time", "--save-every-min", "10"]))
-
+    TAG = "pretrain"
+    rc_b, b = run(TAG, 2, CONFIG + ["--minutes", str(DUAL_MINUTES), "--workers", W2,
+                                    "--schedule", "time", "--save-every-min", "10"])
 say("=" * 70)
 verdict = []
 def crit(name, ok, detail):
@@ -104,6 +116,15 @@ if b:
     say(f"accel: compile={b.get('compiled')} amp={b.get('amp')} sdpa={b.get('sdpa')}")
     say(f"peak mem per GPU (GB): {b.get('peak_mem_gb')}")
     say(f"data wait: {b.get('data_wait_frac')}")
+    for name, (rc, r) in variants.items():
+        if r:
+            say(f"variant {name:7s}: rc={rc} {r.get('crops_per_s') or 0:7.1f} crops/s  "
+                f"compile={r.get('compile_mode')}  gpu-util {r.get('gpu_util')}%  "
+                f"peak {r.get('peak_mem_gb')} GB  batch {r.get('batch_per_gpu')}/GPU")
+        else:
+            say(f"variant {name:7s}: rc={rc} (no report)")
+    if variants:
+        say(f"fastest: {TAG} -> use its --compile/--compile-mode for the pretrain")
     if a and a.get("crops_per_s") and b.get("crops_per_s"):
         say(f"throughput: 1 GPU {a['crops_per_s']:.1f} crops/s, 2 GPU {b['crops_per_s']:.1f} "
             f"crops/s -> speedup {b['crops_per_s'] / a['crops_per_s']:.2f}x")
@@ -117,18 +138,21 @@ def main() -> None:
     ap.add_argument("--slug", default="qwyi123/hod26-s3t-mae-smoke")
     ap.add_argument("--dataset", default="xishengfeng/hod26-planar")
     ap.add_argument("--dual-minutes", type=float, default=11)
+    ap.add_argument("--variant-minutes", type=float, default=4,
+                    help="smoke: minutes per dual-GPU variant (eager / fused / graphs)")
     ap.add_argument("--mode", choices=["smoke", "pretrain"], default="smoke",
                     help="pretrain: the dual-GPU run only, time-budgeted cosine, periodic saves")
     ap.add_argument("--public", action="store_true",
                     help="publish the kernel (and so its output checkpoint) instead of private")
     ap.add_argument("--config", default="--batch 32 --crops-per-frame 8 --crop 128 "
-                                         "--dim 64 --depth 4 --heads 4 --compile 1")
+                                         "--dim 64 --depth 4 --heads 4")
     args = ap.parse_args()
     sources = {rel: (REPO / rel).read_text() for rel in SOURCES}
     head = (f"SOURCES = {json.dumps(sources)}\n"
             f"CONFIG = {json.dumps(args.config.split())}\n"
             f"DUAL_MINUTES = {args.dual_minutes}\n"
-            f"MODE = {args.mode!r}\n")
+            f"MODE = {args.mode!r}\n"
+            f"VARIANT_MINUTES = {args.variant_minutes}\n")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "s3t_smoke.py").write_text(head + BODY)
     (args.out_dir / "kernel-metadata.json").write_text(json.dumps({
