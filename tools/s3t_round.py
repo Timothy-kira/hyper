@@ -67,6 +67,12 @@ def s3t_candidate(total: int = TOTAL, batch: int = 2, mae_file: str | None = Non
     # on the pretrained decoder, DEIM's MAL for the classes, log-space w/h L1.
     # Mosaic already gives DEIM's dense one-to-one supervision.
     cand["train"].update(fdr=True, mal=True, log_size_l1=True)
+    # Speed over bitwise reproducibility: deterministic=True would turn on
+    # cudnn.deterministic and torch's deterministic algorithms, which limit
+    # cudnn.benchmark's choices and swap in slower backward kernels (the
+    # deformable attention's grid_sample among them). The probe's 0.50 s/step
+    # was measured without them.
+    cand["train"]["deterministic"] = False
     if mae_file:
         cand["train"]["s3t_mae_file"] = mae_file
     cand["augment"].update(AUGMENT)

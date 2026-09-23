@@ -1395,6 +1395,9 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                  f"{done.get('mha_to_sdpa', 0)} nn.MultiheadAttention swapped"),
                 (f"fused {cls.__name__}", is_fused, "" if is_fused else "a group is not fused"),
                 ("cudnn.benchmark", bool(torch.backends.cudnn.benchmark), ""),
+                ("non-deterministic kernels (fastest cudnn / grid_sample)",
+                 not bool(torch.backends.cudnn.deterministic),
+                 "deterministic=True in the candidate" if torch.backends.cudnn.deterministic else ""),
                 ("FlashAttention / TF32 / bf16", False, "not supported on T4 (sm75)"),
             ]
             if is_main_rank():

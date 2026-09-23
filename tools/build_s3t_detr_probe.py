@@ -60,11 +60,14 @@ say(f"MAE encoder: {mae}")
 
 
 def build_net(chunks, compile_blocks, s3t=True, scale=0.5, fast=False, freeze=False,
-              arch="tokens", grad_ckpt=True):
+              arch="tokens", grad_ckpt=True, head="rtdetr", channels_last=False):
     # Built the way RTDETRTrainer.get_model builds it: the 18-class graph from
     # the yaml, then every shape-compatible COCO tensor loaded into it.
     net = RTDETRDetectionModel("rtdetr-l.yaml", ch=3, nc=18, verbose=False)
     net.load(COCO, verbose=False)
+    if head == "dfine":
+        # the formal run's head and losses: D-FINE FDR (+FGL, DDF), MAL, log-size L1
+        install_bbox_loss(net, 18, "GIoU", log_size=True, fdr=True, mal=True)
     if s3t:
         # Speed and memory do not depend on the weights: an architecture with
         # no MAE checkpoint yet is measured on its random initialisation.
@@ -75,7 +78,10 @@ def build_net(chunks, compile_blocks, s3t=True, scale=0.5, fast=False, freeze=Fa
                                  fast_kernels=fast, train_encoder=not freeze, arch=arch,
                                  grad_ckpt=grad_ckpt)
     done = enable_transformer_accel(net, fp32_loss=True, nc=18)
-    return net.to(dev).train(), done
+    net = net.to(dev)
+    if channels_last:
+        net = net.to(memory_format=torch.channels_last)
+    return net.train(), done
 
 
 def fake_batch(b, g, ch=16):
@@ -156,7 +162,8 @@ def run(cfg):
         ch = 16 if s3t else 3
         net, done = build_net(cfg.get("chunks", 8), cfg["compile"], s3t, cfg.get("scale", 0.5),
                               cfg.get("fast", False), cfg.get("freeze", False),
-                              cfg.get("arch", "tokens"), cfg.get("ckpt", True))
+                              cfg.get("arch", "tokens"), cfg.get("ckpt", True),
+                              cfg.get("head", "rtdetr"), cfg.get("cl", False))
         rec["accel"] = done
         opt = torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=1e-5, fused=CUDA)
         scaler = torch.amp.GradScaler("cuda", enabled=cfg["amp"] and CUDA)
