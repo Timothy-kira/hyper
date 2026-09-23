@@ -108,22 +108,23 @@
 <path d="M 539.0 450 L 539.0 472" fill="none" stroke="#93c5fd" stroke-width="1.8" marker-end="url(#a)" stroke-dasharray="6 4"/>
 <text x="40" y="622" font-size="17" font-weight="700" fill="#0f172a" text-anchor="start">③ 检测：COCO 预训练 RT-DETR-L（负责空间）</text>
 <rect x="40" y="668" width="230" height="76" rx="9" fill="#fff7ed" stroke="#c2410c" stroke-width="1.6"/>
-<text x="155.0" y="701.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">head 1×1：64 → 3</text>
-<text x="155.0" y="719.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">零初始化，上采样回 (H, W)</text>
+<text x="155.0" y="701.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">S3T 特征 64 通道</text>
+<text x="155.0" y="719.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">上采样回原图 (H, W)</text>
 <rect x="40" y="764" width="230" height="76" rx="9" fill="#fff7ed" stroke="#c2410c" stroke-width="1.6"/>
 <text x="155.0" y="788.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">base 1×1：16 → 3</text>
 <text x="155.0" y="806.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">LDA 初始化</text>
 <text x="155.0" y="824.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">输入 16 波段 level 图</text>
-<circle cx="320" cy="754" r="17" fill="#fff" stroke="#c2410c" stroke-width="1.8"/>
-<text x="320" y="760" font-size="18" font-weight="400" fill="#c2410c" text-anchor="middle">＋</text>
+<rect x="296" y="732" width="48" height="44" rx="8" fill="#fff" stroke="#c2410c" stroke-width="1.8"/>
+<text x="320" y="752" font-size="12" font-weight="400" fill="#c2410c" text-anchor="middle">拼接</text>
+<text x="320" y="768" font-size="12" font-weight="400" fill="#c2410c" text-anchor="middle">3+64</text>
 <line x1="270" y1="706" x2="306" y2="742" stroke="#c2410c" stroke-width="1.8" marker-end="url(#o)"/>
 <line x1="270" y1="802" x2="306" y2="766" stroke="#c2410c" stroke-width="1.8" marker-end="url(#o)"/>
 <rect x="365" y="684" width="215" height="140" rx="9" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.6"/>
 <text x="472.5" y="731.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">HGStem + HGNetv2</text>
-<text x="472.5" y="749.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">stage 1–4</text>
-<text x="472.5" y="767.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">COCO 预训练</text>
-<text x="472.5" y="785.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">输出 P3 / P4 / P5</text>
-<line x1="337" y1="754" x2="361" y2="754" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<text x="472.5" y="749.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">第一层卷积加宽 3 → 3+64</text>
+<text x="472.5" y="767.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">（新通道零初始化）</text>
+<text x="472.5" y="785.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">COCO 预训练 → P3/P4/P5</text>
+<line x1="344" y1="754" x2="361" y2="754" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
 <rect x="620" y="668" width="245" height="172" rx="9" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.6"/>
 <text x="742.5" y="722.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">input_proj（第 19/14/10 层）</text>
 <text x="742.5" y="740.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">P3 /8、P4 /16、P5 /32</text>
@@ -144,7 +145,7 @@
 <path d="M 1359.0 450 L 1359.0 646 L 155 646 L 155 664" fill="none" stroke="#c2410c" stroke-width="1.8" marker-end="url(#o)"/>
 <path d="M 742 646 L 742 664" fill="none" stroke="#c2410c" stroke-width="1.8" marker-end="url(#o)"/>
 <text x="1351.0" y="640" font-size="12" font-weight="400" fill="#c2410c" text-anchor="end">S3T 特征 (B, 64, H/2, W/2)</text>
-<text x="40" y="866" font-size="12" font-weight="400" fill="#9a3412" text-anchor="start">橙色 = 新加的零初始化层：训练第 0 步，检测器看到的只是 16→3 投影，光谱特征靠梯度逐步接入。编码器在 0.5× 输入尺度上跑（回到原生像素尺度），梯度检查点 ＋ fp16。</text>
+<text x="40" y="866" font-size="12" font-weight="400" fill="#9a3412" text-anchor="start">stem 加宽：64 维光谱特征在原图分辨率直接进 backbone，没有 3 通道瓶颈；新通道权重为 0，第 0 步等于预训练 stem 看 16→3 投影。编码器在 0.5× 尺度上跑，梯度检查点 ＋ fp16。</text>
 <text x="40" y="912" font-size="17" font-weight="700" fill="#0f172a" text-anchor="start">④ MAE 预训练（只训练光谱编码器，DETR 不参与；数据 = 官方 3000 训练 + 1000 测试图，不读标签）</text>
 <rect x="40" y="935" width="250" height="110" rx="9" fill="#faf5ff" stroke="#7c3aed" stroke-width="1.6"/>
 <text x="165.0" y="967.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">两种掩码</text>

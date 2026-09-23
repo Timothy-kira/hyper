@@ -1149,8 +1149,14 @@ class SpectralEncoder(nn.Module):
 The detector keeps its pretrained spatial machinery; S3T adds what it cannot
 see. Two paths out of the spectral encoder:
 
-1. main: a 1x1 map of the encoder's features to 3 channels, upsampled and
-   added to a plain 16->3 projection of the bands, feeding the pretrained stem;
+1. main: the encoder's 64-d features, upsampled to full resolution, go into
+   the pretrained stem *beside* a plain 16->3 projection of the bands. The
+   stem's first conv is widened from 3 to 3 + 64 input channels: the first 3
+   keep their COCO weights, the new 64 start at zero (I3D-style inflation with
+   a ControlNet-style zero init). Nothing is squeezed through 3 channels any
+   more, and step 0 is still exactly the pretrained stem on the projection.
+   (widen=False keeps the older form: features mapped to 3 channels by a
+   zero-init 1x1 and added to the projection -- a 64 -> 3 bottleneck);
 2. side: the same features pooled to P3/P4/P5 and added, through zero-
    initialised 1x1 convs, to the hybrid encoder's input projections.
 
@@ -1202,19 +1208,23 @@ class S3TFront(nn.Module):
     """
 
     def __init__(self, encoder: SpectralEncoder, projection=None, scale: float = 0.5,
-                 grad_ckpt: bool = True, amp: bool = True):
+                 grad_ckpt: bool = True, amp: bool = True, widen: bool = True):
         super().__init__()
         n, d = encoder.n_bands, encoder.dim
         self.enc, self.scale, self.grad_ckpt, self.amp = encoder, scale, grad_ckpt, amp
+        self.widen = widen
+        # Channels this front hands the stem: 3 (projection) + d when widened.
+        self.out_channels = 3 + d if widen else 3
         self.base = nn.Conv2d(n, 3, 1, bias=False)
         with torch.no_grad():
             if projection is not None:
                 self.base.weight.copy_(torch.as_tensor(projection, dtype=torch.float32).view(3, n, 1, 1))
             else:
                 self.base.weight.fill_(1.0 / n)
-        self.head = nn.Conv2d(d, 3, 1)
-        nn.init.zeros_(self.head.weight)
-        nn.init.zeros_(self.head.bias)
+        if not widen:
+            self.head = nn.Conv2d(d, 3, 1)
+            nn.init.zeros_(self.head.weight)
+            nn.init.zeros_(self.head.bias)
 
     def __getstate__(self):
         # The side features of the last forward are a graph-carrying tensor:
@@ -1237,8 +1247,35 @@ class S3TFront(nn.Module):
     def forward(self, x):
         f = self._encode(x)                                     # (B, D, h, w)
         self.__dict__["_side"] = f
+        if self.widen:
+            up = F.interpolate(f, size=x.shape[-2:], mode="bilinear", align_corners=False)
+            return torch.cat([self.base(x), up.to(x.dtype)], 1)   # (B, 3 + D, H, W)
         up = F.interpolate(self.head(f), size=x.shape[-2:], mode="bilinear", align_corners=False)
         return self.base(x) + up
+
+
+def widen_first_conv(block: nn.Module, extra: int) -> nn.Conv2d:
+    """Give the block's first conv `extra` more input channels, zero-initialised.
+
+    The original input channels keep their (pretrained) weights, so on inputs
+    whose extra channels are anything at all the output is unchanged at step 0;
+    gradient then decides how much of the new channels to use.
+    """
+    old = next(m for m in block.modules() if isinstance(m, nn.Conv2d))
+    new = nn.Conv2d(old.in_channels + extra, old.out_channels, old.kernel_size, old.stride,
+                    old.padding, old.dilation, old.groups, bias=old.bias is not None,
+                    padding_mode=old.padding_mode).to(old.weight.device, old.weight.dtype)
+    with torch.no_grad():
+        new.weight.zero_()
+        new.weight[:, :old.in_channels] = old.weight
+        if old.bias is not None:
+            new.bias.copy_(old.bias)
+    for parent in block.modules():
+        for name, child in parent._modules.items():
+            if child is old:
+                parent._modules[name] = new
+                return new
+    raise RuntimeError("first conv not found in its block")
 
 
 class Inject(nn.Module):
@@ -1327,7 +1364,8 @@ ROUND_CONFIG = json.loads(r'''
         "amp": false,
         "deterministic": false,
         "s3t_scale": 0.5,
-        "s3t_require_pretrain": true
+        "s3t_require_pretrain": true,
+        "s3t_widen": true
       },
       "infer": {
         "conf": 0.001,
@@ -2023,7 +2061,7 @@ def find_mae_checkpoint():
 
 
 def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5,
-                      inject=(19, 14, 10), dim=64, depth=4, heads=4, **_):
+                      inject=(19, 14, 10), dim=64, depth=4, heads=4, widen=True, **_):
     """S3T encoder in front of the pretrained first block, plus side injections.
 
     The encoder is loaded from the MAE checkpoint when one is given. inject
@@ -2047,8 +2085,14 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
         log(f"  S3T encoder: MAE weights from {mae_ckpt} (step {ck.get('step')})")
     else:
         log("  S3T encoder: NO pretrained weights -- random initialisation")
-    front = S3TFront(enc, projection=projection, scale=scale)
+    front = S3TFront(enc, projection=projection, scale=scale, widen=widen)
     dev = next(block.parameters()).device
+    if widen:
+        # 3 -> 3 + D input channels on the pretrained stem's first conv, the
+        # new ones zero: no 3-channel bottleneck, identical output at step 0.
+        conv = widen_first_conv(block, enc.dim)
+        log(f"  stem widened: first conv now reads {conv.in_channels} channels "
+            f"(3 pretrained + {enc.dim} S3T, zero-initialised)")
     wrapper = SpectralFront(front, block).to(dev)
     for attr in ("i", "f", "type", "np"):
         if hasattr(block, attr):
@@ -2062,8 +2106,8 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
     net.__dict__["_hod26_mixer_init"] = front.base.weight.detach().clone()
     n_enc = sum(p.numel() for p in enc.parameters())
     log(f"  S3T front: {n_enc / 1e6:.2f}M-param spectral Transformer at {scale}x input "
-        f"scale, 16->3 into the pretrained {type(block).__name__}, zero-init side "
-        f"injections at layers {list(inject)}")
+        f"scale, {'3+' + str(enc.dim) if widen else '16->3'} channels into the pretrained "
+        f"{type(block).__name__}, zero-init side injections at layers {list(inject)}")
     return True
 
 
@@ -2862,7 +2906,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                                    f"(*_mae.pt) attached under {INPUT}")
             adapter = {"kind": "s3t", "n_bands": tr["in_channels"], "projection": proj,
                        "mae_ckpt": str(mae) if mae else None,
-                       "scale": float(tr.get("s3t_scale", 0.5))}
+                       "scale": float(tr.get("s3t_scale", 0.5)),
+                       "widen": bool(tr.get("s3t_widen", True))}
         elif tr.get("spectral_stem", "adapter") == "adapter":
             adapter = {"n_bands": tr["in_channels"], "projection": proj,
                        "ckpt_name": tr["model"], "srf_k": tr.get("srf_k", 0),

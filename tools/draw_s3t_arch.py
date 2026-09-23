@@ -118,14 +118,15 @@ def main() -> None:
     # ③ detection
     section(622, "③ 检测：COCO 预训练 RT-DETR-L（负责空间）")
     y3 = 668
-    box(40, y3, 230, 76, ["head 1×1：64 → 3", "零初始化，上采样回 (H, W)"], "new")
+    box(40, y3, 230, 76, ["S3T 特征 64 通道", "上采样回原图 (H, W)"], "new")
     box(40, y3 + 96, 230, 76, ["base 1×1：16 → 3", "LDA 初始化", "输入 16 波段 level 图"], "new")
-    out.append(f'<circle cx="320" cy="{y3 + 86}" r="17" fill="#fff" stroke="#c2410c" stroke-width="1.8"/>')
-    text(320, y3 + 92, "＋", c="#c2410c", fs=18)
+    out.append(f'<rect x="296" y="{y3 + 64}" width="48" height="44" rx="8" fill="#fff" stroke="#c2410c" stroke-width="1.8"/>')
+    text(320, y3 + 84, "拼接", c="#c2410c", fs=12)
+    text(320, y3 + 100, "3+64", c="#c2410c", fs=12)
     arrow(270, y3 + 38, 306, y3 + 74, c="#c2410c", m="o")
     arrow(270, y3 + 134, 306, y3 + 98, c="#c2410c", m="o")
-    box(365, y3 + 16, 215, 140, ["HGStem + HGNetv2", "stage 1–4", "COCO 预训练", "输出 P3 / P4 / P5"], "det")
-    arrow(337, y3 + 86, 361, y3 + 86)
+    box(365, y3 + 16, 215, 140, ["HGStem + HGNetv2", "第一层卷积加宽 3 → 3+64", "（新通道零初始化）", "COCO 预训练 → P3/P4/P5"], "det")
+    arrow(344, y3 + 86, 361, y3 + 86)
     box(620, y3, 245, 172, ["input_proj（第 19/14/10 层）", "P3 /8、P4 /16、P5 /32", "",
                             "＋ 侧注入 Inject：", "自适应池化 → 1×1 零初始化"], "det")
     arrow(580, y3 + 86, 616, y3 + 86)
@@ -137,8 +138,8 @@ def main() -> None:
     path(f"M {sp} {y2 + 110} L {sp} 646 L 155 646 L 155 {y3 - 4}", c="#c2410c", m="o")
     path(f"M 742 646 L 742 {y3 - 4}", c="#c2410c", m="o")
     text(sp - 8, 640, "S3T 特征 (B, 64, H/2, W/2)", c="#c2410c", fs=12, anchor="end")
-    text(40, y3 + 198, "橙色 = 新加的零初始化层：训练第 0 步，检测器看到的只是 16→3 投影，光谱特征靠梯度逐步接入。"
-         "编码器在 0.5× 输入尺度上跑（回到原生像素尺度），梯度检查点 ＋ fp16。", c="#9a3412", fs=12, anchor="start")
+    text(40, y3 + 198, "stem 加宽：64 维光谱特征在原图分辨率直接进 backbone，没有 3 通道瓶颈；新通道权重为 0，第 0 步等于预训练 stem 看 16→3 投影。"
+         "编码器在 0.5× 尺度上跑，梯度检查点 ＋ fp16。", c="#9a3412", fs=12, anchor="start")
 
     # ④ MAE
     section(912, "④ MAE 预训练（只训练光谱编码器，DETR 不参与；数据 = 官方 3000 训练 + 1000 测试图，不读标签）")

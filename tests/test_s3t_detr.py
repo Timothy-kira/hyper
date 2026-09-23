@@ -97,6 +97,8 @@ def main() -> int:
 
         from ultralytics.nn.tasks import RTDETRDetectionModel
         net = RTDETRDetectionModel("rtdetr-l.yaml", ch=3, nc=18, verbose=False)
+        orig_block = copy.deepcopy(net.model[0]).eval()          # the "pretrained" stem as built
+        w_orig = next(x for x in orig_block.modules() if isinstance(x, torch.nn.Conv2d)).weight.detach().clone()
         ok = m.install_spectral_adapter(net, 16, projection=m.LDA_16_TO_3, kind="s3t",
                                         mae_ckpt=str(ck), scale=0.5)
         check("S3T front installs on rtdetr-l", ok is True)
@@ -110,13 +112,20 @@ def main() -> int:
         check("state_dict has no duplicated front keys",
               len(keys) == len(set(keys)) and not any(".front.enc" in k and "model.19" in k for k in keys))
 
+        stem = next(x for x in net.model[0].block.modules() if isinstance(x, torch.nn.Conv2d))
+        check("stem first conv widened to 3 + D inputs", stem.in_channels == 3 + 32, str(stem.in_channels))
+        check("  the 3 original channels keep their weights",
+              torch.equal(stem.weight[:, :3].detach(), w_orig))
+        check("  the D new channels start at zero", float(stem.weight[:, 3:].abs().sum()) == 0.0)
+
         net.eval()
         xb = torch.rand(1, 16, 160, 224)
         with torch.no_grad():
             out = net(xb)
-            base = net.model[0].block(front.base(xb))
-            plain = net.model[0](xb)
-        check("front starts as the plain projection (zero-init head)", torch.allclose(base, plain, atol=1e-6))
+            ref = orig_block(front.base(xb))                     # pretrained stem on the projection
+            got = net.model[0](xb)
+        check("step 0 == pretrained stem on the plain projection (widened, zero-init)",
+              torch.allclose(ref, got, atol=1e-5), f"max diff {float((ref - got).abs().max()):.2e}")
         check("detector forward runs on 16-band input", out is not None)
 
         net.train()
@@ -124,12 +133,12 @@ def main() -> int:
         loss = sum(t.float().abs().mean() for t in (y if isinstance(y, (list, tuple)) else [y])
                    if torch.is_tensor(t))
         loss.backward()
-        g_head = front.head.weight.grad
+        g_new = stem.weight.grad
         g_inj = net.model[19].proj.weight.grad
         g_enc = front.enc.stem[0].weight.grad
-        check("gradient reaches the zero-init head", g_head is not None and g_head.abs().sum() > 0)
+        check("gradient reaches the new stem channels", g_new is not None and g_new[:, 3:].abs().sum() > 0)
         check("gradient reaches the side injection", g_inj is not None and g_inj.abs().sum() > 0)
-        check("encoder is in the graph (grad after the head moves)", g_enc is not None)
+        check("encoder is in the graph (grad after the new channels move)", g_enc is not None)
 
         cp = copy.deepcopy(net)                 # ultralytics EMA / checkpoint path
         check("deepcopy after a forward (EMA, checkpoints)", "_side" not in cp.model[0].front.__dict__)
@@ -147,6 +156,29 @@ def main() -> int:
         except Exception as e:                  # noqa: BLE001
             fused = str(e)
         check("fuse() for validation still works", fused is True, str(fused))
+
+        # Checkpoint-style round trip of the widened model's weights.
+        sd = back.state_dict()
+        net2 = RTDETRDetectionModel("rtdetr-l.yaml", ch=3, nc=18, verbose=False)
+        m.install_spectral_adapter(net2, 16, projection=m.LDA_16_TO_3, kind="s3t",
+                                   mae_ckpt=str(ck), scale=0.5)
+        try:
+            net2.fuse(verbose=False)
+            missing = net2.load_state_dict(sd, strict=True)
+            rt = True
+        except Exception as e:                  # noqa: BLE001
+            rt = str(e)[:200]
+        check("widened weights load into a freshly built S3T model", rt is True, str(rt))
+
+        # The older 3-channel form still builds (widen=False).
+        net3 = RTDETRDetectionModel("rtdetr-l.yaml", ch=3, nc=18, verbose=False)
+        m.install_spectral_adapter(net3, 16, projection=m.LDA_16_TO_3, kind="s3t",
+                                   mae_ckpt=str(ck), scale=0.5, widen=False)
+        with torch.no_grad():
+            net3.eval()
+            net3(xb)
+        check("widen=False (3-channel) form still runs",
+              next(x for x in net3.model[0].block.modules() if isinstance(x, torch.nn.Conv2d)).in_channels == 3)
 
         m.INPUT = tmp
         check("preflight finds the MAE checkpoint", m.find_mae_checkpoint() == ck)

@@ -666,7 +666,7 @@ def find_mae_checkpoint():
 
 
 def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5,
-                      inject=(19, 14, 10), dim=64, depth=4, heads=4, **_):
+                      inject=(19, 14, 10), dim=64, depth=4, heads=4, widen=True, **_):
     """S3T encoder in front of the pretrained first block, plus side injections.
 
     The encoder is loaded from the MAE checkpoint when one is given. inject
@@ -690,8 +690,14 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
         log(f"  S3T encoder: MAE weights from {mae_ckpt} (step {ck.get('step')})")
     else:
         log("  S3T encoder: NO pretrained weights -- random initialisation")
-    front = S3TFront(enc, projection=projection, scale=scale)
+    front = S3TFront(enc, projection=projection, scale=scale, widen=widen)
     dev = next(block.parameters()).device
+    if widen:
+        # 3 -> 3 + D input channels on the pretrained stem's first conv, the
+        # new ones zero: no 3-channel bottleneck, identical output at step 0.
+        conv = widen_first_conv(block, enc.dim)
+        log(f"  stem widened: first conv now reads {conv.in_channels} channels "
+            f"(3 pretrained + {enc.dim} S3T, zero-initialised)")
     wrapper = SpectralFront(front, block).to(dev)
     for attr in ("i", "f", "type", "np"):
         if hasattr(block, attr):
@@ -705,8 +711,8 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
     net.__dict__["_hod26_mixer_init"] = front.base.weight.detach().clone()
     n_enc = sum(p.numel() for p in enc.parameters())
     log(f"  S3T front: {n_enc / 1e6:.2f}M-param spectral Transformer at {scale}x input "
-        f"scale, 16->3 into the pretrained {type(block).__name__}, zero-init side "
-        f"injections at layers {list(inject)}")
+        f"scale, {'3+' + str(enc.dim) if widen else '16->3'} channels into the pretrained "
+        f"{type(block).__name__}, zero-init side injections at layers {list(inject)}")
     return True
 
 
@@ -1505,7 +1511,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                                    f"(*_mae.pt) attached under {INPUT}")
             adapter = {"kind": "s3t", "n_bands": tr["in_channels"], "projection": proj,
                        "mae_ckpt": str(mae) if mae else None,
-                       "scale": float(tr.get("s3t_scale", 0.5))}
+                       "scale": float(tr.get("s3t_scale", 0.5)),
+                       "widen": bool(tr.get("s3t_widen", True))}
         elif tr.get("spectral_stem", "adapter") == "adapter":
             adapter = {"n_bands": tr["in_channels"], "projection": proj,
                        "ckpt_name": tr["model"], "srf_k": tr.get("srf_k", 0),
