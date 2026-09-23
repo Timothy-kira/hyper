@@ -1,0 +1,176 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="1110" viewBox="0 0 1500 1110" font-family="PingFang SC, Noto Sans CJK SC, Microsoft YaHei, WenQuanYi Zen Hei, Helvetica, Arial, sans-serif">
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker><marker id="o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#c2410c"/></marker></defs>
+<rect width="1500" height="1110" fill="#ffffff"/>
+<text x="40" y="44" font-size="26" font-weight="700" fill="#0f172a" text-anchor="start">S3T-DETR 模型结构</text>
+<text x="40" y="70" font-size="14" font-weight="400" fill="#475569" text-anchor="start">光谱 Transformer（自研，MAE 预训练）＋ COCO 预训练 RT-DETR-L（负责空间）。S3M 的光谱 Mamba 在这里换成了 Transformer。</text>
+<rect x="1040" y="80" width="16" height="14" rx="3" fill="#f1f5f9" stroke="#64748b"/>
+<text x="1062" y="92" font-size="12" font-weight="400" fill="#475569" text-anchor="start">固定预处理</text>
+<rect x="1190" y="80" width="16" height="14" rx="3" fill="#eff6ff" stroke="#2563eb"/>
+<text x="1212" y="92" font-size="12" font-weight="400" fill="#475569" text-anchor="start">S3T 编码器</text>
+<rect x="1340" y="80" width="16" height="14" rx="3" fill="#fff7ed" stroke="#c2410c"/>
+<text x="1362" y="92" font-size="12" font-weight="400" fill="#475569" text-anchor="start">新加的零初始化层</text>
+<rect x="1040" y="104" width="16" height="14" rx="3" fill="#f0fdf4" stroke="#16a34a"/>
+<text x="1062" y="116" font-size="12" font-weight="400" fill="#475569" text-anchor="start">COCO 预训练 DETR</text>
+<rect x="1190" y="104" width="16" height="14" rx="3" fill="#faf5ff" stroke="#7c3aed"/>
+<text x="1212" y="116" font-size="12" font-weight="400" fill="#475569" text-anchor="start">仅预训练用</text>
+<text x="40" y="108" font-size="17" font-weight="700" fill="#0f172a" text-anchor="start">① 输入：固定预处理（无可学习参数，检测和预训练共用）</text>
+<rect x="40" y="135" width="240" height="96" rx="9" fill="#f1f5f9" stroke="#64748b" stroke-width="1.6"/>
+<text x="160.0" y="169.33333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">官方 PNG</text>
+<text x="160.0" y="187.33333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">16-bit，单通道 (4H, 4W)</text>
+<text x="160.0" y="205.33333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">4×4 光谱滤光片阵列</text>
+<rect x="322" y="135" width="240" height="96" rx="9" fill="#f1f5f9" stroke="#64748b" stroke-width="1.6"/>
+<text x="442.0" y="169.33333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">官方 X2Cube</text>
+<text x="442.0" y="187.33333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">→ (H, W, 16)</text>
+<text x="442.0" y="205.33333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">460–600 nm，16 个窄带</text>
+<line x1="280" y1="183" x2="318" y2="183" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="604" y="135" width="240" height="96" rx="9" fill="#f1f5f9" stroke="#64748b" stroke-width="1.6"/>
+<text x="724.0" y="169.33333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">log1p ＋ 每帧 P2–P98 缩放</text>
+<text x="724.0" y="187.33333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">去曝光差异，不截断</text>
+<text x="724.0" y="205.33333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">帧内亮度比例全保留</text>
+<line x1="562" y1="183" x2="600" y2="183" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="886" y="135" width="240" height="96" rx="9" fill="#f1f5f9" stroke="#64748b" stroke-width="1.6"/>
+<text x="1006.0" y="169.33333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">逐波段亚像素对齐</text>
+<text x="1006.0" y="187.33333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">第 k 波段平移 (k//4, k%4)/4 px</text>
+<text x="1006.0" y="205.33333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">16 个波段对齐到块中心</text>
+<line x1="844" y1="183" x2="882" y2="183" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="1168" y="135" width="240" height="96" rx="9" fill="#f1f5f9" stroke="#64748b" stroke-width="1.6"/>
+<text x="1288.0" y="160.33333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">每个波段 3 个特征</text>
+<text x="1288.0" y="178.33333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">level：亮度（保留）</text>
+<text x="1288.0" y="196.33333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">shape：去亮度光谱形状</text>
+<text x="1288.0" y="214.33333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">contrast：31/63 环形局部对比</text>
+<line x1="1126" y1="183" x2="1164" y2="183" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<text x="1288.0" y="251" font-size="13" font-weight="400" fill="#0f172a" text-anchor="middle">张量 (B, 3, 16, H, W)</text>
+<text x="40" y="284" font-size="17" font-weight="700" fill="#0f172a" text-anchor="start">② S3T 光谱编码器（0.25M 参数，权重来自 MAE 预训练）</text>
+<text x="40" y="304" font-size="13" font-weight="400" fill="#64748b" text-anchor="start">token 布局 (B, S, C=16, D=64)：S 是空间位置，每个位置有 16 个波段 token</text>
+<rect x="40" y="340" width="178" height="110" rx="9" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+<text x="129.0" y="363.3333333333333" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">Stem（16 波段共享）</text>
+<text x="129.0" y="381.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">Conv 3×3, stride 2</text>
+<text x="129.0" y="399.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">BatchNorm → GELU</text>
+<text x="129.0" y="417.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">Conv 1×1 → D=64</text>
+<text x="129.0" y="435.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">不做 LayerNorm</text>
+<rect x="245" y="340" width="178" height="110" rx="9" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+<text x="334.0" y="372.3333333333333" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">波段 token</text>
+<text x="334.0" y="390.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">(B, S, 16, 64)</text>
+<text x="334.0" y="408.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">＋ 可学习光谱</text>
+<text x="334.0" y="426.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">位置编码</text>
+<line x1="218" y1="395" x2="241" y2="395" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="450" y="340" width="178" height="110" rx="9" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+<text x="539.0" y="381.3333333333333" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">SpectralBlock ×2</text>
+<text x="539.0" y="399.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">16 个波段 token</text>
+<text x="539.0" y="417.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">之间自注意力</text>
+<line x1="423" y1="395" x2="446" y2="395" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="655" y="340" width="178" height="110" rx="9" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+<text x="744.0" y="372.3333333333333" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">SpatialMix</text>
+<text x="744.0" y="390.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">depthwise 7×7</text>
+<text x="744.0" y="408.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">（16 波段共享）</text>
+<text x="744.0" y="426.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">＋ MLP</text>
+<line x1="628" y1="395" x2="651" y2="395" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="860" y="340" width="178" height="110" rx="9" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+<text x="949.0" y="381.3333333333333" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">SpectralBlock ×2</text>
+<text x="949.0" y="399.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">16 个波段 token</text>
+<text x="949.0" y="417.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">之间自注意力</text>
+<line x1="833" y1="395" x2="856" y2="395" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="1065" y="340" width="178" height="110" rx="9" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+<text x="1154.0" y="381.3333333333333" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">SpatialMix</text>
+<text x="1154.0" y="399.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">depthwise 7×7</text>
+<text x="1154.0" y="417.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">＋ MLP</text>
+<line x1="1038" y1="395" x2="1061" y2="395" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="1270" y="340" width="178" height="110" rx="9" fill="#eff6ff" stroke="#2563eb" stroke-width="1.6"/>
+<text x="1359.0" y="372.3333333333333" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">SpectralPool</text>
+<text x="1359.0" y="390.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">对 16 个波段做</text>
+<text x="1359.0" y="408.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">注意力加权求和</text>
+<text x="1359.0" y="426.3333333333333" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">→ (B, 64, H/2, W/2)</text>
+<line x1="1243" y1="395" x2="1266" y2="395" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<path d="M 1288.0 259 L 1288.0 326 L 129.0 326 L 129.0 336" fill="none" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="440" y="474" width="608" height="112" rx="10" fill="#ffffff" stroke="#93c5fd" stroke-dasharray="5 4"/>
+<text x="450" y="496" font-size="13" font-weight="400" fill="#1d4ed8" text-anchor="start">SpectralBlock 内部（取代 S3M 的 Spectral Mamba 块）</text>
+<rect x="450" y="514" width="112" height="34" rx="6" fill="#f8fafc" stroke="#60a5fa"/>
+<text x="506.0" y="536" font-size="12" font-weight="400" fill="#0f172a" text-anchor="middle">x (B·S, 16, 64)</text>
+<line x1="562" y1="531" x2="572" y2="531" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="574" y="514" width="40" height="34" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+<text x="594.0" y="536" font-size="12" font-weight="400" fill="#0f172a" text-anchor="middle">LN</text>
+<line x1="614" y1="531" x2="624" y2="531" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="626" y="514" width="138" height="34" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+<text x="695.0" y="536" font-size="12" font-weight="400" fill="#0f172a" text-anchor="middle">MHSA 4 头 (SDPA)</text>
+<line x1="764" y1="531" x2="774" y2="531" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="776" y="514" width="98" height="34" rx="6" fill="#f8fafc" stroke="#60a5fa"/>
+<text x="825.0" y="536" font-size="12" font-weight="400" fill="#0f172a" text-anchor="middle">× γ₁ ＋ 残差</text>
+<line x1="874" y1="531" x2="884" y2="531" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="886" y="514" width="40" height="34" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+<text x="906.0" y="536" font-size="12" font-weight="400" fill="#0f172a" text-anchor="middle">LN</text>
+<line x1="926" y1="531" x2="936" y2="531" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="938" y="514" width="118" height="34" rx="6" fill="#dbeafe" stroke="#60a5fa"/>
+<text x="997.0" y="536" font-size="12" font-weight="400" fill="#0f172a" text-anchor="middle">MLP 64→256→64</text>
+<line x1="1056" y1="531" x2="1066" y2="531" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="1068" y="514" width="98" height="34" rx="6" fill="#f8fafc" stroke="#60a5fa"/>
+<text x="1117.0" y="536" font-size="12" font-weight="400" fill="#0f172a" text-anchor="middle">× γ₂ ＋ 残差</text>
+<text x="450" y="572" font-size="12" font-weight="400" fill="#475569" text-anchor="start">γ 是 LayerScale（初值 0.1）；LN 只在分支里，残差主干保留绝对亮度；各空间位置互不依赖，所以 MAE 只算可见位置</text>
+<path d="M 539.0 450 L 539.0 472" fill="none" stroke="#93c5fd" stroke-width="1.8" marker-end="url(#a)" stroke-dasharray="6 4"/>
+<text x="40" y="622" font-size="17" font-weight="700" fill="#0f172a" text-anchor="start">③ 检测：COCO 预训练 RT-DETR-L（负责空间）</text>
+<rect x="40" y="668" width="230" height="76" rx="9" fill="#fff7ed" stroke="#c2410c" stroke-width="1.6"/>
+<text x="155.0" y="701.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">head 1×1：64 → 3</text>
+<text x="155.0" y="719.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">零初始化，上采样回 (H, W)</text>
+<rect x="40" y="764" width="230" height="76" rx="9" fill="#fff7ed" stroke="#c2410c" stroke-width="1.6"/>
+<text x="155.0" y="788.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">base 1×1：16 → 3</text>
+<text x="155.0" y="806.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">LDA 初始化</text>
+<text x="155.0" y="824.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">输入 16 波段 level 图</text>
+<circle cx="320" cy="754" r="17" fill="#fff" stroke="#c2410c" stroke-width="1.8"/>
+<text x="320" y="760" font-size="18" font-weight="400" fill="#c2410c" text-anchor="middle">＋</text>
+<line x1="270" y1="706" x2="306" y2="742" stroke="#c2410c" stroke-width="1.8" marker-end="url(#o)"/>
+<line x1="270" y1="802" x2="306" y2="766" stroke="#c2410c" stroke-width="1.8" marker-end="url(#o)"/>
+<rect x="365" y="684" width="215" height="140" rx="9" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.6"/>
+<text x="472.5" y="731.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">HGStem + HGNetv2</text>
+<text x="472.5" y="749.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">stage 1–4</text>
+<text x="472.5" y="767.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">COCO 预训练</text>
+<text x="472.5" y="785.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">输出 P3 / P4 / P5</text>
+<line x1="337" y1="754" x2="361" y2="754" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="620" y="668" width="245" height="172" rx="9" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.6"/>
+<text x="742.5" y="722.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">input_proj（第 19/14/10 层）</text>
+<text x="742.5" y="740.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">P3 /8、P4 /16、P5 /32</text>
+<text x="742.5" y="758.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle"></text>
+<text x="742.5" y="776.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">＋ 侧注入 Inject：</text>
+<text x="742.5" y="794.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">自适应池化 → 1×1 零初始化</text>
+<line x1="580" y1="754" x2="616" y2="754" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="905" y="684" width="245" height="140" rx="9" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.6"/>
+<text x="1027.5" y="740.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">Hybrid encoder</text>
+<text x="1027.5" y="758.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">AIFI（P5 自注意力）</text>
+<text x="1027.5" y="776.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">CCFM 跨尺度融合</text>
+<line x1="865" y1="754" x2="901" y2="754" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="1190" y="684" width="270" height="140" rx="9" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.6"/>
+<text x="1325.0" y="740.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">Transformer decoder</text>
+<text x="1325.0" y="758.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">300 个 query，去噪训练</text>
+<text x="1325.0" y="776.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">→ 框 ＋ 18 类</text>
+<line x1="1150" y1="754" x2="1186" y2="754" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<path d="M 1359.0 450 L 1359.0 646 L 155 646 L 155 664" fill="none" stroke="#c2410c" stroke-width="1.8" marker-end="url(#o)"/>
+<path d="M 742 646 L 742 664" fill="none" stroke="#c2410c" stroke-width="1.8" marker-end="url(#o)"/>
+<text x="1351.0" y="640" font-size="12" font-weight="400" fill="#c2410c" text-anchor="end">S3T 特征 (B, 64, H/2, W/2)</text>
+<text x="40" y="866" font-size="12" font-weight="400" fill="#9a3412" text-anchor="start">橙色 = 新加的零初始化层：训练第 0 步，检测器看到的只是 16→3 投影，光谱特征靠梯度逐步接入。编码器在 0.5× 输入尺度上跑（回到原生像素尺度），梯度检查点 ＋ fp16。</text>
+<text x="40" y="912" font-size="17" font-weight="700" fill="#0f172a" text-anchor="start">④ MAE 预训练（只训练光谱编码器，DETR 不参与；数据 = 官方 3000 训练 + 1000 测试图，不读标签）</text>
+<rect x="40" y="935" width="250" height="110" rx="9" fill="#faf5ff" stroke="#7c3aed" stroke-width="1.6"/>
+<text x="165.0" y="967.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">两种掩码</text>
+<text x="165.0" y="985.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">tube 空间掩码 75%</text>
+<text x="165.0" y="1003.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">（4×4 token 为单位，16 波段一起遮）</text>
+<text x="165.0" y="1021.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">连续 2 个波段（按波长顺序）</text>
+<rect x="330" y="935" width="250" height="110" rx="9" fill="#faf5ff" stroke="#7c3aed" stroke-width="1.6"/>
+<text x="455.0" y="976.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">编码器（同 ②）</text>
+<text x="455.0" y="994.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">只计算可见位置</text>
+<text x="455.0" y="1012.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">→ token 数只剩 1/4</text>
+<line x1="290" y1="990" x2="326" y2="990" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="620" y="935" width="250" height="110" rx="9" fill="#faf5ff" stroke="#7c3aed" stroke-width="1.6"/>
+<text x="745.0" y="976.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">轻量解码器</text>
+<text x="745.0" y="994.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">SpatialMix ＋ SpectralBlock</text>
+<text x="745.0" y="1012.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">宽度 32，预训练后丢弃</text>
+<line x1="580" y1="990" x2="616" y2="990" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="910" y="935" width="250" height="110" rx="9" fill="#faf5ff" stroke="#7c3aed" stroke-width="1.6"/>
+<text x="1035.0" y="976.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">重建</text>
+<text x="1035.0" y="994.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">每个 token 的 2×2 像素</text>
+<text x="1035.0" y="1012.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">× 16 波段的 level</text>
+<line x1="870" y1="990" x2="906" y2="990" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<rect x="1200" y="935" width="250" height="110" rx="9" fill="#faf5ff" stroke="#7c3aed" stroke-width="1.6"/>
+<text x="1325.0" y="967.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">损失</text>
+<text x="1325.0" y="985.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">归一化 MSE</text>
+<text x="1325.0" y="1003.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">＋ 0.5 × L1（防平坦光谱）</text>
+<text x="1325.0" y="1021.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">＋ 0.5 × 光谱梯度</text>
+<line x1="1160" y1="990" x2="1196" y2="990" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
+<text x="40" y="1075" font-size="12" font-weight="400" fill="#6d28d9" text-anchor="start">双卡 T4：DDP (NCCL) · fp16 + GradScaler · SDPA mem-efficient（T4 不支持 FlashAttention） · fused AdamW · 逐 block torch.compile（可选 CUDA Graphs，失败不回退）</text>
+</svg>

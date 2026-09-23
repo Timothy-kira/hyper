@@ -3,6 +3,10 @@
 > 参考 S3M 技术报告（ICPR 2026 "Beyond Visible Spectrum" 分类方案）的设计，按本比赛重新设计。
 > S3M 的光谱 Mamba 流在这里**全部换成 Transformer**；空间部分不再自己搭，直接使用 COCO 预训练的 RT-DETR-L。
 
+![S3T-DETR 结构](s3t_architecture.png)
+
+（矢量版：[`s3t_architecture.svg`](s3t_architecture.svg)，由 `tools/draw_s3t_arch.py` 生成）
+
 ## 1 为什么用高光谱
 
 本比赛的 18 类中有多组"外形相同、材质不同"的配对（apple / apple_plastic、egg / egg_plastic / egg_wood、car / car_toy），它们只能靠光谱区分。另一方面，我们的误差分解显示：模型已经找到了 98.3% 的目标，其中 99.9% 类别判对；剩下的差距全部在**框不够紧**，集中在 stone_block、people、e-bike、car 这四类。CPU 扫描发现，这四类的光谱几乎就是背景光谱乘上 0.68–0.90 的亮度系数（"灰对灰"）。所以模型既要能读懂光谱，又必须**保留绝对亮度和局部对比**，这是下文几处关键改动的出发点。

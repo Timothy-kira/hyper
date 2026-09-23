@@ -61,6 +61,9 @@ preflight passed
 
 ## 模型结构（详细见 `docs/S3T.md`）
 
+![S3T-DETR 结构](../docs/s3t_architecture.png)
+
+
 - 输入：官方 X2Cube → log 辐亮度 → 每帧 P2–P98 缩放 → **逐波段亚像素对齐** → 16 通道 uint8。
 - S3T 前端：每个波段 token 带 3 个特征（亮度 level、去亮度后的光谱形状 shape、63px 环形背景的局部对比 contrast），经过 4 层**光谱自注意力**（每个像素内 16 个波段 token 之间做 attention）和 2 次局部空间混合，再对波段做注意力池化。
 - 两条通路接入 DETR：① 1×1 卷积投影到 3 通道，送进 COCO stem；② 零初始化的侧注入，加到 P3/P4/P5 的输入投影上。
