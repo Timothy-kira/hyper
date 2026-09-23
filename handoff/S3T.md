@@ -6,15 +6,16 @@
 
 在 COCO 预训练的 RT-DETR-L 前面，加一个自己设计的**光谱编码器 S3T-X**（逐像素的通道协方差注意力），用 MAE 在官方 4000 张图上预训练。检测头在 RT-DETR 自己的 decoder 上加了 **D-FINE 的分布回归**，分类用 **MAL**。所有新加的层都零初始化，训练第 0 步就是原封不动的 COCO RT-DETR。
 
-## 现状（2026-09-23 11:30 UTC）
+## 现状（2026-09-23 16:00 UTC）
 
 | 环节 | 状态 | 在哪里 |
 | --- | --- | --- |
 | 速度探针（T4，1024²，真实 loss） | **完成**，S3T-X 通过，见下 | `zetaoxia/hod26-s3t-detr-probe` v5–v7 |
 | MAE v3 预训练（S3T-X，修掉特征泄漏） | **完成**：6358 步，90.6 分钟，6 项检查全部 PASS | 公开 notebook `zetaoxia/hod26-s3t-mae-pretrain3`，输出 `s3t_mae/pretrain3_mae.pt` |
 | 检测：S3T-X 前端 + D-FINE + MAL + 数据增强 | **代码完成**，CPU 上端到端跑通（渲染 → 训练 → 保存 best/last → 重载 → submission.csv） | `tools/s3t_round.py` 生成 `handoff/s3t/hod26_round.py` |
-| 全流程冒烟（smoke_only） | **通过**（14:45）：0.682 s/it，加速全开，训练 / 验证 / best+last / fp16 验证 / 预测 / submission 全部走通，用时 217 秒 | `zetaoxia/hod26-s3t-detr` |
-| 正式检测训练 | **运行中**：约 14:50 UTC 开始，从 COCO 训练 40 epoch（约 15 分钟一个），预计约 10 小时 | `zetaoxia/hod26-s3t-detr` |
+| 全流程冒烟（smoke_only） | **通过**（15:55，512 loader + 分阶段解冻版）：**0.550 s/it**（之前 1024 loader 是 0.682），加速全开，训练 / 验证 / best+last / fp16 验证 / 预测 / submission 全部走通，用时 217 秒 | `zetaoxia/hod26-s3t-detr` v1 |
+| 正式检测训练 | **运行中**：15:56 UTC 开始，从 COCO 训练 44 epoch，512 loader，分阶段解冻，BN 冻结，预计约 10.4 小时 | `zetaoxia/hod26-s3t-detr` v2 |
+| 上一次正式训练（1024 loader） | 按用户要求删掉了：第 1 个 epoch 用了 1055 秒，GPU 利用率只有 53% 和 61%，瓶颈在数据加载；而且没有保护预训练权重。见下面两节 | |
 
 旧的 band-token 编码器（MAE v1/v2）已经停用。v2 那一轮是按用户要求中途删除的，原因见"为什么换成 S3T-X"。
 
@@ -241,12 +242,16 @@ preflight passed
   S3T-X: cross-covariance attention, windows [16, 16, None, None], channels_last; no checkpoints; encoder trained
   S3T-X front: 0.21M-param encoder at 0.5x input scale, stride-4 output joined to HGStem's 48-ch output (zero-init 1x1); ...
   S3T blocks compiled in place: 4
+  S3T-X input: loader at 1/2 of the detector's resolution; the encoder reads it directly (scale 1), ...
+  BatchNorm: 122 layers frozen to COCO's running statistics (eval mode throughout; 2 images/card, no SyncBN)
+  staged unfreezing (...): head (0, 0, 1.0) 0.97M; new 1.24M; ...; backbone (5, 3, 0.1) 13.48M; stem frozen ...
   acceleration table:
     ON   AMP fp16 (+GradScaler)
     ON   loss + Hungarian matching in fp32
     ON   RT-DETR attention via SDPA  (7 nn.MultiheadAttention swapped)
     ON   fused AdamW
     ON   cudnn.benchmark
+    ON   mosaic canvas reuse (data loader)
     off  FlashAttention / TF32 / bf16  (not supported on T4 (sm75))
   2 GPU(s) visible; DDP across [0, 1], batch 4 (2/card)
 ```
@@ -283,7 +288,7 @@ MAE 预训练**不做**任何增强：只用官方的 4000 帧原图裁块。验
 | 时间（UTC） | 内容 |
 | --- | --- |
 | 09:54 – 11:26 | MAE v3 预训练（90.6 分钟，公开 notebook）✅ |
-| 14:50 – 约 01:00 | 检测训练 40 epoch（开头先冒烟约 4 分钟；时钟保护会在超时前停下，并保存 best/last） |
+| 15:56 – 约 02:30 | 检测训练 44 epoch（smoke_only 已经单独跑过，所以用 `--no-smoke`；时钟保护会在超时前停下，并保存 best/last） |
 | 之后 | 同一个 session 里预测测试集，写 `submission.csv` |
 
 还有余量：如果第一轮结束后时间和额度都够，可以挂上 `final_last.pt` 再续一轮。

@@ -33,10 +33,11 @@ from tools.final_runs import full_candidate  # noqa: E402
 
 OUT = REPO / "kernels" / "s3t_detr" / "build"
 MAE_KERNEL = "zetaoxia/hod26-s3t-mae-pretrain3"      # MAE v3, the S3T-X encoder
-TOTAL = 40            # epochs: the GPU smoke measured 0.682 s/it on 2x T4 with real data and
-                      # every acceleration -> ~15 min/epoch with validation, ~10 h; fits the
-                      # 11 h session with the smoke, the prediction reserve and headroom, so
-                      # the 3 closing no-mosaic epochs always run
+TOTAL = 44            # epochs: the GPU smoke measures 0.550 s/it with the 512 loader (0.682
+                      # at 1024). The last formal run's epoch took 1.29x its smoke's s/it x
+                      # 1200 its (validation, loader); at that ratio ~850 s/epoch, 44 epochs
+                      # ~10.4 h -- inside the 11 h session with the prediction reserve, so
+                      # the cosine schedule and the 3 closing no-mosaic epochs always run
 SESSION_HOURS = 11.0
 
 AUGMENT = {"sg_window": 7, "sg_polyorder": 2, "sg_chain": True,

@@ -1631,13 +1631,23 @@ class S3TXFront(nn.Module):
 
     Every new path starts at zero: step 0 is the pretrained detector on the
     projection, exactly.
+
+    upsample: the data loader delivers the input at 1/upsample of the
+    detector's resolution and the 2x happens here, on the GPU. The cube is
+    493x241 natively, so a 512 loader loses nothing; rendering, mosaic and
+    affine augmentation at 1024 cost the 4 vCPUs of a T4 pair 3.5x more per
+    sample (145 vs 41 ms) and left the GPUs 40% idle. The 16->3 projection is
+    applied first and only its 3 channels are resized (a 1x1 conv commutes with
+    bilinear interpolation), and the encoder, which wants native scale, reads
+    the loader's input directly (scale * upsample = 1: no resize at all).
     """
 
     def __init__(self, encoder, projection=None, scale: float = 0.5, grad_ckpt: bool = True,
-                 amp: bool = True, stem_ch: int = 48, train_encoder: bool = True):
+                 amp: bool = True, stem_ch: int = 48, train_encoder: bool = True, upsample: int = 1):
         super().__init__()
         n, d = encoder.n_bands, encoder.dim
         self.enc, self.scale, self.amp = encoder, scale, amp
+        self.upsample = int(upsample)
         encoder.grad_ckpt = bool(grad_ckpt)
         self.train_encoder = bool(train_encoder)
         if not self.train_encoder:
@@ -1665,9 +1675,10 @@ class S3TXFront(nn.Module):
         # Features in fp32 whatever the model's dtype: the ring means and the
         # per-band statistics are sums over many pixels.
         level = x.float() * LEVEL_SPAN + LEVEL_LO
-        if self.scale != 1.0:
-            level = F.interpolate(level, scale_factor=self.scale, mode="bilinear",
-                                  align_corners=False, antialias=True)
+        s = self.scale * getattr(self, "upsample", 1)
+        if s != 1.0:
+            level = F.interpolate(level, scale_factor=s, mode="bilinear",
+                                  align_corners=False, antialias=s < 1)
         feats = observed_features(level)
         wdt = self.fuse.weight.dtype
         amp = self.amp and x.is_cuda
@@ -1711,7 +1722,11 @@ class S3TXFront(nn.Module):
     def forward(self, x):
         f, pyr = self._encode(x)
         self.__dict__["_side"], self.__dict__["_pyr"] = f, pyr
-        return self.base(x)
+        y = self.base(x)
+        u = getattr(self, "upsample", 1)
+        if u > 1:
+            y = F.interpolate(y, scale_factor=u, mode="bilinear", align_corners=False)
+        return y
 
 
 def widen_first_conv(block: nn.Module, extra: int) -> nn.Conv2d:
@@ -1869,8 +1884,8 @@ ROUND_CONFIG = json.loads(r'''
       },
       "train": {
         "model": "rtdetr-l",
-        "imgsz": 1024,
-        "epochs": 40,
+        "imgsz": 512,
+        "epochs": 44,
         "batch": 2,
         "lr0": 0.01,
         "mosaic": 1.0,
@@ -1886,7 +1901,7 @@ ROUND_CONFIG = json.loads(r'''
         "srf_k": 8,
         "srf_width": 2.0,
         "warmup_epochs": 5.0,
-        "schedule_epochs": 40,
+        "schedule_epochs": 44,
         "bbox_loss": "GIoU",
         "loss_gain": {},
         "bbox_alpha": 1.0,
@@ -1907,8 +1922,47 @@ ROUND_CONFIG = json.loads(r'''
         "amp_fp32_loss": true,
         "s3t_arch": "xca",
         "s3t_grad_ckpt": false,
+        "s3t_upsample": 2,
         "fdr": true,
         "mal": true,
+        "unfreeze": {
+          "head": [
+            0,
+            0,
+            1.0
+          ],
+          "new": [
+            0,
+            0,
+            1.0
+          ],
+          "mixer": [
+            0,
+            0,
+            1.0
+          ],
+          "decoder": [
+            2,
+            2,
+            1.0
+          ],
+          "neck": [
+            2,
+            2,
+            1.0
+          ],
+          "s3t_enc": [
+            2,
+            2,
+            1.0
+          ],
+          "backbone": [
+            5,
+            3,
+            0.1
+          ]
+        },
+        "frozen_bn": true,
         "channels_last": false,
         "s3t_mae_file": "pretrain3_mae.pt"
       },
@@ -1935,7 +1989,8 @@ ROUND_CONFIG = json.loads(r'''
     "session_hours": 11.0,
     "require_gpus": 2,
     "render_only": false,
-    "smoke_only": false
+    "smoke_only": false,
+    "smoke": true
   }
 }
 ''')
@@ -2460,6 +2515,10 @@ def predict_kwargs(cand):
           "batch": PREDICT_BATCH}
     if inf.get("iou") is not None:
         kw["iou"] = inf["iou"]
+    if int(cand["train"].get("s3t_upsample", 1)) > 1:
+        # The model upsamples inside; predict must feed it what the loader fed
+        # it in training, not the detector's own resolution.
+        kw["imgsz"] = cand["train"]["imgsz"]
     return kw
 
 
@@ -2577,8 +2636,24 @@ if _nn is not None:
             with _t.autocast(dev, enabled=False):
                 kw = {k: self._f(v) for k, v in kw.items()}
                 return self.inner(self._f(preds), targets, **kw)
+
+    class FrozenBatchNorm2d(_nn.BatchNorm2d):
+        """BatchNorm that always normalises with its running statistics.
+
+        At 2 images per card and no SyncBN, train-mode BatchNorm normalises
+        each layer with the statistics of two mosaics and folds them into the
+        COCO running estimates it was pretrained with (momentum 0.03 a step),
+        so the pretrained statistics are gone within a few hundred steps and
+        training normalises differently from evaluation. Eval mode throughout
+        keeps COCO's statistics and makes the layer a fixed affine map whose
+        scale and shift still train (where their part's LR allows). The class
+        is swapped in place, so state_dict, fuse() and pickling are unchanged.
+        """
+
+        def train(self, mode=True):
+            return super().train(False)
 else:                                                # pragma: no cover
-    SpectralFront = None
+    SpectralFront = FrozenBatchNorm2d = None
 
 try:
     import torch as _torch
@@ -3022,7 +3097,7 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
                       inject=(19, 14, 10), dim=64, depth=4, heads=4, widen=True,
                       context=True, ctx_layer=11, ckpt_chunks=8, compile_blocks=False,
                       fast_kernels=False, train_encoder=True, arch="tokens", grad_ckpt=True,
-                      windows=(16, 16, None, None), **_):
+                      windows=(16, 16, None, None), upsample=1, **_):
     """S3T encoder in front of the pretrained first block, plus side injections.
 
     The encoder is loaded from the MAE checkpoint when one is given; its config
@@ -3030,6 +3105,9 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
     "tokens": the band-token encoder, joined at the stem's widened input).
     inject names the hybrid encoder's input projections (P3, P4, P5 in
     rtdetr-l); each gets the spectral features through a zero-initialised 1x1.
+    upsample (xca only) lets the loader run at 1/upsample of the detector's
+    resolution: the front reads that input directly and hands the detector a
+    bilinear upsample made on the GPU (see S3TXFront).
     """
     import torch
 
@@ -3055,7 +3133,7 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
     if xca:
         stem_ch = [m for m in block.modules() if isinstance(m, torch.nn.Conv2d)][-1].out_channels
         front = S3TXFront(enc, projection=projection, scale=scale, grad_ckpt=grad_ckpt,
-                          stem_ch=stem_ch, train_encoder=train_encoder)
+                          stem_ch=stem_ch, train_encoder=train_encoder, upsample=upsample)
         widen = False
     else:
         front = S3TFront(enc, projection=projection, scale=scale, widen=widen,
@@ -3105,6 +3183,10 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
         log(f"  S3T-X: cross-covariance attention, windows {enc.windows}, channels_last; "
             f"{'per-block checkpoints' if grad_ckpt else 'no checkpoints'}; encoder "
             f"{'trained' if train_encoder else 'FROZEN (feature extractor)'}")
+        if upsample > 1:
+            log(f"  S3T-X input: loader at 1/{upsample} of the detector's resolution; the "
+                f"encoder reads it directly (scale {scale * upsample:g}), the detector gets a "
+                f"{upsample}x bilinear upsample on the GPU")
         log(f"  S3T-X front: {n_enc / 1e6:.2f}M-param encoder at {scale}x input scale, "
             f"stride-4 output joined to {type(block).__name__}'s {front.fuse.out_channels}-ch output "
             f"(zero-init 1x1); learned pyramid -> zero-init injections at layers {list(inject)}"
@@ -3189,6 +3271,45 @@ def _install_mosaic_canvas_reuse():
     apply_image._hod26_orig = orig
     Mosaic.apply_image = apply_image
     return True
+
+
+def _install_amp_check_override():
+    """ultralytics' check_amp, overridable for runs that require AMP.
+
+    check_amp compares fp32 and fp16 inference of a *different* model (YOLO26n)
+    on one image and fails on any difference in the number of boxes. On a T4
+    with cudnn.benchmark that flips between processes: the S3T-X smoke passed it
+    and the long run, two minutes later in the same session, failed it -- and
+    would have trained in fp32 at half the speed had the run not refused. AMP
+    on *this* model is measured instead (probes and smokes: finite losses,
+    stable GradScaler), and its loss and Hungarian matching run in fp32. So when
+    HOD26_REQUIRE_AMP=1 (set by run_candidate for such runs, inherited by the
+    DDP workers) a failed check is logged and overridden; otherwise untouched.
+    """
+    try:
+        import ultralytics.engine.trainer as _tr
+    except Exception:                                           # noqa: BLE001
+        return False
+    if getattr(_tr.check_amp, "_hod26", False):
+        return True
+    orig = _tr.check_amp
+
+    def check_amp(model):
+        ok = orig(model)
+        if not ok and os.environ.get("HOD26_REQUIRE_AMP") == "1":
+            os.environ["HOD26_AMP_OVERRIDDEN"] = "1"
+            print("AMP: ultralytics check_amp failed (YOLO26n fp32 vs fp16 box count); "
+                  "overridden -- this run requires AMP, measured stable on its own model, "
+                  "loss and matching in fp32", flush=True)
+            return True
+        return ok
+
+    check_amp._hod26 = True
+    _tr.check_amp = check_amp
+    return True
+
+
+_install_amp_check_override()
 
 
 def mosaic_canvas_patched():
@@ -3497,10 +3618,149 @@ def restore_state(net, src):
     return len(ok)
 
 
+def freeze_batchnorm(net):
+    """Every BatchNorm2d in the model to FrozenBatchNorm2d (eval mode for good)."""
+    n = 0
+    for m in net.modules():
+        if type(m) is _nn.BatchNorm2d:
+            m.__class__ = FrozenBatchNorm2d
+            m.eval()
+            n += 1
+    return n
+
+
+# What each part of the S3T-X detector is, for staged unfreezing:
+#   head        the classification and box heads (decoder and encoder-query
+#               selection) and the denoising class embedding -- the weights that
+#               say what and where;
+#   new         everything zero- or randomly initialised for this model: the S3T
+#               fusion, pyramid and injections, and D-FINE's distribution heads;
+#   mixer       the 16 -> 3 band projection in front of the pretrained stem;
+#   decoder     the pretrained decoder layers, input projections, query
+#               positional head and encoder output projection;
+#   neck        the pretrained hybrid encoder (AIFI + CCFM);
+#   s3t_enc     the MAE-pretrained S3T-X encoder;
+#   backbone    HGNetv2 stages 1-4 (COCO);
+#   stem        HGNetv2's stem (COCO);
+#   frozen_norm BatchNorm scale/shift in the stem and backbone.
+UNFREEZE_HEAD_KEYS = ("dec_score_head", "dec_bbox_head", "enc_score_head",
+                      "enc_bbox_head", "denoising_class_embed")
+UNFREEZE_PARTS = ("head", "new", "mixer", "decoder", "neck", "s3t_enc",
+                  "backbone", "stem", "frozen_norm")
+
+
+def param_parts(net):
+    """{id(param): (part, name)} for every parameter of an (unwrapped) detector."""
+    net = getattr(net, "module", net)
+    n_bb = len((getattr(net, "yaml", None) or {}).get("backbone") or []) or 10
+    last = len(net.model) - 1
+    norms = {id(p) for m in net.model[:n_bb] for mm in m.modules()
+             if isinstance(mm, _nn.BatchNorm2d) for p in mm.parameters(recurse=False)}
+    out = {}
+    for name, p in net.named_parameters():
+        bits = name.split(".")
+        if bits[0] != "model":
+            raise RuntimeError(f"unfreeze: parameter outside net.model: {name}")
+        i, rest = int(bits[1]), ".".join(bits[2:])
+        if id(p) in norms:
+            part = "frozen_norm"
+        elif i == 0:
+            part = ("s3t_enc" if rest.startswith("front.enc.") else
+                    "mixer" if rest.startswith("front.base.") else
+                    "new" if rest.startswith("front.") else "stem")
+        elif i < n_bb:
+            part = "backbone"
+        elif i < last:
+            wrapped = type(net.model[i]).__name__ in ("Inject", "ContextInject", "Tap")
+            part = "new" if wrapped and not rest.startswith("layer.") else "neck"
+        elif rest.startswith("decoder.fdr."):
+            part = "new"
+        else:
+            part = "head" if bits[2] in UNFREEZE_HEAD_KEYS else "decoder"
+        out[id(p)] = (part, name)
+    return out
+
+
+def unfreeze_mult(schedule, part, epoch):
+    """LR multiplier of a part at an epoch: 0 until its first epoch, then a
+    linear ramp over `ramp` epochs to its target. No entry: frozen for good."""
+    s = schedule.get(part)
+    if not s:
+        return 0.0
+    start, ramp, target = s
+    if epoch < start:
+        return 0.0
+    return float(target) * (1.0 if ramp <= 0 else min(1.0, (epoch - start + 1) / ramp))
+
+
+def split_groups_by_part(groups, net, schedule):
+    """ultralytics' three groups (weight / bn / bias), each split by part.
+
+    Every group keeps its own hyperparameters (and the param_group key the
+    warmup reads); the part rides along as an extra key.
+    """
+    parts = param_parts(net)
+    unknown = sorted({pt for pt, _ in parts.values()} - set(UNFREEZE_PARTS))
+    if unknown:
+        raise RuntimeError(f"unfreeze: unclassified parts {unknown}")
+    extra = sorted(set(schedule) - set(UNFREEZE_PARTS))
+    if extra:
+        raise RuntimeError(f"unfreeze: schedule names unknown parts {extra}")
+    out = []
+    for g in groups:
+        by = {}
+        for p in g["params"]:
+            if id(p) not in parts:
+                raise RuntimeError("unfreeze: an optimizer parameter is not in the model")
+            by.setdefault(parts[id(p)][0], []).append(p)
+        for part in UNFREEZE_PARTS:
+            if by.get(part):
+                out.append({**{k: v for k, v in g.items() if k != "params"},
+                            "params": by[part], "part": part})
+    n_opt = sum(len(g["params"]) for g in out)
+    if n_opt != sum(len(g["params"]) for g in groups):
+        raise RuntimeError("unfreeze: the split lost parameters")
+    return out
+
+
+def attach_unfreeze(opt, trainer, schedule):
+    """Scale each group's LR by its part's multiplier for the step, then put it back.
+
+    Multipliers rather than requires_grad: DDP registers its gradient hooks
+    once, on the parameters that require grad when it wraps the model, and
+    ultralytics turns requires_grad back on for any float parameter it finds
+    frozen. A multiplier of 0 is an exact freeze under AdamW (the update and
+    the decoupled decay both scale with the LR), and the LR the warmup and the
+    scheduler write is left alone -- only the step sees the product.
+    """
+    state = {"epoch": None, "saved": None}
+
+    def pre(o, args, kwargs):
+        e = int(getattr(trainer, "epoch", 0) or 0)
+        if e != state["epoch"]:
+            state["epoch"] = e
+            if is_main_rank():
+                log(f"  unfreeze epoch {e + 1}: " + ", ".join(
+                    f"{pt} {unfreeze_mult(schedule, pt, e):g}" for pt in UNFREEZE_PARTS))
+        state["saved"] = [g["lr"] for g in o.param_groups]
+        for g in o.param_groups:
+            g["lr"] = g["lr"] * unfreeze_mult(schedule, g.get("part"), e)
+
+    def post(o, args, kwargs):
+        for g, lr in zip(o.param_groups, state["saved"]):
+            g["lr"] = lr
+
+    opt.register_step_pre_hook(pre)
+    opt.register_step_post_hook(post)
+    opt.__dict__["_hod26_unfreeze"] = schedule
+    return opt
+
+
 def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                   bbox_loss="GIoU", loss_gain=None, is_rtdetr=True,
                   bbox_alpha=1.0, vfl_beta=0.0, log_size_l1=False,
-                  reset_best_fitness=True, accel=None, fdr=False, mal=False):
+                  reset_best_fitness=True, accel=None, fdr=False, mal=False,
+                  unfreeze=None, frozen_bn=False):
     """A trainer that seeds the head from COCO by name and installs the adapter.
 
     Both have to happen inside get_model, and for the same reason: ultralytics
@@ -3534,7 +3794,19 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
 
         def build_optimizer(self, *args, **kwargs):
             opt = super().build_optimizer(*args, **kwargs)
+            groups = opt.param_groups
+            if unfreeze:
+                groups = split_groups_by_part(groups, self.model, unfreeze)
+                if is_main_rank():
+                    counts = {}
+                    for g in groups:
+                        counts[g["part"]] = counts.get(g["part"], 0) + sum(p.numel() for p in g["params"])
+                    log("  staged unfreezing (part: first epoch, ramp epochs, LR x; params): " + "; ".join(
+                        f"{pt} {'frozen' if not unfreeze.get(pt) else tuple(unfreeze[pt])} "
+                        f"{counts.get(pt, 0) / 1e6:.2f}M" for pt in UNFREEZE_PARTS))
             if not accel or not accel.get("fused_optimizer"):
+                if unfreeze:
+                    opt = attach_unfreeze(type(opt)(groups, lr=opt.defaults["lr"]), self, unfreeze)
                 return opt
             import torch
             cls = type(opt)
@@ -3544,18 +3816,23 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
             # fused=None from the first build, and a group's own value wins
             # over the constructor's default -- passing fused=True alone
             # silently kept the foreach kernels.
-            for g in opt.param_groups:
+            for g in groups:
                 g["fused"], g["foreach"] = True, None
-            fused = cls(opt.param_groups, lr=opt.defaults["lr"], fused=True)
+            fused = cls(groups, lr=opt.defaults["lr"], fused=True)
+            if unfreeze:
+                attach_unfreeze(fused, self, unfreeze)
             is_fused = all(g.get("fused") is True for g in fused.param_groups)
             # What this process's model actually has (ensure_accel), not a flag.
             done = ensure_accel(self.model, nc=self.data["nc"], fp32_loss=accel.get("fp32_loss", True),
                                 compile_blocks=bool(adapter and adapter.get("compile_blocks")))
             sdpa_ok = done["sdpa_mha"] > 0 and done["plain_mha"] == 0
             comp_ok = done["compiled"] == done["blocks"] > 0 if done["compile_wanted"] else None
+            overridden = os.environ.get("HOD26_AMP_OVERRIDDEN") == "1"
             table = [
                 ("AMP fp16 (+GradScaler)", bool(getattr(self, "amp", False)),
-                 "ultralytics check_amp result" if not getattr(self, "amp", False) else ""),
+                 "ultralytics check_amp result" if not getattr(self, "amp", False) else
+                 ("ultralytics check_amp failed; overridden (required, measured stable)"
+                  if overridden else "")),
                 ("loss + Hungarian matching in fp32", done["fp32_loss"], ""),
                 ("RT-DETR attention via SDPA", sdpa_ok,
                  f"{done['sdpa_mha']} SDPA, {done['plain_mha']} plain nn.MultiheadAttention"),
@@ -3684,6 +3961,10 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                                   bbox_alpha, vfl_beta, log_size_l1, loss_gain, fdr=fdr, mal=mal)
             if adapter:
                 install_spectral_adapter(net, **adapter)
+            if frozen_bn:
+                n_bn = freeze_batchnorm(net)
+                log(f"  BatchNorm: {n_bn} layers frozen to COCO's running statistics "
+                    f"(eval mode throughout; 2 images/card, no SyncBN)")
             if accel:
                 done = enable_transformer_accel(net, fp32_loss=accel.get("fp32_loss", True),
                                                 nc=self.data["nc"])
@@ -4304,7 +4585,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                        "fast_kernels": bool(tr.get("s3t_fast_kernels", False)),
                        "train_encoder": bool(tr.get("s3t_train_encoder", True)),
                        "arch": tr.get("s3t_arch", "tokens"),
-                       "grad_ckpt": bool(tr.get("s3t_grad_ckpt", True))}
+                       "grad_ckpt": bool(tr.get("s3t_grad_ckpt", True)),
+                       "upsample": int(tr.get("s3t_upsample", 1))}
         elif tr.get("spectral_stem", "adapter") == "adapter":
             adapter = {"n_bands": tr["in_channels"], "projection": proj,
                        "ckpt_name": tr["model"], "srf_k": tr.get("srf_k", 0),
@@ -4321,6 +4603,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                                 vfl_beta=float(tr.get("vfl_beta", 0.0)),
                                 log_size_l1=bool(tr.get("log_size_l1", False)),
                                 fdr=bool(tr.get("fdr", False)), mal=bool(tr.get("mal", False)),
+                                unfreeze=tr.get("unfreeze") or None,
+                                frozen_bn=bool(tr.get("frozen_bn", False)),
                                 accel=({"fp32_loss": bool(tr.get("amp_fp32_loss", True)),
                                         "fused_optimizer": True,
                                         "require_amp": bool(tr.get("amp", False))}
@@ -4328,6 +4612,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
     if tr.get("spectral_stem") == "s3t":
         import torch
         torch.backends.cudnn.benchmark = True
+        if tr.get("amp"):
+            os.environ["HOD26_REQUIRE_AMP"] = "1"
     # One card or both, decided by what the session actually has rather than by
     # what the metadata asked for: a request for two that lands on one must not
     # take the run down with it. Per-card batch stays at tr["batch"], so each
