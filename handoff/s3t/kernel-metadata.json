@@ -1,0 +1,18 @@
+{
+  "id": "TEAMMATE/hod26-s3t-detr",
+  "title": "Hod26 S3T Detr",
+  "code_file": "hod26_round.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "machine_shape": "NvidiaTeslaT4x2",
+  "enable_internet": true,
+  "competition_sources": [],
+  "dataset_sources": [
+    "xishengfeng/hod26-planar"
+  ],
+  "kernel_sources": [
+    "qwyi123/hod26-s3t-mae-pretrain"
+  ]
+}

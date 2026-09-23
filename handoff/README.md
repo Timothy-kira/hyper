@@ -1,5 +1,10 @@
 # HOD26 — round two of the same run, on a fresh account
 
+> **New, separate line: S3T-DETR** (spectral Transformer pretrained with MAE, in
+> front of a COCO RT-DETR-L, full augmentation, 2x T4). Instructions in
+> [`S3T.md`](S3T.md) (Chinese), design in [`../docs/S3T.md`](../docs/S3T.md).
+> It is an alternative to the epoch-21 resume below, not a step of it.
+
 You are on team **Tims** in the [Hyperspectral Object Detection Challenge 2026](https://www.kaggle.com/competitions/hyperspectral-object-detection-challenge-2026).
 Deadline **2026-09-24 16:00 UTC** — about two days out as this is written.
 

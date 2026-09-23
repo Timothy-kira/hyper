@@ -231,3 +231,32 @@ diluting it — and band 4 is where `orange` (+1.29 vs ~0 for its neighbours),
 contrast. Those classes already score well, so this is not urgent, but the
 SRF bank's premise that neighbouring indices are neighbouring wavelengths does
 not hold for band 4.
+
+
+## Enhancing the difference: two CPU scans of fixed transforms
+
+If the grey classes are the background at a different brightness, a transform
+that exposes *local* contrast should separate them better than raw bands. Two
+CPU scans (`tools/build_enhance_scan.py`, no GPU) measured class-wide pixel AUC
+(core vs ring, grouped 5-fold by frame) and median edge d' across the box
+boundary, for each transform:
+
+| transform | AUC deficit 4 / other 14 | edge d' deficit / other |
+| --- | --- | --- |
+| raw16 (log bands, baseline) | 0.711 / 0.895 | 0.26 / 0.93 |
+| lratio, 31 px plain window | 0.652 / 0.868 | 0.18 / 0.72 |
+| lcn, 31 px plain window | 0.634 / 0.858 | 0.13 / 0.61 |
+| local RX, 31 px | 0.695 / 0.718 | 0.23 / 0.46 |
+| whiten16 | 0.713 / 0.895 | 0.27 / 0.92 |
+| shape + raw | 0.718 / 0.902 | 0.28 / 0.98 |
+| lratio, 31/63 annulus | 0.709 / 0.909 | 0.23 / 0.95 |
+| **shape + lratio 31/63 annulus** | **0.728 / 0.922** | **0.28 / 1.02** |
+| raw + lratio 63 + lratio 95 | 0.733 / 0.931 | 0.27 / 0.96 |
+
+A plain 31 px window hurts: for 20–45 px objects it is mostly object, so the
+ratio cancels the contrast it is meant to expose. A guard region (annulus)
+fixes that. The best balanced transform, shape + 31/63 annular log-ratio, is
+what S3T feeds its encoder (level, shape, contrast per band). The gains are
+real but modest: a fixed per-pixel transform moves the deficit classes by
+~0.02 AUC, which is why S3T learns the spectral-spatial mapping instead of
+hand-picking one.
