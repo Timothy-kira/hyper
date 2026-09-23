@@ -1957,6 +1957,13 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
                                                 box.maps[box.ap_class_index])}
         except Exception:
             rec["per_class"] = {}
+        # Mean GPU utilisation over the epoch, per card: high means the GPU
+        # is the limit, low means the data loader (4 vCPUs for 2 ranks) is.
+        g = state.get("_gpu") or []
+        if g:
+            n = min(len(x) for x in g)
+            rec["gpu_util"] = [round(sum(x[i] for x in g) / len(g)) for i in range(n)]
+            g.clear()
         drift = adapter_drift(trainer)
         if drift:
             rec["adapter_drift"] = round(drift["rel"], 6)
@@ -1973,6 +1980,7 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
             f"mAP50-95 {m.get('metrics/mAP50-95(B)', float('nan')):.4f}  "
             f"lr {next(iter(rec['lr'].values()), float('nan')):.2e}  "
             f"{rec['seconds']:.0f}s"
+            + (f"  gpu {rec['gpu_util']}%" if rec.get("gpu_util") else "")
             + (f"  drift {drift['rel']:.4%}" if drift else ""))
 
         if rec["final_eval"]:
@@ -1995,6 +2003,27 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
     def announce(trainer):
         log(f"  training starts at epoch {trainer.start_epoch + 1} of "
             f"{trainer.epochs} (resume={bool(trainer.resume)})")
+        if is_main_rank() and "_gpu" not in state:
+            # Started here, in the process that trains: the callbacks are
+            # pickled to the DDP workers before training, and a thread is not.
+            import subprocess
+            import threading
+            samples = state.setdefault("_gpu", [])
+
+            def sample():
+                while True:
+                    try:
+                        out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu",
+                                              "--format=csv,noheader,nounits"],
+                                             capture_output=True, text=True, timeout=5).stdout
+                        vals = [float(v) for v in out.split()]
+                        if vals:
+                            samples.append(vals)
+                    except Exception:                           # noqa: BLE001
+                        pass
+                    time.sleep(5)
+
+            threading.Thread(target=sample, daemon=True).start()
 
     model.add_callback("on_fit_epoch_end", record)
     model.add_callback("on_train_start", announce)
