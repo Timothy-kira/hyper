@@ -156,6 +156,86 @@ def main() -> int:
     blob = pickle.dumps(mae)
     check("model pickles (DDP / checkpoints)", isinstance(pickle.loads(blob), S3TMAE))
 
+    # ---- MAE v2 -------------------------------------------------------------
+    from hod26.s3t.mae2 import S3TMAE2, band_mask2, interp_bands, spatial_mask2
+    torch.manual_seed(0)
+    idx2 = spatial_mask2(2, 32, 32, 2, 0.5, "cpu")
+    check("v2 spatial mask: ratio 0.5 in 2x2 units keeps half", idx2.shape == (2, 512), str(tuple(idx2.shape)))
+    ok_n, ok_run = True, True
+    for _ in range(40):
+        bm2 = band_mask2(8, "cpu")
+        for r in bm2:
+            k = int(r.sum())
+            ok_n &= 1 <= k <= 4
+    check("v2 band mask: 1..4 bands per sample", ok_n)
+    torch.manual_seed(1)
+    runs = []
+    for _ in range(60):
+        r = band_mask2(1, "cpu", p_scatter=0.0)[0]
+        pos = sorted(chain.index(k) for k in torch.nonzero(r).flatten().tolist())
+        runs.append(pos == list(range(pos[0], pos[0] + len(pos))))
+    check("v2 band mask without scatter is contiguous in wavelength order", all(runs))
+    lin = torch.zeros(1, 16, 3)
+    for j, c in enumerate(chain):
+        lin[0, c] = 0.1 * j + 1.0
+    bmx = torch.zeros(1, 16, dtype=torch.bool)
+    bmx[0, [chain[3], chain[4], chain[9]]] = True
+    check("interpolation baseline is exact on a spectrum linear in wavelength order",
+          torch.allclose(interp_bands(lin, bmx), lin, atol=1e-6))
+
+    mae2 = S3TMAE2(SpectralEncoder(dim=32, depth=2, heads=4), glob_dim=32)
+    xb2 = torch.from_numpy(np.stack([P.features(rng.integers(100, 4000, (32, 32, 16)).astype(np.uint16))
+                                     for _ in range(2)]))
+    loss2, parts2, pred2, _, _ = mae2(xb2, ratio=0.75)
+    loss2.backward()
+    missing = [n for n, p_ in mae2.named_parameters() if p_.grad is None]
+    check("v2 loss finite, every parameter gets a gradient", bool(torch.isfinite(loss2)) and not missing,
+          str(missing[:5]))
+    check("v2 reports split losses, baselines and grey rate",
+          all(k in parts2 for k in ("norm_s", "norm_b", "l1_s", "l1_b", "band_vs_interp", "spat_vs_mean", "grey")))
+    # v1 encoder weights load into v2 unchanged (continue-training path)
+    v1 = S3TMAE(SpectralEncoder(dim=32, depth=2, heads=4))
+    mae2.enc.load_state_dict(v1.enc.state_dict(), strict=True)
+    check("v1 encoder loads strictly into v2", True)
+    # A masked unit's content must not reach visible encoder tokens (v2 masks).
+    mae2.eval()
+    torch.manual_seed(5)
+    idx3 = spatial_mask2(1, 16, 16, 2, 0.75, "cpu")
+    keep3 = torch.zeros(256, dtype=torch.bool)
+    keep3[idx3[0]] = True
+    kp3 = keep3.view(16, 1, 16, 1).expand(16, 2, 16, 2).reshape(32, 32)
+    xa3 = torch.randn(1, 3, 16, 32, 32)
+    xc3 = xa3.clone()
+    xc3[..., ~kp3] += 5.0
+    with torch.no_grad():
+        ta3, _ = mae2.enc.tokens(xa3 * kp3, idx3)
+        tc3, _ = mae2.enc.tokens(xc3 * kp3, idx3)
+    check("v2: masked pixels cannot leak into visible tokens", torch.allclose(ta3, tc3))
+    # Grey rate is 1 for a flat prediction and ~0 for the truth itself.
+    tgt = torch.randn(1, 256, 16, 4)
+    keep_tok = keep3[None].float()
+    hs = (~keep3)[None, :, None].expand(1, 256, 16)
+    hb = keep3[None, :, None] & torch.zeros(1, 1, 16, dtype=torch.bool)
+    flat_pred = torch.zeros_like(tgt)
+    r_flat = mae2.references(flat_pred, tgt, keep_tok, torch.zeros(1, 16, dtype=torch.bool), hs, hb, 16, 16)
+    r_true = mae2.references(tgt.clone(), tgt, keep_tok, torch.zeros(1, 16, dtype=torch.bool), hs, hb, 16, 16)
+    check("grey rate: flat prediction -> 1, perfect prediction -> 0",
+          float(r_flat["grey"]) == 1.0 and float(r_true["grey"]) == 0.0,
+          f"{float(r_flat['grey'])} / {float(r_true['grey'])}")
+    torch.manual_seed(2)
+    mae2 = S3TMAE2(SpectralEncoder(dim=32, depth=2, heads=4), glob_dim=32)
+    opt2 = torch.optim.AdamW(mae2.parameters(), lr=3e-3)
+    first2 = None
+    for step in range(60):
+        torch.manual_seed(100 + step % 4)
+        l2, *_ = mae2(xb2, ratio=0.5)
+        opt2.zero_grad()
+        l2.backward()
+        opt2.step()
+        first2 = first2 if first2 is not None else float(l2.detach())
+    check("v2 loss falls when overfitting one batch", float(l2.detach()) < 0.7 * first2,
+          f"{first2:.3f} -> {float(l2.detach()):.3f}")
+
     print("\n".join(fails) if fails else "\nall S3T checks pass")
     return 1 if fails else 0
 

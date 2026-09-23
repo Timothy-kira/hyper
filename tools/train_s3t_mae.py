@@ -32,6 +32,7 @@ for cand in (HERE.parent / "src", HERE / "src"):
 
 from hod26.cube import load_planar                      # noqa: E402
 from hod26.s3t.mae import S3TMAE                        # noqa: E402
+from hod26.s3t.mae2 import S3TMAE2                      # noqa: E402
 from hod26.s3t.preprocess import features               # noqa: E402
 from hod26.s3t.spectral import SpectralEncoder          # noqa: E402
 
@@ -120,7 +121,8 @@ def compile_units(model):
     """The modules whose small kernels dominate a step: every Transformer block
     and spatial mix, in the encoder and the decoder."""
     from hod26.s3t.spectral import SpatialMix, SpectralBlock
-    return [m for m in model.modules() if isinstance(m, (SpectralBlock, SpatialMix))]
+    from hod26.s3t.mae2 import GlobalBlock
+    return [m for m in model.modules() if isinstance(m, (SpectralBlock, SpatialMix, GlobalBlock))]
 
 
 def compile_blocks(model, mode):
@@ -209,6 +211,20 @@ def main():
     ap.add_argument("--auto-batch", type=int, default=0,
                     help="0 (default): stop if --batch does not fit, naming the size that does; "
                          "1: halve until it fits")
+    ap.add_argument("--mae-version", type=int, default=1, choices=[1, 2],
+                    help="2: global-attention decoder, split spatial/spectral losses, "
+                         "1-4 band masks, 2x2 units, ratio curriculum (src/hod26/s3t/mae2.py)")
+    ap.add_argument("--ratio-start", type=float, default=0.5, help="v2: mask ratio at the start")
+    ap.add_argument("--ratio-end", type=float, default=0.75, help="v2: mask ratio after the curriculum")
+    ap.add_argument("--curriculum", type=float, default=0.2,
+                    help="v2: fraction of the run over which the ratio climbs")
+    ap.add_argument("--init-encoder", default="",
+                    help="continue from an earlier encoder: a *_mae.pt path, or 'auto' to find "
+                         "the one attached under /kaggle/input")
+    ap.add_argument("--freeze-encoder-steps", type=int, default=0,
+                    help="encoder lr held at 0 for this many steps (new decoder catches up)")
+    ap.add_argument("--enc-lr-mult", type=float, default=1.0,
+                    help="encoder lr as a multiple of the decoder's after the freeze")
     ap.add_argument("--compile-scope", default="blocks", choices=["blocks", "whole"],
                     help="blocks: compile each block in place (DDP-safe); "
                          "whole: torch.compile(DDP(model)), the form that failed on 2x T4")
@@ -269,7 +285,24 @@ def main():
         f"{frames_per_step} frames x {args.crops_per_frame} crops = {frames_per_step * args.crops_per_frame} crops/GPU/step")
 
     enc = SpectralEncoder(dim=args.dim, depth=args.depth, heads=args.heads)
-    model = S3TMAE(enc).to(device)
+    if args.init_encoder:
+        src = args.init_encoder
+        if src == "auto":
+            hits = sorted(p for p in Path("/kaggle/input").rglob("*_mae.pt")) if Path("/kaggle/input").exists() else []
+            if len(hits) != 1:
+                die(report, out, args.tag, "--init-encoder auto",
+                    f"expected exactly one *_mae.pt under /kaggle/input, found {[str(h) for h in hits]}")
+            src = str(hits[0])
+        ck0 = torch.load(src, map_location="cpu", weights_only=True)
+        cfg0 = ck0.get("config") or {}
+        if any(cfg0.get(k) not in (None, getattr(args, k)) for k in ("dim", "depth", "heads")):
+            die(report, out, args.tag, "--init-encoder", f"{src} was trained with {cfg0}, "
+                f"this run asks for dim={args.dim} depth={args.depth} heads={args.heads}")
+        enc.load_state_dict(ck0["encoder"], strict=True)
+        report["init_encoder"] = {"path": src, "step": ck0.get("step")}
+        log(f"encoder: continued from {src} (step {ck0.get('step')}), decoder freshly initialised")
+    model = (S3TMAE2(enc) if args.mae_version == 2 else S3TMAE(enc)).to(device)
+    report["mae_version"] = args.mae_version
     # Only the conv weights: channels_last on a 4-D embedding Parameter would
     # just give DDP mismatched gradient strides.
     for m in model.modules():
@@ -281,12 +314,15 @@ def main():
     log(f"model: encoder {n_enc / 1e6:.2f}M params, MAE total {n_par / 1e6:.2f}M; "
         f"mask 0.75 spatial (units of 4x4 tokens) + 0.15 contiguous bands; "
         f"encoder computes visible positions only (25% of tokens)")
+    enc_ids = {id(p) for p in enc.parameters()}
+    groups = [{"params": [p for p in model.parameters() if id(p) in enc_ids], "name": "encoder"},
+              {"params": [p for p in model.parameters() if id(p) not in enc_ids], "name": "decoder"}]
     try:
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05,
+        opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=0.05,
                                 betas=(0.9, 0.95), fused=cuda)
         log(f"optimizer: AdamW fused={cuda}")
     except (TypeError, RuntimeError) as e:
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05, betas=(0.9, 0.95))
+        opt = torch.optim.AdamW(groups, lr=args.lr, weight_decay=0.05, betas=(0.9, 0.95))
         log(f"optimizer: AdamW fused=off ({e})")
     scaler = torch.amp.GradScaler("cuda", enabled=cuda and amp_dtype == torch.float16)
 
@@ -306,7 +342,9 @@ def main():
                 torch.cuda.reset_peak_memory_stats(device)
                 xp = torch.randn(bs, 3, 16, args.crop, args.crop, device=device)
                 with torch.autocast("cuda", dtype=amp_dtype):
-                    lp, *_ = model(xp)
+                    # v2: the lowest ratio keeps the most positions visible,
+                    # which is the step that needs the most memory.
+                    lp, *_ = (model(xp, ratio=args.ratio_start) if args.mae_version == 2 else model(xp))
                 lp.backward()
             except torch.OutOfMemoryError:
                 ok = False
@@ -395,6 +433,15 @@ def main():
             p = (step - warm) / max(1, args.max_steps - warm)
         return args.lr * 0.5 * (1 + math.cos(math.pi * min(1.0, p)))
 
+    def mask_ratio(step):
+        """v2 curriculum, quantised to 0.05 so the compiled blocks see a handful
+        of shapes, not a new one every step. Same on every rank (step, frac)."""
+        if args.mae_version != 2:
+            return None
+        p = frac if args.schedule == "time" else step / max(1, args.max_steps)
+        r = args.ratio_start + (args.ratio_end - args.ratio_start) * min(1.0, p / max(args.curriculum, 1e-6))
+        return round(r * 20) / 20
+
     step, epoch, hist = 0, 0, []
     seen = 0
     t_steady, seen_steady = None, 0
@@ -412,14 +459,20 @@ def main():
                 wait += time.time() - t_prev
             xb = xb.flatten(0, 1).to(device, non_blocking=True).float()
             for g in opt.param_groups:
-                g["lr"] = lr_at(step)
+                mult = 1.0
+                if g.get("name") == "encoder":
+                    # lr 0 rather than requires_grad=False: DDP was built with
+                    # these parameters, and toggling them would break its reducer.
+                    mult = 0.0 if step < args.freeze_encoder_steps else args.enc_lr_mult
+                g["lr"] = lr_at(step) * mult
+            ratio = mask_ratio(step)
             t_step = time.time()
             failed = None
             if graphs:
                 torch.compiler.cudagraph_mark_step_begin()
             try:
                 with torch.autocast(device.type, dtype=amp_dtype, enabled=cuda):
-                    loss, parts, *_ = run(xb)
+                    loss, parts, *_ = run(xb, ratio=ratio) if ratio is not None else run(xb)
                 scaler.scale(loss).backward()
             except Exception as e:                               # noqa: BLE001
                 # The first steps are where compilation (and CUDA-graph
@@ -446,7 +499,7 @@ def main():
                 if cuda:
                     torch.cuda.empty_cache()
                 with torch.autocast(device.type, dtype=amp_dtype, enabled=cuda):
-                    loss, parts, *_ = run(xb)
+                    loss, parts, *_ = run(xb, ratio=ratio) if ratio is not None else run(xb)
                 scaler.scale(loss).backward()
             scaler.unscale_(opt)
             gn = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -480,12 +533,23 @@ def main():
                     if util and util.mean():
                         rate += f"  gpu-util {util.mean()}%"
                 mem = f"  mem {torch.cuda.max_memory_allocated(device) / 2**30:.2f}G" if cuda else ""
-                log(f"step {step:5d}  loss {lv:.4f}  (norm {float(parts['norm']):.3f} "
-                    f"l1 {float(parts['l1']):.3f} grad {float(parts['grad']):.4f})  "
+                if args.mae_version == 2:
+                    body = (f"spatial {float(parts['norm_s']):.3f}  spectral {float(parts['norm_b']):.3f}  "
+                            f"band/interp {float(parts['band_vs_interp']):.3f}  "
+                            f"spat/mean {float(parts['spat_vs_mean']):.3f}  grey {float(parts['grey']):.2f}  "
+                            f"ratio {ratio:.2f}{'  enc frozen' if step < args.freeze_encoder_steps else ''}")
+                else:
+                    body = (f"norm {float(parts['norm']):.3f} l1 {float(parts['l1']):.3f} "
+                            f"grad {float(parts['grad']):.4f}")
+                log(f"step {step:5d}  loss {lv:.4f}  ({body})  "
                     f"gnorm {float(gn):.2f}  scale {scaler.get_scale() if scaler.is_enabled() else 1:.0f}  "
                     f"lr {lr_at(step):.2e}{rate}{mem}")
-                hist.append({"step": step, "loss": lv, "t": time.time() - T0,
-                             "scale": scaler.get_scale() if scaler.is_enabled() else 1.0})
+                rec = {"step": step, "loss": lv, "t": time.time() - T0,
+                       "scale": scaler.get_scale() if scaler.is_enabled() else 1.0}
+                rec.update({k: float(v) for k, v in parts.items()})
+                if ratio is not None:
+                    rec["ratio"] = ratio
+                hist.append(rec)
             stop[0] = float(time.time() > deadline or step >= args.max_steps)
             stop[1] = (time.time() - t_train0) / max(1.0, deadline - t_train0)
             t_prev = time.time()
@@ -525,9 +589,11 @@ def main():
         ck = out / f"{args.tag}_mae.pt"
         torch.save({"mae": model.state_dict(), "encoder": enc.state_dict(),
                     "config": {"dim": args.dim, "depth": args.depth, "heads": args.heads},
-                    "step": step}, ck)
+                    "mae_version": args.mae_version, "step": step,
+                    "init_encoder": report.get("init_encoder")}, ck)
         back = torch.load(ck, map_location="cpu", weights_only=True)
-        fresh = S3TMAE(SpectralEncoder(dim=args.dim, depth=args.depth, heads=args.heads))
+        fresh_enc = SpectralEncoder(dim=args.dim, depth=args.depth, heads=args.heads)
+        fresh = S3TMAE2(fresh_enc) if args.mae_version == 2 else S3TMAE(fresh_enc)
         fresh.load_state_dict(back["mae"])
         same = all(torch.equal(a.cpu(), b) for a, b in zip(model.state_dict().values(),
                                                            fresh.state_dict().values()))
@@ -540,7 +606,8 @@ def main():
             model.eval()
             xb = ds[0][:1].to(device).float()
             with torch.no_grad(), torch.autocast(device.type, dtype=amp_dtype, enabled=cuda):
-                _, _, pred, idx, bm = model(xb)
+                _, _, pred, idx, bm = (model(xb, ratio=args.ratio_end) if args.mae_version == 2
+                                       else model(xb))
             s = enc.stride
             gh, gw = xb.shape[-2] // s, xb.shape[-1] // s
             keep = torch.zeros(gh * gw, device=device)
