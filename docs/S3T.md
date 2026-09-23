@@ -2,6 +2,8 @@
 
 > 参考 S3M 技术报告（ICPR 2026 "Beyond Visible Spectrum" 分类方案）的设计，按本比赛重新设计。
 > S3M 的光谱 Mamba 流在这里**全部换成 Transformer**；空间部分不再自己搭，直接使用 COCO 预训练的 RT-DETR-L。
+>
+> **2026-09-23 更新**：编码器换成 **S3T-X**（通道协方差注意力，见 4.2）。原来的 band-token 编码器在检测时要 3.4 s/step，11 小时训不完；S3T-X 是 0.50 s/step。MAE 升级到 v3（修掉特征泄漏，见 5.1），检测头加了 D-FINE 分布回归和 MAL（见 4.4）。4.5–4.8 节保留旧编码器的设计作记录。
 
 ![S3T-DETR 结构](s3t_architecture.png)
 
@@ -38,17 +40,61 @@
 
 第二轮扫描中，`shape + lr_ann63` 组合把弱类的 AUC 从 0.711 提到 0.728、边缘 d′ 从 0.26 提到 0.28，其余类别的 AUC 从 0.895 提到 0.922、边缘 d′ 从 0.93 提到 1.02，是所有测过的变换里最均衡的。
 
-### 4.2 删掉 IWS（S3M 在这里有问题）
+### 4.2 S3T-X 编码器（当前版本，`src/hod26/s3t/xca.py`）
+
+**为什么换**：旧编码器每个位置存 16 个 token × 64 维 = 1024 个数，比一个像素的原始信息（48 个数）多 20 多倍。1024² 的输入有约 105 万个 token，每个 LayerNorm、线性层、拷贝都按这个状态量计算，一步 3.65 s 里有 3.3 s 花在它身上。attention 本身只占约 2%，所以换线性注意力解决不了问题，要减的是状态量。
+
+**做法**：每个位置只保留一个 64 维向量，波段之间的内容相关混合改用通道协方差注意力（XCiT 的 XCA、Restormer 的 MDTA、MST++ 的 spectral-wise attention）：
+
+```
+XCA(Q, K, V) = V · softmax(K̂ᵀ Q̂ · τ)，Q̂、K̂ 沿像素做 L2 归一化，τ 每个头可学
+```
+
+d×d 的注意力矩阵，是这些像素上特征的归一化互协方差，计算量对像素数是线性的。
+
+**为什么适合这个数据**：在局部窗口里，K̂ᵀQ̂ 就是局部背景的光谱协方差，对 V 做 softmax 混合，相当于可学习的软局部白化，也就是 local RX 检测器背后的运算（用到局部背景的马氏距离）。CPU 扫描里，灰色弱类只有相对局部背景才可分，local RX 对 e-bike 和 car 最好。所以：
+- 前两个 block 用 16×16 的窗口（约 32 原生像素，对应之前有效的 31px 环形窗口）；
+- 后两个 block 用全图，做光照这类场景级的归一化。
+
+**结构**：
+- stem：Conv 3×3 stride 2，接 GELU，再接 Conv 1×1；
+- 4 × [LN → XCA（qkv 1×1 + depthwise 3×3）→ LayerScale 残差；LN → GDFN（门控 depthwise FFN）→ LayerScale 残差]；
+- 最后一个逐像素 LN。全程 channels_last，0.21M 参数。
+- **没有 BatchNorm**：MAE 时 75% 的位置是 0，BN 统计量会被带偏；检测时每卡 2 张图，统计量也不稳。
+- **亮度保留**：输入不做逐像素归一化，LN 只在残差分支里。
+- **MAE 掩码**：q、k 在被遮位置置 0，所以协方差只来自可见像素；每个分支卷积前的归一化输入也乘上可见掩码（FCMAE 的做法），可见输出读不到被遮位置，连 LayerNorm 对 0 向量输出的常数也读不到。缺失的波段加一个可学习向量，和"值本来就是 0"区分开。
+
+### 4.3 接入 DETR（`S3TXFront`）
+
+在两边网格本来就对齐的地方接：
+- 编码器在 0.5 倍输入上以 stride 2 运行，网格是输入的 stride 4，正好和 HGStem 的输出（48 通道）一样。用零初始化的 1×1 卷积（64→48）加到 HGStem 输出上。不再上采样到原图，也不再加宽全分辨率 stem 的第一层卷积。
+- 可学习的 stride-2 卷积金字塔（每级后接 LN）把特征送到 stride 8/16/32，经零初始化的 1×1 加到 P3/P4/P5 的输入投影上（第 19、14、10 层），代替平均池化：几像素大的目标一平均就混进背景了。
+- P3/P4 注入前先对 AIFI 的全局 token 做交叉注意力（空间 → 光谱），同 4.8 节。
+- 16→3 投影照常送进 COCO stem；第 0 步整个检测器和 COCO RT-DETR 在投影上的输出完全一致（测试核对）。
+
+### 4.4 检测头与 loss：D-FINE FDR + GO-LSD + MAL
+
+误差分解里，匹配框的中位 IoU 是 0.864，扣分主要在 IoU 0.9 以上。所以：
+- **FDR**：RT-DETR 每层 decoder 旁边加一个零初始化的 3 层 MLP，对每条边预测 33 个偏移量上的分布（D-FINE 的 W(n)：越靠近 0 越密，端点 ±4，单位是边长/4）。框 = 预训练 box head 的框，每条边再移动分布的期望。
+  - 不像原版 D-FINE 那样替换 box head：COCO 学到的回归能力保留，第 0 步分布均匀、期望为 0，输出和 COCO decoder 完全一致。
+  - 细化后的框同时作为下一层的参考框。
+- **FGL**（0.15）：匹配到的 GT 边偏移拆到相邻两个 bin 上，对分布做交叉熵，按 IoU 加权；复用 loss 自己的匈牙利匹配（含 denoising query）。
+- **DDF / GO-LSD**（1.5）：最后一层的框作为老师，换算到前面各层的参考框坐标下，蒸馏给它们的分布；匹配上的 query 按 IoU 加权，没匹配上的按老师的置信度加权，正负样本按 D-FINE 平衡。和原版的区别：原版各层分布共用第 0 层的参考框，可以直接做 KL；这里各层参考框不同，所以蒸馏的是老师的框，而不是整条分布。
+- **MAL**（DEIM）：正样本权重 1、目标 IoU^1.5；负样本保留 RT-DETR 的 α·p^γ。
+- **log-size L1**：宽高在 log 空间做 L1。
+- DEIM 的 Dense O2O 由 mosaic 提供。
+
+### 4.5 （旧版）删掉 IWS（S3M 在这里有问题）
 
 S3M 的 IWS 模块给每个通道乘一个与输入内容无关的系数 α ∈ (0, 1)，紧接着是逐波段的线性卷积 PatchEmbed 和 LayerNorm。线性卷积会把 α 原样带过去，LayerNorm 再把尺度归一化掉，α 的作用几乎被完全抵消。另外，传感器固定时波段也固定，"Fourier(λ) → MLP"实际上就是学 16 个常数。S3T 不用 IWS，波段身份交给一个可学习的光谱位置编码（S3M 4.4 节）。
 
-### 4.3 Stem（替代 S3M 的 PatchEmbed）
+### 4.6 （旧版）Stem（替代 S3M 的 PatchEmbed）
 
 - 所有波段共享一个重叠卷积：Conv 3×3，stride 2 → BatchNorm → GELU → Conv 1×1。输出为 (B, S, C=16, D=64)。
 - **不在每个 token 上做 LayerNorm**。如果一个 patch 亮度均匀、值为 b，它的 embedding 是 b·v，LayerNorm 之后 b 就被消掉了，而亮度正是灰色类别的关键线索。测试中专门检查了"整体亮度翻倍时输出会改变"这一点。
 - 用 stride 2 而不是 stride 4 的 patchify：cube 本身已经是原图缩小 4 倍的结果，再用 stride 4，11×20 px 的 stone_block 只剩 3×5 个 token。
 
-### 4.4 光谱 Transformer 块（替代 SpectralMambaBlock）
+### 4.7 （旧版）光谱 Transformer 块（替代 SpectralMambaBlock）
 
 ```
 x: (B, S, C, D) → (B·S, C, D)
@@ -60,7 +106,7 @@ x ← x + γ2 · MLP(LN(x))       # 4D 中间维度
 - 不同空间位置之间互不依赖，所以 MAE 预训练时**只需要计算没被遮住的位置**。
 - 每两个光谱块后面接一个 **SpatialMix**：各波段共享的 7×7 depthwise 卷积，再接一个 MLP。被遮住的位置按 0 输入（FCMAE 的稀疏卷积做法），可见 token 读不到被遮住的内容。这一点有专门的测试。
 
-### 4.5 光谱聚合与检测接口
+### 4.8 （旧版）光谱聚合与检测接口
 
 - **SpectralPool**：按内容对 16 个波段 token 做注意力加权求和，得到 (B, D, H/2, W/2)。
 - **主通路（stem 加宽）**：S3T 的 64 维特征上采样回原图分辨率，与一个 16→3 投影（LDA 初始化）拼接成 3 + 64 个通道，送入 COCO 预训练的 RT-DETR stem。stem 第一层卷积从 3 个输入通道加宽到 67 个：前 3 个通道沿用 COCO 权重，新增的 64 个初始化为 0（I3D 的通道膨胀 + ControlNet 的零初始化）。这样既不经过 3 通道瓶颈（旧做法是先把 64 维压成 3 通道再加上去，原图分辨率上的细节只能走这 3 个数），第 0 步又和预训练 stem 看投影完全一致。
@@ -71,7 +117,28 @@ x ← x + γ2 · MLP(LN(x))       # 4D 中间维度
 
 ## 5 训练
 
-### 5.1 MAE 预训练（只训练光谱编码器，DETR 不参与）
+### 5.1 MAE v3（当前版本，`src/hod26/s3t/mae3.py`）
+
+**v1/v2 的特征泄漏**：特征是在 mask 之前算的。
+- shape 要减去全部 16 个波段的均值。只遮 1 个波段时，同一像素任意一个可见波段的 level − shape 就是这个均值，被遮波段可以精确解出来；遮 k 个波段时，它们的和也泄漏了。
+- contrast 的环形均值把被遮像素也算进去了。
+
+**v3**：先 mask，再用 `observed_features` 计算特征：
+- shape 只减存在的波段的均值；
+- contrast 用归一化卷积，只对环形窗口里看得见的像素取均值；
+- 图像外面也当作"看不见"。
+
+检测前端用同一个函数（没有遮挡），所以微调和预训练看到的输入完全一致。
+
+**掩码与损失**同 v2：2×2 token 单位、遮挡比例 0.5→0.75 逐步加大、1–4 个波段（70% 按波长连续）、空间和光谱补全分开计算并各有参照。
+
+**解码器**：2 层全局 attention（2D 正弦位置编码）加 1 个窗口 XCA block，线性头输出每个位置 16 波段 × 2×2 像素。
+
+**编码器是稠密计算**，被遮位置保持 0：S3T-X 足够便宜，不需要只算可见位置。
+
+**首轮**（双卡 T4，每卡 48 个 128px 裁块，114 crops/s）：1400 步时 band/interp 0.45、spat/mean 0.59、灰块率 0.01。
+
+### 5.1b （旧版）MAE v1/v2 预训练（只训练光谱编码器，DETR 不参与）
 
 - **Tube 空间掩码**：以 4×4 个 token（原生 8×8 px）为单位，遮掉 75%，16 个波段同时遮住。
 - **连续光谱掩码**：按波长顺序遮掉连续 2 个波段（15%）。
@@ -87,17 +154,25 @@ x ← x + γ2 · MLP(LN(x))       # 4D 中间维度
 
 ### 5.2 检测微调
 
-- COCO 预训练的 RT-DETR-L，fp32（ultralytics 的建议：RT-DETR 的匈牙利匹配在 AMP 下可能出现 NaN），imgsz 1024，每卡 batch 2，双卡 DDP，nbs=64。
+- **从 COCO 开始**（不接旧 checkpoint）：RT-DETR-L，imgsz 1024，每卡 batch 2，双卡 DDP，nbs=64，48 epoch。
+- **加速**：
+  - AMP fp16，loss 和匈牙利匹配强制 fp32（ultralytics 提醒过它在 fp16 下可能出 NaN）；
+  - RT-DETR 的 `nn.MultiheadAttention` 换成走 SDPA 的版本（mem-efficient kernel）；
+  - S3T-X block 逐个 `torch.compile`；
+  - fused AdamW（逐个 param group 确认真的开了）；
+  - cudnn.benchmark。
+- **保存**：每个 epoch 把 last.pt 复制到输出目录（带 optimizer，可续训）；best.pt 每次更新都复制。
 - 数据增强见 `handoff/S3T.md`：离线的 S-G 平滑（沿波长顺序）、同类 SMOTE、超像素 CutMix，每帧额外生成 1 份副本；在线的 mosaic、翻转、缩放。
 - 600 张验证集不参与训练，用 pycocotools 计算 mAP50-95 作为唯一的比较标准。
 
 ## 6 不足
 
-- 检测微调代码只在 CPU 上测过（安装、前向、反向、深拷贝、保存与加载、融合都覆盖了），还没有在 GPU 上跑过。
+- S3T-X 检测的速度和显存在 T4 上测过（探针），完整训练还没有在 GPU 上跑完；CPU 上用合成数据端到端跑通过（渲染、训练、保存 best/last、重载、预测）。
+- D-FINE 的 GO-LSD 做了改动：各层参考框不同，蒸馏的是老师的框而不是整条分布，见 4.4。
 - 计划中"对齐阶段冻结 DETR"这一步没有实现。现在靠零初始化和从头开始的完整微调来代替。
 - 计划中给检测头加 P2 这一步没有实现，这需要改 RT-DETR 的解码器结构，风险太大。
 - 逐 block 编译加 CUDA Graphs 只在 CPU 上验证过能正常训练，在 GPU 上的提速效果要等下一个账号跑冒烟测试确认。
 
 ## 引用
 
-S3M 报告；He et al., *Masked Autoencoders*（2022）；Tong et al., *VideoMAE*（2022）；Woo et al., *ConvNeXt V2 / FCMAE*（2023）；Xiao et al., *Early Convolutions Help Transformers See Better*（2021）；Zhao et al., *RT-DETR*（2024）；Touvron et al., *CaiT / LayerScale*（2021）。
+S3M 报告；He et al., *Masked Autoencoders*（2022）；Tong et al., *VideoMAE*（2022）；Woo et al., *ConvNeXt V2 / FCMAE*（2023）；Xiao et al., *Early Convolutions Help Transformers See Better*（2021）；Zhao et al., *RT-DETR*（2024）；Touvron et al., *CaiT / LayerScale*（2021）；El-Nouby et al., *XCiT*（2021）；Zamir et al., *Restormer*（2022）；Cai et al., *MST++*（2022）；Peng et al., *D-FINE*（2025）；Huang et al., *DEIM*（2025）；Reed & Yu, *RX anomaly detector*（1990）。

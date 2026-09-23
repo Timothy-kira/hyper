@@ -1016,10 +1016,19 @@ class SpectralAttention(nn.Module):
         self.heads, self.hd = heads, dim // heads
         self.qkv = nn.Linear(dim, 3 * dim)
         self.proj = nn.Linear(dim, dim)
+        # "sdpa": F.scaled_dot_product_attention (flash / memory-efficient
+        # kernels). "bmm": two batched matmuls. The fused kernels tile 64
+        # queries x 64 keys; with 16 band tokens most of each tile is padding,
+        # while a 16x16x16 matmul is one tensor-core tile. Same arithmetic.
+        self.impl = "sdpa"
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         n, c, d = t.shape
         q, k, v = self.qkv(t).view(n, c, 3, self.heads, self.hd).permute(2, 0, 3, 1, 4)
+        if getattr(self, "impl", "sdpa") == "bmm":
+            a = torch.matmul(q, k.transpose(-1, -2)) * (self.hd ** -0.5)
+            o = torch.matmul(a.softmax(-1).to(v.dtype), v)
+            return self.proj(o.transpose(1, 2).reshape(n, c, d))
         # Contiguous on purpose: inductor's SDPA lowering asserted on the strided
         # views (stride 96 where it traced 32) in the first 2xT4 pretrain.
         o = F.scaled_dot_product_attention(q.contiguous(), k.contiguous(), v.contiguous())
@@ -1074,13 +1083,21 @@ class SpatialMix(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.pw = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.g = nn.Parameter(torch.full((dim,), ls))
+        # True: run the depthwise conv in channels_last (NHWC), which is the
+        # token layout already, so one transpose is saved and cuDNN's NHWC
+        # kernels are used instead of the native NCHW depthwise kernel.
+        self.channels_last = False
 
     def forward(self, t, idx, hw):
         h, w = hw
         dense = scatter_dense(t, idx, h * w)
         b, s, c, d = dense.shape
-        x = dense.permute(0, 2, 3, 1).reshape(b * c, d, h, w)
-        y = self.dw(x).view(b, c, d, s).permute(0, 3, 1, 2)
+        if getattr(self, "channels_last", False):
+            x = dense.transpose(1, 2).reshape(b * c, h, w, d).permute(0, 3, 1, 2)   # NCHW view, NHWC storage
+            y = self.dw(x).permute(0, 2, 3, 1).reshape(b, c, s, d).transpose(1, 2)
+        else:
+            x = dense.permute(0, 2, 3, 1).reshape(b * c, d, h, w)
+            y = self.dw(x).view(b, c, d, s).permute(0, 3, 1, 2)
         y = gather(y, idx)
         return t + self.g * self.pw(self.norm(y))
 
@@ -1143,6 +1160,208 @@ class SpectralEncoder(nn.Module):
         p = self.norm(self.pool(t))                               # (B, S, D)
         return p.transpose(1, 2).reshape(x.shape[0], self.dim, gh, gw)
 
+# ---- inlined from src/hod26/s3t/xca.py ------------------------------
+"""S3T-X: the spectral encoder with cross-covariance (channel) attention.
+
+Why this replaces the band-token encoder
+----------------------------------------
+The band-token encoder kept 16 tokens x 64 dims = 1024 numbers per position at
+stride 2 -- more than twenty times the 48 numbers a pixel carries (16 bands x
+level/shape/contrast). Every LayerNorm, linear layer and copy scaled with that
+state, and a 1024^2 detector input carried ~1.05M tokens: 3.3 s of a 3.65 s
+training step on a T4. Attention itself was ~2% of the arithmetic, so a
+cheaper attention (linear or otherwise) could not fix it; the state could.
+
+What the band tokens bought was *content-dependent mixing between bands*.
+Cross-covariance attention buys the same thing on a per-pixel vector:
+
+    XCA(Q, K, V) = V . softmax(K^T Q / tau),   Q, K l2-normalised over pixels
+
+(XCiT, NeurIPS 2021; Restormer's MDTA, CVPR 2022; MST++'s spectral-wise
+attention, NTIRE 2022). The d x d matrix is a normalised cross-covariance of
+the features over the pixels it is computed on, the cost is linear in pixels,
+and each pixel keeps one d-dim vector.
+
+Why it fits this data
+---------------------
+Computed over a *local window*, K^T Q is the local background's spectral
+covariance, and applying a softmax of it to V is a learned, soft analogue of
+local whitening -- the operation behind the local RX detector, which scores a
+pixel by its Mahalanobis distance to the local background because small
+targets differ only from their surroundings. The grey detection classes are
+exactly that case: the CPU scans found them separable only against a local
+background (annular contrast; local RX was the best transform for e-bike and
+car). So the first blocks use 16 x 16 windows (~32 native px, the scale of the
+31 px annulus that worked) and the last blocks the whole image, for
+scene-level normalisation such as illumination.
+
+Layout: channels_last (NHWC) throughout, so the per-pixel LayerNorm acts on
+the contiguous last dimension and the 1x1 / depthwise convs use cuDNN's NHWC
+kernels without transposes.
+
+Masked pretraining: pass `vis` (B, 1, h, w), 1 for visible positions. Keys and
+queries are zeroed at masked positions before the covariance, so the
+statistics come from visible pixels only; the state is re-zeroed at masked
+positions after every block and the normalised input of every branch before
+its convolutions (the sparse-conv trick of FCMAE), so no visible output ever
+reads a masked position -- not even the constant a LayerNorm makes of a zero.
+`band_vis` (B, C) marks the bands present; a missing band adds a learned
+vector to the stem output, so a masked band is not mistaken for a zero one.
+
+No BatchNorm anywhere: under a 75% mask its batch statistics would be those
+of mostly-zero maps, and a detector's 2-image batches are no better.
+"""
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+
+def ln_nhwc(x: torch.Tensor, ln: nn.LayerNorm) -> torch.Tensor:
+    """Per-pixel LayerNorm of an NCHW-shaped tensor stored channels_last."""
+    return F.layer_norm(x.permute(0, 2, 3, 1), ln.normalized_shape, ln.weight, ln.bias,
+                        ln.eps).permute(0, 3, 1, 2)
+
+
+def _windows(t: torch.Tensor, win: int | None, heads: int):
+    """(B, C, H, W) -> (B*nW, heads, C/heads, N) over windows (or the whole map)."""
+    b, c, h, w = t.shape
+    if win is None:
+        return t.reshape(b, heads, c // heads, h * w)
+    t = t.reshape(b, heads, c // heads, h // win, win, w // win, win)
+    t = t.permute(0, 3, 5, 1, 2, 4, 6)                      # B, nH, nW, heads, dh, win, win
+    return t.reshape(-1, heads, c // heads, win * win)
+
+
+def _unwindows(t: torch.Tensor, win: int | None, b: int, c: int, h: int, w: int):
+    if win is None:
+        return t.reshape(b, c, h, w)
+    heads, dh = t.shape[1], t.shape[2]
+    t = t.reshape(b, h // win, w // win, heads, dh, win, win).permute(0, 3, 4, 1, 5, 2, 6)
+    return t.reshape(b, c, h, w)
+
+
+class XCAttention(nn.Module):
+    """Multi-Dconv cross-covariance attention, over windows or the whole map."""
+
+    def __init__(self, dim: int, heads: int = 4, window: int | None = 16):
+        super().__init__()
+        assert dim % heads == 0
+        self.heads, self.window = heads, window
+        self.qkv = nn.Conv2d(dim, 3 * dim, 1, bias=False)
+        self.qkv_dw = nn.Conv2d(3 * dim, 3 * dim, 3, padding=1, groups=3 * dim, bias=False)
+        self.temperature = nn.Parameter(torch.ones(heads, 1, 1))
+        self.proj = nn.Conv2d(dim, dim, 1)
+
+    def forward(self, x, vis=None):
+        b, c, h, w = x.shape
+        win = self.window
+        pad_h = pad_w = 0
+        if win is not None and (h % win or w % win):
+            pad_h, pad_w = (-h) % win, (-w) % win
+        q, k, v = self.qkv_dw(self.qkv(x)).chunk(3, dim=1)
+        if vis is not None:
+            # statistics from visible pixels only
+            q, k = q * vis, k * vis
+        if pad_h or pad_w:
+            q, k, v = (F.pad(t, (0, pad_w, 0, pad_h)) for t in (q, k, v))
+        hp, wp = h + pad_h, w + pad_w
+        q = F.normalize(_windows(q, win, self.heads), dim=-1)
+        k = F.normalize(_windows(k, win, self.heads), dim=-1)
+        v = _windows(v, win, self.heads)
+        attn = (q @ k.transpose(-2, -1)) * self.temperature        # (B*nW, heads, dh, dh)
+        out = attn.softmax(-1).to(v.dtype) @ v                       # (B*nW, heads, dh, N)
+        out = _unwindows(out, win, b, c, hp, wp)[:, :, :h, :w]
+        return self.proj(out.contiguous(memory_format=torch.channels_last))
+
+
+class GDFN(nn.Module):
+    """Gated-Dconv feed-forward (Restormer): GELU(a) * b after a depthwise 3x3."""
+
+    def __init__(self, dim: int, expand: float = 2.0):
+        super().__init__()
+        hid = int(dim * expand)
+        self.pw_in = nn.Conv2d(dim, 2 * hid, 1, bias=False)
+        self.dw = nn.Conv2d(2 * hid, 2 * hid, 3, padding=1, groups=2 * hid, bias=False)
+        self.pw_out = nn.Conv2d(hid, dim, 1, bias=False)
+
+    def forward(self, x):
+        a, g = self.dw(self.pw_in(x)).chunk(2, dim=1)
+        return self.pw_out(F.gelu(a) * g)
+
+
+class XCABlock(nn.Module):
+    def __init__(self, dim: int, heads: int = 4, window: int | None = 16, ls: float = 0.1):
+        super().__init__()
+        self.n1, self.attn = nn.LayerNorm(dim), XCAttention(dim, heads, window)
+        self.n2, self.ffn = nn.LayerNorm(dim), GDFN(dim)
+        self.g1 = nn.Parameter(torch.full((1, dim, 1, 1), ls))
+        self.g2 = nn.Parameter(torch.full((1, dim, 1, 1), ls))
+
+    def forward(self, x, vis=None):
+        h = ln_nhwc(x, self.n1)
+        x = x + self.g1 * self.attn(h if vis is None else h * vis, vis)
+        h = ln_nhwc(x, self.n2)
+        x = x + self.g2 * self.ffn(h if vis is None else h * vis)
+        return x if vis is None else x * vis
+
+
+class XCAEncoder(nn.Module):
+    """(B, F, C, H, W) features -> (B, D, H/2, W/2), one D-dim vector per position."""
+
+    arch = "xca"
+
+    def __init__(self, n_feats: int = 3, n_bands: int = N_BANDS, dim: int = 64, depth: int = 4,
+                 heads: int = 4, windows=(16, 16, None, None), stride: int = 2):
+        super().__init__()
+        self.n_feats, self.n_bands, self.dim, self.stride = n_feats, n_bands, dim, stride
+        self.depth, self.heads = depth, heads
+        windows = list(windows) + [None] * max(0, depth - len(windows))
+        self.windows = [None if w in (None, 0) else int(w) for w in windows[:depth]]
+        self.stem = nn.Sequential(
+            nn.Conv2d(n_feats * n_bands, dim, 3, stride=stride, padding=1),
+            nn.GELU(), nn.Conv2d(dim, dim, 1))
+        self.band_missing = nn.Linear(n_bands, dim, bias=False)
+        nn.init.trunc_normal_(self.band_missing.weight, std=0.02)
+        self.blocks = nn.ModuleList(XCABlock(dim, heads, w) for w in self.windows)
+        self.norm = nn.LayerNorm(dim)
+        self.grad_ckpt = False
+
+    def config(self):
+        return {"arch": "xca", "dim": self.dim, "depth": self.depth, "heads": self.heads,
+                "windows": self.windows, "stride": self.stride}
+
+    def grid(self, h, w):
+        return -(-h // self.stride), -(-w // self.stride)
+
+    def stem_map(self, x, vis=None, band_vis=None):
+        b, f, c, h, w = x.shape
+        y = self.stem(x.reshape(b, f * c, h, w).contiguous(memory_format=torch.channels_last))
+        if band_vis is not None:
+            y = y + self.band_missing((~band_vis.bool()).to(y.dtype))[:, :, None, None]
+        return y if vis is None else y * vis
+
+    def forward(self, x, vis=None, band_vis=None):
+        y = self.stem_map(x, vis, band_vis)
+        ckpt = self.grad_ckpt and self.training and torch.is_grad_enabled()
+        for blk in self.blocks:
+            if ckpt:
+                y = torch.utils.checkpoint.checkpoint(blk, y, vis, use_reentrant=False)
+            else:
+                y = blk(y, vis)
+        return ln_nhwc(y, self.norm)
+
+
+def build_encoder(cfg: dict | None = None):
+    """Encoder from a checkpoint's config: 'xca' (S3T-X) or the band-token one."""
+    cfg = dict(cfg or {})
+    if cfg.get("arch", "tokens") == "xca":
+        return XCAEncoder(dim=cfg.get("dim", 64), depth=cfg.get("depth", 4), heads=cfg.get("heads", 4),
+                          windows=cfg.get("windows", (16, 16, None, None)), stride=cfg.get("stride", 2))
+    return SpectralEncoder(dim=cfg.get("dim", 64), depth=cfg.get("depth", 4), heads=cfg.get("heads", 4))
+
 # ---- inlined from src/hod26/s3t/front.py ------------------------------
 """S3T in front of a COCO-pretrained RT-DETR.
 
@@ -1167,6 +1386,12 @@ see. Two paths out of the spectral encoder:
 Both new outputs start at zero, so step 0 is the projection alone and the
 pretrained detector sees a sane image; the spectral features are phased in by
 gradient rather than dropped in at full strength.
+
+S3TXFront is the same idea for the S3T-X encoder (xca.py), wired where the
+grids already agree: its stride-4 output joins the HGStem output (stride 4)
+through a zero-init 1x1 instead of being upsampled to the input and pushed
+through a widened full-resolution conv, and a learned strided pyramid replaces
+the average pooling for the side injections.
 """
 
 
@@ -1202,6 +1427,46 @@ def level_features(level: torch.Tensor, inner: int = 31, outer: int = 63) -> tor
     return torch.stack([level, shape, level - ring], 1)
 
 
+def _box_sum(x: torch.Tensor, k: int) -> torch.Tensor:
+    """k x k window sums over (N, C, H, W), zero outside: two 1-D average pools."""
+    r = k // 2
+    y = F.avg_pool2d(x, (1, k), stride=1, padding=(0, r), count_include_pad=True)
+    return F.avg_pool2d(y, (k, 1), stride=1, padding=(r, 0), count_include_pad=True) * (k * k)
+
+
+def observed_features(level: torch.Tensor, vis: torch.Tensor | None = None,
+                      band_vis: torch.Tensor | None = None, inner: int = 31,
+                      outer: int = 63) -> torch.Tensor:
+    """(B, 16, H, W) aligned level -> (B, 3, 16, H, W) from the observed part only.
+
+    level, shape and contrast as in level_features, but every statistic is
+    taken over what is observed, so none of the three carries anything of a
+    masked pixel or band:
+      shape     level minus the mean of the *present* bands (band_vis, (B, 16));
+      contrast  level minus the mean of the *observed* pixels of the 31/63
+                annulus (vis, (B, 1, H, W)): a normalised convolution. Outside
+                the image counts as unobserved, so a border pixel's ring is the
+                part of it inside the image.
+    Masked pixels and bands come out as zero. With nothing masked this is the
+    detector's input; S3T-X is fine-tuned on exactly what it was pretrained on.
+    """
+    b, c, h, w = level.shape
+    level = level.float()
+    m = torch.ones(b, 1, h, w, device=level.device) if vis is None else vis.float()
+    bv = torch.ones(b, c, device=level.device) if band_vis is None else band_vis.float()
+    bv = bv[:, :, None, None]
+    obs = m * bv                                                       # (B, C, H, W)
+    lv = level * obs
+    mean_b = lv.sum(1, keepdim=True) / bv.sum(1, keepdim=True).clamp(min=1.0)
+    shape = (level - mean_b) * obs
+    num = _box_sum(lv, outer) - _box_sum(lv, inner)
+    den = _box_sum(m, outer) - _box_sum(m, inner)
+    ok = den > 0.5
+    ring = num / den.clamp(min=1.0)
+    contrast = torch.where(ok, level - ring, torch.zeros_like(level)) * obs
+    return torch.stack([lv, shape, contrast], 1)
+
+
 class S3TFront(nn.Module):
     """(B, 16, H, W) in [0, 1] -> (B, 3, H, W) for the pretrained stem.
 
@@ -1212,10 +1477,32 @@ class S3TFront(nn.Module):
     """
 
     def __init__(self, encoder: SpectralEncoder, projection=None, scale: float = 0.5,
-                 grad_ckpt: bool = True, amp: bool = True, widen: bool = True):
+                 grad_ckpt: bool = True, amp: bool = True, widen: bool = True,
+                 ckpt_chunks: int = 8, fast_kernels: bool = False, train_encoder: bool = True):
         super().__init__()
         n, d = encoder.n_bands, encoder.dim
         self.enc, self.scale, self.grad_ckpt, self.amp = encoder, scale, grad_ckpt, amp
+        # 0: one checkpoint around the whole encoder (the form that OOM'd: its
+        # backward recomputes every layer at once, ~13 GB per 1024^2 image).
+        # N > 0: checkpoint each layer separately, and split the per-position
+        # layers (spectral blocks, the pool, the stem) into N chunks of
+        # positions, so a backward holds one chunk of one layer at a time.
+        self.ckpt_chunks = int(ckpt_chunks)
+        # Kernel choices that keep the arithmetic: 16-token attention as batched
+        # matmuls, depthwise convs in channels_last. Weights are untouched.
+        if fast_kernels:
+            for m in encoder.modules():
+                if isinstance(m, SpectralAttention):
+                    m.impl = "bmm"
+                elif isinstance(m, SpatialMix):
+                    m.channels_last = True
+        # False: the encoder is a fixed feature extractor during detection (no
+        # backward through it, no recomputation); the stem channels and the
+        # injections still train. An option to measure, not the default.
+        self.train_encoder = bool(train_encoder)
+        if not self.train_encoder:
+            for p_ in encoder.parameters():
+                p_.requires_grad_(False)
         self.widen = widen
         # Channels this front hands the stem: 3 (projection) + d when widened.
         self.out_channels = 3 + d if widen else 3
@@ -1245,9 +1532,56 @@ class S3TFront(nn.Module):
                                   align_corners=False, antialias=True)
         feats = level_features(level)
         with torch.autocast("cuda", dtype=torch.float16, enabled=self.amp and x.is_cuda):
-            if self.grad_ckpt and self.training and torch.is_grad_enabled():
+            if not getattr(self, "train_encoder", True):
+                with torch.no_grad():
+                    return self.enc(feats).float()
+            ckpt = self.grad_ckpt and self.training and torch.is_grad_enabled()
+            if ckpt and self.ckpt_chunks > 0:
+                return self._encode_chunked(feats).float()
+            if ckpt:
                 return torch.utils.checkpoint.checkpoint(self.enc, feats, use_reentrant=False).float()
             return self.enc(feats).float()
+
+    def _encode_chunked(self, feats):
+        """SpectralEncoder.forward, checkpointed layer by layer and chunk by chunk.
+
+        Same modules, same order, same arithmetic as enc(feats); only what is
+        kept for backward changes. Spectral blocks, the band pool and the band
+        embedding act on each position independently, so they run on slices of
+        the position axis; SpatialMix needs the whole grid and is checkpointed
+        whole (it is the cheaper layer).
+        """
+        from torch.utils.checkpoint import checkpoint
+
+        enc, n = self.enc, self.ckpt_chunks
+        b, f, c, h, w = feats.shape
+
+        def stem(z):
+            y = enc.stem(z.transpose(1, 2).reshape(b * c, f, h, w))
+            return y
+
+        y = checkpoint(stem, feats, use_reentrant=False)
+        gh, gw = y.shape[-2:]
+        t = y.view(b, c, enc.dim, gh * gw).permute(0, 3, 1, 2) + enc.band_pe   # (B, S, C, D)
+
+        def per_chunk(fn, t):
+            s = t.shape[1]
+            step = -(-s // n)
+            return torch.cat([checkpoint(fn, t[:, i:i + step], use_reentrant=False)
+                              for i in range(0, s, step)], 1)
+
+        for layer in enc.layers:
+            if isinstance(layer, SpatialMix):
+                t = checkpoint(layer, t, None, (gh, gw), use_reentrant=False)
+            else:
+                t = per_chunk(layer, t)
+        p = per_chunk(lambda z: enc.norm(enc.pool(z)), t)                   # (B, S, D)
+        return p.transpose(1, 2).reshape(b, enc.dim, gh, gw)
+
+    def side_at(self, size):
+        """The spectral features on a detector level's grid, or None before a forward."""
+        f = self.__dict__.get("_side")
+        return None if f is None else F.adaptive_avg_pool2d(f, size)
 
     def forward(self, x):
         f = self._encode(x)                                     # (B, D, h, w)
@@ -1257,6 +1591,116 @@ class S3TFront(nn.Module):
             return torch.cat([self.base(x), up.to(x.dtype)], 1)   # (B, 3 + D, H, W)
         up = F.interpolate(self.head(f), size=x.shape[-2:], mode="bilinear", align_corners=False)
         return self.base(x) + up
+
+
+class SpectralPyramid(nn.Module):
+    """Stride-4 spectral features -> strides 8, 16, 32 (the detector's P3, P4, P5).
+
+    Strided 3x3 convolutions rather than average pooling: a target a few pixels
+    wide is averaged into its background by a pool, and the grey classes differ
+    from their background only in spectrum. Each level ends in a per-pixel
+    LayerNorm so every injection sees unit-scale input.
+    """
+
+    def __init__(self, dim: int, levels: int = 3):
+        super().__init__()
+        self.down = nn.ModuleList(nn.Conv2d(dim, dim, 3, stride=2, padding=1) for _ in range(levels))
+        self.norm = nn.ModuleList(nn.LayerNorm(dim) for _ in range(levels))
+
+    def forward(self, f):
+        out = []
+        for conv, ln in zip(self.down, self.norm):
+            f = F.gelu(conv(f))
+            out.append(ln_nhwc(f, ln))
+        return out
+
+
+class S3TXFront(nn.Module):
+    """S3T-X in front of the detector: fused where the grids already agree.
+
+    (B, 16, H, W) in [0, 1] -> (B, 3, H, W): the plain 16 -> 3 projection, for
+    the pretrained stem, unchanged. The spectral features never pass through
+    three channels and are never upsampled:
+
+    * the encoder runs at `scale` (0.5: native pixel scale) with stride 2, so
+      its grid is the input's stride 4 -- exactly the grid of RT-DETR's HGStem
+      output. `fuse_stem` adds them there through a zero-initialised 1x1 conv
+      (D -> the stem's 48 channels); the wrapper around the stem calls it.
+    * a learned pyramid takes them to strides 8/16/32 for the side injections
+      (`side_at`), which may first read AIFI's global context (ContextInject).
+
+    Every new path starts at zero: step 0 is the pretrained detector on the
+    projection, exactly.
+    """
+
+    def __init__(self, encoder, projection=None, scale: float = 0.5, grad_ckpt: bool = True,
+                 amp: bool = True, stem_ch: int = 48, train_encoder: bool = True):
+        super().__init__()
+        n, d = encoder.n_bands, encoder.dim
+        self.enc, self.scale, self.amp = encoder, scale, amp
+        encoder.grad_ckpt = bool(grad_ckpt)
+        self.train_encoder = bool(train_encoder)
+        if not self.train_encoder:
+            for p_ in encoder.parameters():
+                p_.requires_grad_(False)
+        self.out_channels = 3
+        self.base = nn.Conv2d(n, 3, 1, bias=False)
+        with torch.no_grad():
+            if projection is not None:
+                self.base.weight.copy_(torch.as_tensor(projection, dtype=torch.float32).view(3, n, 1, 1))
+            else:
+                self.base.weight.fill_(1.0 / n)
+        self.pyramid = SpectralPyramid(d)
+        self.fuse = nn.Conv2d(d, stem_ch, 1)
+        nn.init.zeros_(self.fuse.weight)
+        nn.init.zeros_(self.fuse.bias)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for k in ("_side", "_pyr", "_ctx"):
+            state.pop(k, None)
+        return state
+
+    def _encode(self, x):
+        level = x * LEVEL_SPAN + LEVEL_LO
+        if self.scale != 1.0:
+            level = F.interpolate(level, scale_factor=self.scale, mode="bilinear",
+                                  align_corners=False, antialias=True)
+        feats = observed_features(level)
+        with torch.autocast("cuda", dtype=torch.float16, enabled=self.amp and x.is_cuda):
+            if not self.train_encoder:
+                with torch.no_grad():
+                    f = self.enc(feats)
+            else:
+                f = self.enc(feats)
+            return f, self.pyramid(f)
+
+    def side_at(self, size):
+        pyr = self.__dict__.get("_pyr")
+        if pyr is None:
+            return None
+        size = tuple(size)
+        for p_ in pyr:
+            if tuple(p_.shape[-2:]) == size:
+                return p_
+        # an input size the strides do not divide: the finest level at least
+        # as large as the target, pooled onto it
+        big = [p_ for p_ in pyr if p_.shape[-2] >= size[0] and p_.shape[-1] >= size[1]]
+        return F.adaptive_avg_pool2d(big[-1] if big else pyr[0], size)
+
+    def fuse_stem(self, y):
+        """HGStem output (B, 48, H/4, W/4) plus the spectral features on the same grid."""
+        f = self.__dict__.get("_side")
+        if f is None:
+            return y
+        if f.shape[-2:] != y.shape[-2:]:
+            f = F.interpolate(f, size=y.shape[-2:], mode="bilinear", align_corners=False)
+        return y + self.fuse(f).to(y.dtype)
+
+    def forward(self, x):
+        f, pyr = self._encode(x)
+        self.__dict__["_side"], self.__dict__["_pyr"] = f, pyr
+        return self.base(x)
 
 
 def widen_first_conv(block: nn.Module, extra: int) -> nn.Conv2d:
@@ -1301,10 +1745,10 @@ class Inject(nn.Module):
 
     def forward(self, x):
         y = self.layer(x)
-        f = self.front.__dict__.get("_side")
+        f = self.front.side_at(y.shape[-2:])
         if f is None:
             return y
-        return y + self.proj(F.adaptive_avg_pool2d(f, y.shape[-2:]).to(y.dtype))
+        return y + self.proj(f.to(y.dtype))
 
 
 
@@ -1362,11 +1806,11 @@ class ContextInject(Inject):
 
     def forward(self, x):
         y = self.layer(x)
-        f = self.front.__dict__.get("_side")
-        if f is None:
-            return y
         h, w = y.shape[-2:]
-        fp = F.adaptive_avg_pool2d(f, (h, w)).to(y.dtype)          # (B, D, h, w)
+        fp = self.front.side_at((h, w))
+        if fp is None:
+            return y
+        fp = fp.to(y.dtype)                                          # (B, D, h, w)
         ctx = self.front.__dict__.get("_ctx")
         if ctx is not None:
             b, d = fp.shape[:2]
@@ -1415,7 +1859,7 @@ ROUND_CONFIG = json.loads(r'''
       "train": {
         "model": "rtdetr-l",
         "imgsz": 1024,
-        "epochs": 16,
+        "epochs": 48,
         "batch": 2,
         "lr0": 0.01,
         "mosaic": 1.0,
@@ -1431,22 +1875,30 @@ ROUND_CONFIG = json.loads(r'''
         "srf_k": 8,
         "srf_width": 2.0,
         "warmup_epochs": 5.0,
-        "schedule_epochs": 16,
+        "schedule_epochs": 48,
         "bbox_loss": "GIoU",
         "loss_gain": {},
         "bbox_alpha": 1.0,
         "vfl_beta": 0.0,
-        "log_size_l1": false,
+        "log_size_l1": true,
         "repeat_threshold": 0.0,
         "multi_scale": false,
         "coco_prior": true,
         "in_channels": 16,
-        "amp": false,
+        "amp": true,
         "deterministic": false,
         "s3t_scale": 0.5,
         "s3t_require_pretrain": true,
         "s3t_widen": true,
-        "s3t_context": true
+        "s3t_context": true,
+        "s3t_ckpt_chunks": 8,
+        "s3t_compile": true,
+        "amp_fp32_loss": true,
+        "s3t_arch": "xca",
+        "s3t_grad_ckpt": false,
+        "fdr": true,
+        "mal": true,
+        "s3t_mae_file": "pretrain3_mae.pt"
       },
       "infer": {
         "conf": 0.001,
@@ -1787,6 +2239,51 @@ def repeat_factors(train_ids, anns, threshold: float):
     return out
 
 
+_MAT: dict = {}
+
+
+def _emit(root, split, stem, img, boxes, a):
+    n = write_frame(root / "images" / split / stem, img)
+    lines = []
+    for b in boxes:
+        cx = (b.x1 + b.x2) / 2 / a.width
+        cy = (b.y1 + b.y2) / 2 / a.height
+        bw = (b.x2 - b.x1) / a.width
+        bh = (b.y2 - b.y1) / a.height
+        lines.append(f"{b.cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
+    (root / "labels" / split / f"{stem}.txt").write_text("\n".join(lines))
+    return n
+
+
+def _render_frame(job):
+    """Render one frame (and, for train, its augmented copies and repeats)."""
+    split, pid = job
+    cv2.setNumThreads(1)          # one process per core already; no nested pools after fork
+    m = _MAT
+    root, a = m["root"], m["anns"][pid]
+    cube = load_planar(m["index"][pid])
+    # The unaugmented frame is always written; validation is never augmented,
+    # so the score keeps measuring the real distribution.
+    img = build_channels(cube, m["channels"])
+    frame = _emit(root, split, str(pid), img, a.boxes, a)
+    if split == "train":
+        # Augmented copies are re-rendered; repeats are file copies. A repeat is
+        # not a wasted duplicate: ultralytics augments at load time -- mosaic,
+        # flip, scale -- so the same frame listed twice trains on two different
+        # images. Re-rendering it would only add our own spectral augmentation
+        # on top, which is what the copies setting is for.
+        rng = np.random.default_rng((0, int(pid)))
+        for k in range(m["copies"]):
+            c2, b2 = augment_cube(cube, list(a.boxes), m["aug"], m["donors"], m["pool"], rng)
+            _emit(root, split, f"{pid}_a{k}", build_channels(c2, m["channels"]), b2, a)
+        for k in range(m["reps"][pid] - 1):
+            for src, dst in ((frame, frame.with_name(f"{pid}_r{k}{frame.suffix}")),
+                             (root / "labels" / split / f"{pid}.txt",
+                              root / "labels" / split / f"{pid}_r{k}.txt")):
+                shutil.copyfile(src, dst)
+    return img.shape[2]
+
+
 def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
     """Write the YOLO dataset this candidate trains on, reusing it if rendered.
 
@@ -1808,47 +2305,26 @@ def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
     wants_aug = bool(aug.get("sg_window") or aug.get("smote_alpha") or aug.get("cutmix_prob"))
     donors = class_donors(index, anns, train_ids) if aug.get("smote_alpha") else {}
     pool = [index[p] for p in train_ids] if aug.get("cutmix_prob") else []
-    rng = np.random.default_rng(0)
-
-    def emit(root, split, stem, img, boxes, a):
-        n = write_frame(root / "images" / split / stem, img)
-        lines = []
-        for b in boxes:
-            cx = (b.x1 + b.x2) / 2 / a.width
-            cy = (b.y1 + b.y2) / 2 / a.height
-            bw = (b.x2 - b.x1) / a.width
-            bh = (b.y2 - b.y1) / a.height
-            lines.append(f"{b.cls_id} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}")
-        (root / "labels" / split / f"{stem}.txt").write_text("\n".join(lines))
-        return n
-
     reps = repeat_factors(train_ids, anns, float(cand["train"].get("repeat_threshold", 0.0)))
-    n_ch = 3
-    for split, ids in (("train", train_ids), ("val", val_ids)):
-        for pid in ids:
-            cube = load_planar(index[pid])
-            a = anns[pid]
-            # The unaugmented frame is always written; validation is never
-            # augmented, so the score keeps measuring the real distribution.
-            img = build_channels(cube, cand["channels"])
-            n_ch = img.shape[2]
-            frame = emit(root, split, str(pid), img, a.boxes, a)
 
-            if split == "train":
-                # Augmented copies are re-rendered; repeats are file copies.
-                # A repeat is not a wasted duplicate: ultralytics augments at
-                # load time -- mosaic, flip, scale, HSV -- so the same frame
-                # listed twice trains on two different images. Re-rendering it
-                # would only add our own spectral augmentation on top, which is
-                # what the copies setting is for and is separate from balance.
-                for k in range(copies if wants_aug else 0):
-                    c2, b2 = augment_cube(cube, list(a.boxes), aug, donors, pool, rng)
-                    emit(root, split, f"{pid}_a{k}", build_channels(c2, cand["channels"]), b2, a)
-                for k in range(reps[pid] - 1):
-                    for src, dst in ((frame, frame.with_name(f"{pid}_r{k}{frame.suffix}")),
-                                     (root / "labels" / split / f"{pid}.txt",
-                                      root / "labels" / split / f"{pid}_r{k}.txt")):
-                        shutil.copyfile(src, dst)
+    # One process per CPU, forked so they inherit everything below without
+    # pickling it. Each frame's augmentation draws from its own generator,
+    # seeded by the frame id, so the result does not depend on scheduling.
+    _MAT.clear()
+    _MAT.update(index=index, anns=anns, channels=cand["channels"], aug=aug, donors=donors,
+                pool=pool, copies=copies if wants_aug else 0, reps=reps, root=root)
+    jobs = [("train", p) for p in train_ids] + [("val", p) for p in val_ids]
+    workers = max(1, min(os.cpu_count() or 1, 8))
+    t_r = time.time()
+    if workers > 1:
+        import multiprocessing as _mp
+        with _mp.get_context("fork").Pool(workers) as mp_pool:
+            chans = mp_pool.map(_render_frame, jobs, chunksize=8)
+    else:
+        chans = [_render_frame(j) for j in jobs]
+    _MAT.clear()
+    n_ch = chans[0] if chans else 3
+    log(f"  rendering: {len(jobs)} frames on {workers} processes in {time.time() - t_r:.0f}s")
 
     for split, ids in (("train", train_ids), ("val", val_ids)):
         n = len(list((root / "images" / split).glob("*.png"))) + \
@@ -1949,7 +2425,52 @@ if _nn is not None:
             self.block = block
 
         def forward(self, x):
-            return self.block(self.front(x))
+            y = self.block(self.front(x))
+            # S3T-X joins the stem's output (both at stride 4); the older
+            # fronts have already joined at its input.
+            fuse = getattr(self.front, "fuse_stem", None)
+            return y if fuse is None else fuse(y)
+
+    class SDPAMultiheadAttention(_nn.MultiheadAttention):
+        """nn.MultiheadAttention that never asks for the attention weights.
+
+        ultralytics calls AIFI's and the decoder's attention without
+        need_weights=False, so PyTorch materialises the full weight matrix
+        instead of dispatching to scaled_dot_product_attention's fused kernels.
+        Same parameters, same output; the class is swapped in place.
+        """
+
+        def forward(self, query, key, value, key_padding_mask=None, need_weights=True,
+                    attn_mask=None, average_attn_weights=True, is_causal=False):
+            return super().forward(query, key, value, key_padding_mask=key_padding_mask,
+                                   need_weights=False, attn_mask=attn_mask,
+                                   average_attn_weights=average_attn_weights, is_causal=is_causal)
+
+    class FP32Criterion(_nn.Module):
+        """The detector's loss computed in fp32 under an AMP forward.
+
+        ultralytics warns that RT-DETR's bipartite matching can produce NaN in
+        fp16, and HungarianMatcher does not cast back itself. Everything before
+        the loss runs in fp16; the matching and the loss do not. A Module,
+        because the model registers its criterion as a child module.
+        """
+
+        def __init__(self, inner):
+            super().__init__()
+            self.inner = inner
+
+        @staticmethod
+        def _f(x):
+            if isinstance(x, (tuple, list)):
+                return type(x)(FP32Criterion._f(v) for v in x)
+            return x.float() if hasattr(x, "is_floating_point") and x.is_floating_point() else x
+
+        def forward(self, preds, targets, **kw):
+            import torch as _t
+            dev = "cuda" if _t.cuda.is_available() else "cpu"
+            with _t.autocast(dev, enabled=False):
+                kw = {k: self._f(v) for k, v in kw.items()}
+                return self.inner(self._f(preds), targets, **kw)
 else:                                                # pragma: no cover
     SpectralFront = None
 
@@ -1960,6 +2481,9 @@ try:
     from ultralytics.models.utils.loss import RTDETRDetectionLoss as _RTDETRLoss
     from ultralytics.utils.loss import VarifocalLoss as _VFL
     from ultralytics.utils.metrics import bbox_iou as _bbox_iou
+    from ultralytics.nn.modules.transformer import MLP as _MLP
+    from ultralytics.nn.modules.transformer import DeformableTransformerDecoder as _DTD
+    from ultralytics.nn.modules.utils import inverse_sigmoid as _inv_sig
 except ImportError:                                  # pragma: no cover
     _RTDETRLoss = None
 
@@ -1980,10 +2504,17 @@ if _RTDETRLoss is not None:
         """
 
         beta: float = 0.0
+        # MAL (DEIM, CVPR 2025) is beta=1 with the target raised to a power:
+        # every matched query gets full weight, and its target is IoU^1.5, so a
+        # low-IoU match is taught a low score instead of being down-weighted
+        # out of the loss.
+        target_pow: float = 1.0
 
         def forward(self, pred_score, gt_score, label):
             if not self.beta:
                 return super().forward(pred_score, gt_score, label)
+            if self.target_pow != 1.0:
+                gt_score = gt_score.clamp_min(0).pow(self.target_pow)
             pos = gt_score + self.beta * (1.0 - gt_score)
             weight = (self.alpha * pred_score.sigmoid().pow(self.gamma) * (1 - label)
                       + pos * label)
@@ -2027,6 +2558,45 @@ if _RTDETRLoss is not None:
         alpha_iou: float = 1.0
         log_size: bool = False
         EPS = 1e-4
+        # D-FINE (ICLR 2025) on top of the decoder (FDRDecoder): FGL trains
+        # each layer's edge distributions on the matched boxes, DDF distils
+        # the last layer's box into the earlier layers' distributions (GO-LSD).
+        # Gains are D-FINE's.
+        fdr: bool = False
+        fgl_gain: float = 0.15
+        ddf_gain: float = 1.5
+
+        def __getstate__(self):
+            state = self.__dict__.copy()
+            state.pop("_fdr_calls", None)
+            return state
+
+        def _get_loss(self, pred_bboxes, pred_scores, gt_bboxes, gt_cls, gt_groups, masks=None,
+                      gt_mask=None, postfix="", match_indices=None):
+            # Same matching, recorded, so the distribution losses reuse it.
+            if match_indices is None:
+                match_indices = self.matcher(pred_bboxes, pred_scores, gt_bboxes, gt_cls, gt_groups,
+                                             masks=masks, gt_mask=gt_mask)
+            calls = self.__dict__.get("_fdr_calls")
+            if calls is not None:
+                calls.append((match_indices, pred_bboxes, pred_scores))
+            return super()._get_loss(pred_bboxes, pred_scores, gt_bboxes, gt_cls, gt_groups,
+                                     masks=masks, gt_mask=gt_mask, postfix=postfix,
+                                     match_indices=match_indices)
+
+        def forward(self, preds, batch, dn_bboxes=None, dn_scores=None, dn_meta=None):
+            dec = self.__dict__.get("_fdr_decoder")
+            stash = dec.__dict__.get("_fdr") if (self.fdr and dec is not None) else None
+            if stash is None:
+                return super().forward(preds, batch, dn_bboxes, dn_scores, dn_meta)
+            dec.__dict__["_fdr"] = None                     # one loss per forward
+            self.__dict__["_fdr_calls"] = calls = []
+            try:
+                loss = super().forward(preds, batch, dn_bboxes, dn_scores, dn_meta)
+            finally:
+                self.__dict__.pop("_fdr_calls", None)
+            loss.update(fdr_losses(self, dec, stash, calls, batch, dn_meta))
+            return loss
 
         def _l1(self, pred_bboxes, gt_bboxes):
             if not self.log_size:
@@ -2060,8 +2630,176 @@ if _RTDETRLoss is not None:
                 name_giou: (self.loss_gain["giou"] * overlap.sum() / n).squeeze(),
             }
 
+    def fdr_weighting(reg_max=32, up=0.5, reg_scale=4.0):
+        """D-FINE's W(n): reg_max + 1 edge offsets, dense near 0, +-2*up*reg_scale at the ends."""
+        ub1 = abs(up) * abs(reg_scale)
+        step = (ub1 + 1) ** (2 / (reg_max - 2))
+        left = [-(step ** i) + 1 for i in range(reg_max // 2 - 1, 0, -1)]
+        right = [step ** i - 1 for i in range(1, reg_max // 2)]
+        return _torch.tensor([-2 * ub1] + left + [0.0] + right + [2 * ub1], dtype=_torch.float32)
+
+    def fdr_apply(box, corners, project, reg_scale):
+        """cxcywh box, corner logits (..., 4 * (R + 1)) -> the box with its edges moved.
+
+        Each edge moves by the expectation of W under its distribution, in units
+        of the box's side / reg_scale (D-FINE's distance2bbox). Uniform logits
+        give an expectation of 0 (W is odd), so zero-initialised heads leave the
+        box exactly where the pretrained head put it.
+        """
+        p = project.float()
+        d = (corners.float().unflatten(-1, (4, p.numel())).softmax(-1) * p).sum(-1)
+        cx, cy, w, h = box.float().unbind(-1)
+        half = 0.5 * reg_scale
+        x1 = cx - (half + d[..., 0]) * w / reg_scale
+        y1 = cy - (half + d[..., 1]) * h / reg_scale
+        x2 = cx + (half + d[..., 2]) * w / reg_scale
+        y2 = cy + (half + d[..., 3]) * h / reg_scale
+        c = _torch.stack([(x1 + x2) / 2, (y1 + y2) / 2], -1).clamp(0.0, 1.0)
+        wh = _torch.stack([x2 - x1, y2 - y1], -1).clamp(1e-4, 1.0)
+        return _torch.cat([c, wh], -1).to(box.dtype)
+
+    def fdr_targets(ref, gt, project, reg_scale):
+        """Where gt's edges sit relative to ref, as two adjacent bins of W and their weights.
+
+        D-FINE's bbox2distance + translate_gt: an edge offset between W[k] and
+        W[k+1] is split linearly between them, so the expectation reproduces it
+        exactly; beyond either end it goes wholly to the end bin.
+        """
+        p = project.float()
+        rmax = p.numel() - 1
+        ref, gt = ref.float(), gt.float()
+        sw = ref[..., 2] / reg_scale + 1e-16
+        sh = ref[..., 3] / reg_scale + 1e-16
+        g1, g2 = gt[..., :2] - gt[..., 2:] / 2, gt[..., :2] + gt[..., 2:] / 2
+        d = _torch.stack([(ref[..., 0] - g1[..., 0]) / sw, (ref[..., 1] - g1[..., 1]) / sh,
+                          (g2[..., 0] - ref[..., 0]) / sw, (g2[..., 1] - ref[..., 1]) / sh],
+                         -1).reshape(-1) - 0.5 * reg_scale
+        k = (p[None, :] <= d[:, None]).sum(1) - 1
+        lo = k.clamp(0, rmax - 1)
+        wr = ((d - p[lo]) / (p[lo + 1] - p[lo])).clamp(0.0, 1.0)
+        wr = _torch.where(k < 0, _torch.zeros_like(wr), wr)
+        wr = _torch.where(k >= rmax, _torch.ones_like(wr), wr)
+        return lo, 1.0 - wr, wr
+
+    def _two_bin_kl(logits, lo, wl, wr):
+        """KL(two-bin target || softmax(logits)) per edge; its gradient is D-FINE's FGL/DDF's."""
+        lp = logits.float().log_softmax(-1)
+        ce = -(lp.gather(1, lo[:, None])[:, 0] * wl + lp.gather(1, (lo + 1)[:, None])[:, 0] * wr)
+        ent = -(wl * wl.clamp_min(1e-12).log() + wr * wr.clamp_min(1e-12).log())
+        return ce - ent
+
+    def fdr_losses(crit, dec, stash, calls, batch, dn_meta):
+        """FGL on every decoder layer's matched boxes; DDF from the last layer to the rest.
+
+        calls are the loss's own matchings, in DETRLoss's order: the main
+        queries' last layer, then its aux layers (encoder, decoder 0..L-2), then
+        the same for the denoising queries (no encoder layer there).
+        """
+        proj, rs = dec.fdr_project.float(), float(dec.fdr_reg_scale)
+        corners, refs = stash["corners"].float(), stash["refs"].float()
+        L, R1 = corners.shape[0], proj.numel()
+        if dn_meta is not None:
+            dn_c, mc = corners.split(dn_meta["dn_num_split"], dim=2)
+            dn_r, mr = refs.split(dn_meta["dn_num_split"], dim=2)
+            parts = [(mc, mr, [L - 1, None] + list(range(L - 1))),
+                     (dn_c, dn_r, [L - 1] + list(range(L - 1)))]
+        else:
+            parts = [(corners, refs, [L - 1, None] + list(range(L - 1)))]
+        if sum(len(pl) for _, _, pl in parts) != len(calls):
+            raise RuntimeError(f"FDR loss: {len(calls)} matchings for layers "
+                               f"{[pl for _, _, pl in parts]} -- DETRLoss changed its call order")
+        gt = batch["bboxes"].float()
+        fgl = ddf = corners.sum() * 0.0
+        k = 0
+        for C, Rf, plan in parts:
+            t_idx, t_box, t_score = calls[k]                     # this part's last layer: the teacher
+            t_box = t_box.detach().float()
+            t_conf = t_score.detach().float().sigmoid().max(-1).values
+            b = t_box.shape[0]
+            for layer in plan:
+                mi, pb, _ = calls[k]
+                k += 1
+                if layer is None:
+                    continue
+                idx, gt_idx = crit._get_index(mi)
+                if len(gt_idx):
+                    lo, wl, wr = fdr_targets(Rf[layer][idx], gt[gt_idx], proj, rs)
+                    iou = _bbox_iou(pb[idx].detach().float(), gt[gt_idx], xywh=True).view(-1).clamp_min(0)
+                    fgl = fgl + (_two_bin_kl(C[layer][idx].reshape(-1, R1), lo, wl, wr)
+                                 * iou.repeat_interleave(4)).sum() / len(gt_idx)
+                if crit.ddf_gain and layer < L - 1:
+                    lo, wl, wr = fdr_targets(Rf[layer].reshape(-1, 4), t_box.reshape(-1, 4), proj, rs)
+                    kl = _two_bin_kl(C[layer].reshape(-1, R1), lo, wl, wr)
+                    wt = t_conf.clone()
+                    pos = _torch.zeros_like(wt, dtype=_torch.bool)
+                    tidx, tgt_idx = crit._get_index(t_idx)
+                    if len(tgt_idx):
+                        pos[tidx] = True
+                        wt[tidx] = _bbox_iou(t_box[tidx], gt[tgt_idx], xywh=True).view(-1).clamp_min(0)
+                    wt, pos = wt.reshape(-1).repeat_interleave(4), pos.reshape(-1).repeat_interleave(4)
+                    kl = kl * wt
+                    scale = 8.0 / b                               # D-FINE: independent of batch per GPU
+                    n_pos, n_neg = (pos.sum() * scale) ** 0.5, ((~pos).sum() * scale) ** 0.5
+                    l_pos = kl[pos].mean() if pos.any() else kl.sum() * 0.0
+                    l_neg = kl[~pos].mean() if (~pos).any() else kl.sum() * 0.0
+                    ddf = ddf + (l_pos * n_pos + l_neg * n_neg) / (n_pos + n_neg).clamp_min(1e-6)
+        return {"loss_fgl": crit.fgl_gain * fgl, "loss_ddf": crit.ddf_gain * ddf}
+
+    class FDRDecoder(_DTD):
+        """RT-DETR's pretrained decoder with D-FINE's distribution refinement added.
+
+        D-FINE replaces the box head: each layer predicts, per edge, a
+        distribution over reg_max + 1 offsets and the box is its expectation.
+        Replacing it here would throw away the COCO-pretrained box heads, so
+        the distributions are added *on top*: layer i's box is the pretrained
+        head's box with each edge moved by the expectation of its distribution
+        (fdr_apply), and the heads producing the logits start at zero -- a
+        uniform distribution, an offset of exactly 0, the pretrained decoder at
+        step 0. The refined box is also the next layer's reference.
+
+        Swapped in by class (install_fdr), like SDPAMultiheadAttention: the
+        layers, heads and weights are the pretrained ones.
+        """
+
+        def __getstate__(self):
+            state = self.__dict__.copy()
+            state.pop("_fdr", None)
+            return state
+
+        def forward(self, embed, refer_bbox, feats, shapes, bbox_head, score_head, pos_mlp,
+                    attn_mask=None, padding_mask=None):
+            output = embed
+            boxes, logits, corners, refs = [], [], [], []
+            last = None
+            proj, rs = self.fdr_project, self.fdr_reg_scale
+            refer_bbox = refer_bbox.sigmoid()
+            for i, layer in enumerate(self.layers):
+                output = layer(output, refer_bbox, feats, shapes, padding_mask, attn_mask,
+                               pos_mlp(refer_bbox))
+                delta = bbox_head[i](output)
+                c = self.fdr[i](output)
+                refined = fdr_apply(_torch.sigmoid(delta + _inv_sig(refer_bbox)), c, proj, rs)
+                if self.training:
+                    logits.append(score_head[i](output))
+                    # ultralytics' look-forward-twice: from layer 1 on, the box
+                    # the loss sees is built on the previous layer's undetached box.
+                    coarse = (_torch.sigmoid(delta + _inv_sig(refer_bbox)) if i == 0
+                              else _torch.sigmoid(delta + _inv_sig(last)))
+                    boxes.append(refined if i == 0 else fdr_apply(coarse, c, proj, rs))
+                    corners.append(c)
+                    refs.append(coarse.detach())
+                elif i == self.eval_idx:
+                    logits.append(score_head[i](output))
+                    boxes.append(refined)
+                    break
+                last = refined
+                refer_bbox = refined.detach() if self.training else refined
+            self.__dict__["_fdr"] = ({"corners": _torch.stack(corners), "refs": _torch.stack(refs)}
+                                     if self.training else None)
+            return _torch.stack(boxes), _torch.stack(logits)
+
 else:                                                # pragma: no cover
-    IoUKindDETRLoss = IoUKindVFL = None
+    IoUKindDETRLoss = IoUKindVFL = FDRDecoder = None
 
 if SpectralFront is not None:
     # The trained model is pickled into every checkpoint, and pickle stores the
@@ -2076,7 +2814,7 @@ if SpectralFront is not None:
     _mod.SpectralFront = SpectralFront
     SpectralFront.__module__ = "hod26_kernel"
     if IoUKindDETRLoss is not None:
-        for _c in (IoUKindDETRLoss, IoUKindVFL):
+        for _c in (IoUKindDETRLoss, IoUKindVFL, FDRDecoder):
             setattr(_mod, _c.__name__, _c)
             _c.__module__ = "hod26_kernel"
 
@@ -2134,40 +2872,77 @@ def visible_gpus():
         return 0
 
 
-def find_mae_checkpoint():
-    """The S3T encoder pretrained by MAE, wherever its kernel output is mounted."""
+def find_mae_checkpoint(name=None):
+    """The S3T encoder pretrained by MAE, wherever its kernel output is mounted.
+
+    Exactly one, or an error: with two pretraining notebooks attached (v1's
+    pretrain_mae.pt and v2's pretrain2_mae.pt) picking by sort order would
+    silently train the detector on whichever path sorts first. name (the
+    candidate's train.s3t_mae_file) selects one by file name.
+    """
     hits = sorted(INPUT.rglob("*_mae.pt")) if INPUT.exists() else []
-    hits.sort(key=lambda p: (0 if "pretrain" in p.name else 1, str(p)))
+    if name:
+        hits = [h for h in hits if h.name == name]
+    if len(hits) > 1:
+        raise RuntimeError(f"{len(hits)} MAE checkpoints attached ({[str(h) for h in hits]}); "
+                           f"set train.s3t_mae_file to the one to use")
     return hits[0] if hits else None
 
 
 def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5,
                       inject=(19, 14, 10), dim=64, depth=4, heads=4, widen=True,
-                      context=True, ctx_layer=11, **_):
+                      context=True, ctx_layer=11, ckpt_chunks=8, compile_blocks=False,
+                      fast_kernels=False, train_encoder=True, arch="tokens", grad_ckpt=True,
+                      windows=(16, 16, None, None), **_):
     """S3T encoder in front of the pretrained first block, plus side injections.
 
-    The encoder is loaded from the MAE checkpoint when one is given. inject
-    names the hybrid encoder's input projections (P3, P4, P5 in rtdetr-l); each
-    gets the pooled spectral features through a zero-initialised 1x1 conv.
+    The encoder is loaded from the MAE checkpoint when one is given; its config
+    decides the architecture (arch "xca": S3T-X, fused at the stem's output;
+    "tokens": the band-token encoder, joined at the stem's widened input).
+    inject names the hybrid encoder's input projections (P3, P4, P5 in
+    rtdetr-l); each gets the spectral features through a zero-initialised 1x1.
     """
     import torch
 
     block = net.model[0]
     if isinstance(block, SpectralFront):
         return False                      # already installed (resumed model)
-    cfg = {"dim": dim, "depth": depth, "heads": heads}
+    cfg = {"arch": arch, "dim": dim, "depth": depth, "heads": heads, "windows": list(windows)}
     state = None
     if mae_ckpt:
         ck = torch.load(mae_ckpt, map_location="cpu", weights_only=True)
         cfg.update(ck.get("config") or {})
+        if cfg.get("arch", "tokens") != arch:
+            raise RuntimeError(f"MAE checkpoint {mae_ckpt} is arch={cfg.get('arch', 'tokens')!r}, "
+                               f"the run asks for arch={arch!r}")
         state = ck["encoder"]
-    enc = SpectralEncoder(dim=cfg["dim"], depth=cfg["depth"], heads=cfg["heads"])
+    enc = build_encoder(cfg)
     if state is not None:
-        missing, unexpected = enc.load_state_dict(state, strict=True), None
+        enc.load_state_dict(state, strict=True)
         log(f"  S3T encoder: MAE weights from {mae_ckpt} (step {ck.get('step')})")
     else:
         log("  S3T encoder: NO pretrained weights -- random initialisation")
-    front = S3TFront(enc, projection=projection, scale=scale, widen=widen)
+    xca = cfg.get("arch") == "xca"
+    if xca:
+        stem_ch = [m for m in block.modules() if isinstance(m, torch.nn.Conv2d)][-1].out_channels
+        front = S3TXFront(enc, projection=projection, scale=scale, grad_ckpt=grad_ckpt,
+                          stem_ch=stem_ch, train_encoder=train_encoder)
+        widen = False
+    else:
+        front = S3TFront(enc, projection=projection, scale=scale, widen=widen,
+                         ckpt_chunks=ckpt_chunks, fast_kernels=fast_kernels,
+                         train_encoder=train_encoder)
+    if compile_blocks:
+        # Fuse each block's LayerNorm/GELU/residual chains (nn.Module.compile,
+        # in place, so DDP and pickling see ordinary modules). No fallback: a
+        # failure surfaces as an error at the first step.
+        from torch import nn as _tnn
+        n_c = 0
+        for m in enc.modules():
+            if type(m).__name__ in ("SpectralBlock", "SpatialMix", "SpectralPool", "XCABlock"):
+                m.compile()
+                n_c += 1
+        log(f"  S3T blocks compiled in place: {n_c}")
     dev = next(block.parameters()).device
     if widen:
         # 3 -> 3 + D input channels on the pretrained stem's first conv, the
@@ -2197,11 +2972,48 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
     net.__dict__["_hod26_mixer"] = front.base
     net.__dict__["_hod26_mixer_init"] = front.base.weight.detach().clone()
     n_enc = sum(p.numel() for p in enc.parameters())
+    if xca:
+        log(f"  S3T-X: cross-covariance attention, windows {enc.windows}, channels_last; "
+            f"{'per-block checkpoints' if grad_ckpt else 'no checkpoints'}; encoder "
+            f"{'trained' if train_encoder else 'FROZEN (feature extractor)'}")
+        log(f"  S3T-X front: {n_enc / 1e6:.2f}M-param encoder at {scale}x input scale, "
+            f"stride-4 output joined to {type(block).__name__}'s {front.fuse.out_channels}-ch output "
+            f"(zero-init 1x1); learned pyramid -> zero-init injections at layers {list(inject)}"
+            + (f"; P3/P4 read AIFI's global context (layer {ctx_layer}, {ctx_ch}-d)" if context else ""))
+        return True
+    log(f"  S3T memory: per-layer checkpoints, per-position layers in {ckpt_chunks} chunks"
+        if ckpt_chunks else "  S3T memory: one checkpoint around the whole encoder")
+    log(f"  S3T kernels: {'16-token attention as batched matmul, depthwise conv channels_last' if fast_kernels else 'SDPA attention, NCHW depthwise conv'}; "
+        f"encoder {'trained' if train_encoder else 'FROZEN (feature extractor)'}")
     log(f"  S3T front: {n_enc / 1e6:.2f}M-param spectral Transformer at {scale}x input "
         f"scale, {'3+' + str(enc.dim) if widen else '16->3'} channels into the pretrained "
         f"{type(block).__name__}, zero-init side injections at layers {list(inject)}"
         + (f"; P3/P4 read AIFI's global context (layer {ctx_layer}, {ctx_ch}-d)" if context else ""))
     return True
+
+
+def enable_transformer_accel(net, fp32_loss=True, nc=None):
+    """Put every attention in the detector on SDPA, and its loss on fp32.
+
+    Returns what it did, for the acceleration table the run prints.
+    """
+    import torch
+    n_mha = 0
+    for m in net.modules():
+        if type(m) is torch.nn.MultiheadAttention:
+            m.__class__ = SDPAMultiheadAttention
+            n_mha += 1
+    wrapped = False
+    if fp32_loss:
+        if getattr(net, "criterion", None) is None:
+            # get_model runs before ultralytics sets net.nc; the criterion needs it.
+            if nc is not None and not hasattr(net, "nc"):
+                net.nc = int(nc)
+            net.criterion = net.init_criterion()
+        if not isinstance(net.criterion, FP32Criterion):
+            net.criterion = FP32Criterion(net.criterion)
+        wrapped = True
+    return {"mha_to_sdpa": n_mha, "fp32_loss": wrapped}
 
 
 def install_spectral_adapter(net, n_bands, projection=None, ckpt_name=None,
@@ -2371,9 +3183,33 @@ IOU_KINDS = {"GIoU": {"GIoU": True}, "DIoU": {"DIoU": True},
              "CIoU": {"CIoU": True}, "IoU": {}}
 
 
+def install_fdr(net, reg_max: int = 32, reg_scale: float = 4.0, up: float = 0.5):
+    """D-FINE's distribution refinement on RT-DETR's decoder (see FDRDecoder).
+
+    One zero-initialised 3-layer MLP per decoder layer, hidden -> 4 x (reg_max
+    + 1) edge logits, as D-FINE initialises its heads. Returns the decoder.
+    """
+    import torch
+    head = net.model[-1]
+    dec = head.decoder
+    if isinstance(dec, FDRDecoder):
+        return dec
+    hd = int(getattr(head, "hidden_dim", 256))
+    dev = next(dec.parameters()).device
+    heads = torch.nn.ModuleList(_MLP(hd, hd, 4 * (reg_max + 1), 3) for _ in range(len(dec.layers)))
+    for m in heads:
+        torch.nn.init.zeros_(m.layers[-1].weight)
+        torch.nn.init.zeros_(m.layers[-1].bias)
+    dec.__class__ = FDRDecoder
+    dec.fdr = heads.to(dev)
+    dec.register_buffer("fdr_project", fdr_weighting(reg_max, up, reg_scale).to(dev), persistent=False)
+    dec.fdr_reg_scale = float(reg_scale)
+    return dec
+
+
 def install_bbox_loss(net, nc: int, kind: str = "GIoU", alpha: float = 1.0,
                       beta: float = 0.0, log_size: bool = False,
-                      loss_gain: dict | None = None):
+                      loss_gain: dict | None = None, fdr: bool = False, mal: bool = False):
     """Condition RT-DETR's box and class losses on how good each match is.
 
     Every default reproduces the stock loss exactly, which is what makes an A/B
@@ -2387,16 +3223,27 @@ def install_bbox_loss(net, nc: int, kind: str = "GIoU", alpha: float = 1.0,
     crit.iou_flag = IOU_KINDS[kind]
     crit.alpha_iou = float(alpha)
     crit.log_size = bool(log_size)
-    if beta:
+    if mal:
+        # MAL: every matched query at full weight, target IoU^1.5 (DEIM's
+        # gamma); negatives keep RT-DETR's alpha * p^gamma focal weight.
+        vfl = IoUKindVFL(gamma=crit.vfl.gamma, alpha=crit.vfl.alpha)
+        vfl.beta, vfl.target_pow = 1.0, 1.5
+        crit.vfl = vfl
+    elif beta:
         vfl = IoUKindVFL()
         vfl.beta = float(beta)
         crit.vfl = vfl
+    if fdr:
+        crit.fdr = True
+        crit.__dict__["_fdr_decoder"] = install_fdr(net)
     if loss_gain:
         crit.loss_gain.update(loss_gain)
     net.criterion = crit
     log(f"  box loss: {kind}"
         + (f", alpha={alpha}" if alpha != 1.0 else "")
-        + (f", vfl_beta={beta}" if beta else "")
+        + (", MAL (target IoU^1.5, positives at full weight)" if mal else "")
+        + (f", vfl_beta={beta}" if beta and not mal else "")
+        + (", D-FINE FDR (+FGL 0.15, GO-LSD/DDF 1.5) on the pretrained decoder" if fdr else "")
         + (", log-space wh" if log_size else "")
         + (f", gains {loss_gain}" if loss_gain else ""))
     return True
@@ -2429,7 +3276,7 @@ def restore_state(net, src):
 def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                   bbox_loss="GIoU", loss_gain=None, is_rtdetr=True,
                   bbox_alpha=1.0, vfl_beta=0.0, log_size_l1=False,
-                  reset_best_fitness=True):
+                  reset_best_fitness=True, accel=None, fdr=False, mal=False):
     """A trainer that seeds the head from COCO by name and installs the adapter.
 
     Both have to happen inside get_model, and for the same reason: ultralytics
@@ -2451,6 +3298,44 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
     """
 
     class HOD26Trainer(base_cls):
+        def build_optimizer(self, *args, **kwargs):
+            opt = super().build_optimizer(*args, **kwargs)
+            if not accel or not accel.get("fused_optimizer"):
+                return opt
+            import torch
+            cls = type(opt)
+            # Rebuilt from the same groups (each carries its own lr, momentum /
+            # betas and weight decay), with the fused CUDA kernel. No fallback.
+            # The flag has to go on each group: the groups already carry
+            # fused=None from the first build, and a group's own value wins
+            # over the constructor's default -- passing fused=True alone
+            # silently kept the foreach kernels.
+            for g in opt.param_groups:
+                g["fused"], g["foreach"] = True, None
+            fused = cls(opt.param_groups, lr=opt.defaults["lr"], fused=True)
+            is_fused = all(g.get("fused") is True for g in fused.param_groups)
+            done = getattr(self, "_hod26_accel", {}) or {}
+            table = [
+                ("AMP fp16 (+GradScaler)", bool(getattr(self, "amp", False)),
+                 "ultralytics check_amp result" if not getattr(self, "amp", False) else ""),
+                ("loss + Hungarian matching in fp32", bool(done.get("fp32_loss")), ""),
+                ("RT-DETR attention via SDPA", done.get("mha_to_sdpa", 0) > 0,
+                 f"{done.get('mha_to_sdpa', 0)} nn.MultiheadAttention swapped"),
+                (f"fused {cls.__name__}", is_fused, "" if is_fused else "a group is not fused"),
+                ("cudnn.benchmark", bool(torch.backends.cudnn.benchmark), ""),
+                ("FlashAttention / TF32 / bf16", False, "not supported on T4 (sm75)"),
+            ]
+            if is_main_rank():
+                log("  acceleration table:")
+                for name, on, why in table:
+                    log(f"    {'ON ' if on else 'off'}  {name}" + (f"  ({why})" if why else ""))
+            if not is_fused:
+                raise RuntimeError("fused optimizer requested but a parameter group is not fused")
+            if accel.get("require_amp") and not getattr(self, "amp", False):
+                raise RuntimeError("AMP was requested but ultralytics turned it off "
+                                   "(check_amp failed); stopping instead of training in fp32")
+            return fused
+
         def _setup_scheduler(self):
             """Shape the LR curve over the whole run, not over this session.
 
@@ -2542,11 +3427,15 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
             # RTDETRDetectionLoss only: the YOLO head computes its box loss
             # somewhere else entirely, so this override would silently miss.
             if is_rtdetr and any((bbox_loss not in ("", "GIoU"), loss_gain,
-                                  bbox_alpha != 1.0, vfl_beta, log_size_l1)):
+                                  bbox_alpha != 1.0, vfl_beta, log_size_l1, fdr, mal)):
                 install_bbox_loss(net, self.data["nc"], bbox_loss or "GIoU",
-                                  bbox_alpha, vfl_beta, log_size_l1, loss_gain)
+                                  bbox_alpha, vfl_beta, log_size_l1, loss_gain, fdr=fdr, mal=mal)
             if adapter:
                 install_spectral_adapter(net, **adapter)
+            if accel:
+                done = enable_transformer_accel(net, fp32_loss=accel.get("fp32_loss", True),
+                                                nc=self.data["nc"])
+                self.__dict__["_hod26_accel"] = done
                 # Resuming rebuilds the model from its yaml, which has no
                 # adapter in it. Only once the front end is back does the
                 # checkpoint's every tensor have a key to land on.
@@ -2820,6 +3709,12 @@ def snapshot_for_resume(tag, run):
                      (run / "results.csv", WORK / f"{tag}_results.csv")):
         if src.exists():
             shutil.copy2(src, dst)
+    # best.pt too, whenever an epoch rewrote it: the runs directory is scratch
+    # and is not saved, so a session that ends in an exception would otherwise
+    # keep last.pt and lose the best weights it had already found.
+    best, kept = run / "weights" / "best.pt", WORK / f"{tag}_best.pt"
+    if best.exists() and (not kept.exists() or best.stat().st_mtime > kept.stat().st_mtime):
+        shutil.copy2(best, kept)
 
 
 def keep_for_resume(tag):
@@ -2993,7 +3888,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
         # ignored entirely when srf_k selects the two-stage front end.
         proj = PDA_PROJECTIONS.get(str(tr.get("adapter_penalty", "0")), LDA_16_TO_3)
         if tr.get("spectral_stem") == "s3t":
-            mae = find_mae_checkpoint()
+            mae = find_mae_checkpoint(tr.get("s3t_mae_file"))
             if mae is None and tr.get("s3t_require_pretrain", True):
                 raise RuntimeError("spectral_stem=s3t needs the MAE checkpoint "
                                    f"(*_mae.pt) attached under {INPUT}")
@@ -3001,7 +3896,13 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                        "mae_ckpt": str(mae) if mae else None,
                        "scale": float(tr.get("s3t_scale", 0.5)),
                        "widen": bool(tr.get("s3t_widen", True)),
-                       "context": bool(tr.get("s3t_context", True))}
+                       "context": bool(tr.get("s3t_context", True)),
+                       "ckpt_chunks": int(tr.get("s3t_ckpt_chunks", 8)),
+                       "compile_blocks": bool(tr.get("s3t_compile", False)),
+                       "fast_kernels": bool(tr.get("s3t_fast_kernels", False)),
+                       "train_encoder": bool(tr.get("s3t_train_encoder", True)),
+                       "arch": tr.get("s3t_arch", "tokens"),
+                       "grad_ckpt": bool(tr.get("s3t_grad_ckpt", True))}
         elif tr.get("spectral_stem", "adapter") == "adapter":
             adapter = {"n_bands": tr["in_channels"], "projection": proj,
                        "ckpt_name": tr["model"], "srf_k": tr.get("srf_k", 0),
@@ -3016,7 +3917,15 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                                 is_rtdetr=tr["model"].startswith("rtdetr"),
                                 bbox_alpha=float(tr.get("bbox_alpha", 1.0)),
                                 vfl_beta=float(tr.get("vfl_beta", 0.0)),
-                                log_size_l1=bool(tr.get("log_size_l1", False)))
+                                log_size_l1=bool(tr.get("log_size_l1", False)),
+                                fdr=bool(tr.get("fdr", False)), mal=bool(tr.get("mal", False)),
+                                accel=({"fp32_loss": bool(tr.get("amp_fp32_loss", True)),
+                                        "fused_optimizer": True,
+                                        "require_amp": bool(tr.get("amp", False))}
+                                       if tr.get("spectral_stem") == "s3t" else None))
+    if tr.get("spectral_stem") == "s3t":
+        import torch
+        torch.backends.cudnn.benchmark = True
     # One card or both, decided by what the session actually has rather than by
     # what the metadata asked for: a request for two that lands on one must not
     # take the run down with it. Per-card batch stays at tr["batch"], so each
@@ -3040,7 +3949,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
         hsv_h=tr["hsv_h"], hsv_s=tr["hsv_s"], hsv_v=tr["hsv_v"],
         fliplr=tr["fliplr"], scale=tr["scale"], cos_lr=tr.get("cos_lr", True),
         multi_scale=tr.get("multi_scale", False),
-        warmup_epochs=tr.get("warmup_epochs", 3.0),
+        warmup_epochs=tr.get("warmup_epochs", 3.0), nbs=int(tr.get("nbs") or 64),
         project=str(RUNS), name=tag, exist_ok=True,
         verbose=False, plots=False, val=True, seed=0,
         amp=tr.get("amp", True), deterministic=tr.get("deterministic", True),
@@ -3827,14 +4736,29 @@ def preflight(round_cfg):
             else:
                 note.append(f"resume from {ck}")
     if (cand.get("train") or {}).get("spectral_stem") == "s3t":
-        mae = find_mae_checkpoint()
+        try:
+            mae = find_mae_checkpoint((cand.get("train") or {}).get("s3t_mae_file"))
+        except RuntimeError as exc:
+            bad.append(str(exc))
+            mae = "ambiguous"
         if mae is None and (cand.get("train") or {}).get("s3t_require_pretrain", True):
             bad.append("spectral_stem=s3t but no MAE checkpoint (*_mae.pt) is "
                        "attached. Add the pretraining notebook's output "
-                       "(qwyi123/hod26-s3t-mae-pretrain) as an input. Attached: "
+                       "(zetaoxia/hod26-s3t-mae-pretrain3 for S3T-X) as an input. Attached: "
                        + str([q.name for q in sorted(INPUT.glob('*'))]))
-        elif mae is not None:
-            note.append(f"S3T MAE encoder {mae}")
+        elif mae is not None and mae != "ambiguous":
+            want = (cand.get("train") or {}).get("s3t_arch", "tokens")
+            try:
+                import torch
+                got = (torch.load(mae, map_location="cpu", weights_only=True).get("config")
+                       or {}).get("arch", "tokens")
+            except Exception as exc:                            # noqa: BLE001
+                got = f"unreadable ({exc})"
+            if got != want:
+                bad.append(f"MAE checkpoint {mae} is arch={got!r}; the run asks for "
+                           f"s3t_arch={want!r}")
+            else:
+                note.append(f"S3T MAE encoder {mae} (arch {got})")
     if sub.get("weights_from"):
         if find_weights(sub["weights_from"]) is None:
             bad.append(f"weights_from={sub['weights_from']} not found under "
