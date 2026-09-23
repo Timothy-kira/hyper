@@ -49,7 +49,7 @@ def s3t_candidate(total: int = TOTAL) -> dict:
         # optimizer still steps on an effective batch of 64.
         "train.batch": 2,
     })
-    cand["train"].update(s3t_scale=0.5, s3t_require_pretrain=True, s3t_widen=True,
+    cand["train"].update(s3t_scale=0.5, s3t_require_pretrain=True, s3t_widen=True, s3t_context=True,
                          mosaic=1.0, fliplr=0.5, scale=0.5, close_mosaic=3)
     cand["augment"].update(AUGMENT)
     return cand

@@ -97,6 +97,7 @@ def main() -> int:
 
         from ultralytics.nn.tasks import RTDETRDetectionModel
         net = RTDETRDetectionModel("rtdetr-l.yaml", ch=3, nc=18, verbose=False)
+        orig_net = copy.deepcopy(net).eval()                    # the "pretrained" detector as built
         orig_block = copy.deepcopy(net.model[0]).eval()          # the "pretrained" stem as built
         w_orig = next(x for x in orig_block.modules() if isinstance(x, torch.nn.Conv2d)).weight.detach().clone()
         ok = m.install_spectral_adapter(net, 16, projection=m.LDA_16_TO_3, kind="s3t",
@@ -106,8 +107,10 @@ def main() -> int:
         check("MAE encoder weights loaded",
               all(torch.equal(a, b) for a, b in zip(front.enc.state_dict().values(),
                                                     enc.state_dict().values())))
-        check("side injections wrap P3/P4/P5 input projections",
-              all(type(net.model[i]).__name__ == "Inject" for i in (19, 14, 10)))
+        check("P3/P4 injections read AIFI context, P5 (before AIFI) plain",
+              [type(net.model[i]).__name__ for i in (19, 14, 10, 11)]
+              == ["ContextInject", "ContextInject", "Inject", "Tap"],
+              str([type(net.model[i]).__name__ for i in (19, 14, 10, 11)]))
         keys = list(net.state_dict())
         check("state_dict has no duplicated front keys",
               len(keys) == len(set(keys)) and not any(".front.enc" in k and "model.19" in k for k in keys))
@@ -127,6 +130,12 @@ def main() -> int:
         check("step 0 == pretrained stem on the plain projection (widened, zero-init)",
               torch.allclose(ref, got, atol=1e-5), f"max diff {float((ref - got).abs().max()):.2e}")
         check("detector forward runs on 16-band input", out is not None)
+        with torch.no_grad():
+            want = orig_net(front.base(xb))
+        flat = lambda o: [t for t in (o if isinstance(o, (list, tuple)) else [o]) if torch.is_tensor(t)]
+        same = all(torch.allclose(a, b_, atol=1e-4) for a, b_ in zip(flat(out), flat(want)))
+        check("whole detector at step 0 == pretrained detector on the projection", same)
+        check("AIFI context captured for the injections", net.model[0].front.__dict__.get("_ctx") is not None)
 
         net.train()
         y = net.predict(xb) if False else net(xb)
@@ -140,8 +149,23 @@ def main() -> int:
         check("gradient reaches the side injection", g_inj is not None and g_inj.abs().sum() > 0)
         check("encoder is in the graph (grad after the new channels move)", g_enc is not None)
 
+        # Once the zero-init projection has moved, the context attention and
+        # AIFI itself must be in the graph (spatial -> spectral direction).
+        probe = copy.deepcopy(net)
+        probe.train()
+        with torch.no_grad():
+            probe.model[19].proj.weight.normal_(0, 0.02)
+        yp = probe(xb)
+        sum(t.float().abs().mean() for t in flat(yp)).backward()
+        gq = probe.model[19].q.weight.grad
+        ga = next(p_ for p_ in probe.model[11].layer.parameters()).grad
+        check("gradient reaches the context cross-attention", gq is not None and gq.abs().sum() > 0)
+        check("gradient reaches AIFI through the context path", ga is not None and ga.abs().sum() > 0)
+
         cp = copy.deepcopy(net)                 # ultralytics EMA / checkpoint path
-        check("deepcopy after a forward (EMA, checkpoints)", "_side" not in cp.model[0].front.__dict__)
+        check("deepcopy after a forward (EMA, checkpoints)",
+              "_side" not in cp.model[0].front.__dict__ and "_ctx" not in cp.model[0].front.__dict__)
+        check("the copy's Tap points at the copy's front", cp.model[11].front is cp.model[0].front)
         check("the copy's injections point at the copy's front",
               cp.model[19].front is cp.model[0].front)
         blob = pickle.dumps(cp)

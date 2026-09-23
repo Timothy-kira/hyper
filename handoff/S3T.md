@@ -53,7 +53,7 @@ preflight ok: S3T MAE encoder /kaggle/input/.../pretrain_mae.pt
 preflight passed
   S3T encoder: MAE weights from ... (step N)
   stem widened: first conv now reads 67 channels (3 pretrained + 64 S3T, zero-initialised)
-  S3T front: 0.25M-param spectral Transformer at 0.5x input scale, 3+64 channels into the pretrained HGStem, zero-init side injections at layers [19, 14, 10]
+  S3T front: 0.25M-param spectral Transformer at 0.5x input scale, 3+64 channels into the pretrained HGStem, zero-init side injections at layers [19, 14, 10]; P3/P4 read AIFI's global context (layer 11, 256-d)
   2 GPU(s) visible; DDP across [0, 1], batch 4 (2/card)
 ```
 
@@ -83,7 +83,7 @@ preflight passed
 
 - 输入：官方 X2Cube → log 辐亮度 → 每帧 P2–P98 缩放 → **逐波段亚像素对齐** → 16 通道 uint8。
 - S3T 前端：每个波段 token 带 3 个特征（亮度 level、去亮度后的光谱形状 shape、63px 环形背景的局部对比 contrast），经过 4 层**光谱自注意力**（每个像素内 16 个波段 token 之间做 attention）和 2 次局部空间混合，再对波段做注意力池化。
-- 两条通路接入 DETR：① **stem 加宽**：64 维 S3T 特征上采样到原图分辨率，与 16→3 投影拼成 67 个通道送进 COCO stem；stem 第一层卷积加宽成 67 个输入通道，前 3 个沿用 COCO 权重，新增 64 个初始化为 0，没有 3 通道瓶颈；② 零初始化的侧注入，加到 P3/P4/P5 的输入投影上。
+- 两条通路接入 DETR：① **stem 加宽**：64 维 S3T 特征上采样到原图分辨率，与 16→3 投影拼成 67 个通道送进 COCO stem；stem 第一层卷积加宽成 67 个输入通道，前 3 个沿用 COCO 权重，新增 64 个初始化为 0，没有 3 通道瓶颈；② 零初始化的侧注入，加到 P3/P4/P5 的输入投影上；其中 P3/P4 注入前，先对 AIFI 的全局 token 做一次交叉注意力（空间 → 光谱，双向交换）。
 - 零初始化意味着训练第 0 步时，检测器看到的就是一个普通的 16→3 投影，光谱特征靠梯度逐步接入，不会一上来就把预训练的 DETR 冲乱。
 
 ## 怎么判断它有没有用

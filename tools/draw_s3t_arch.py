@@ -54,8 +54,8 @@ def main() -> None:
                '</defs>')
     out.append(f'<rect width="{W}" height="{H}" fill="#ffffff"/>')
     text(40, 44, "S3T-DETR 模型结构", c="#0f172a", fs=26, anchor="start", weight="700")
-    text(40, 70, "光谱 Transformer（自研，MAE 预训练）＋ COCO 预训练 RT-DETR-L（负责空间）。"
-         "S3M 的光谱 Mamba 在这里换成了 Transformer。", fs=14, anchor="start")
+    text(40, 70, "双流：光谱 Transformer（自研，MAE 预训练）＋ COCO 预训练 RT-DETR-L（空间）。光谱 → 空间在 stem 和 P3/P4/P5 两处融合，"
+         "空间 → 光谱在 P3/P4 读 AIFI 全局上下文。S3M 的光谱 Mamba 换成了 Transformer。", fs=14, anchor="start")
     for i, (k, t) in enumerate([("in", "固定预处理"), ("enc", "S3T 编码器"), ("new", "新加的零初始化层"),
                                 ("det", "COCO 预训练 DETR"), ("mae", "仅预训练用")]):
         f, s = COL[k]
@@ -127,10 +127,14 @@ def main() -> None:
     arrow(270, y3 + 134, 306, y3 + 98, c="#c2410c", m="o")
     box(365, y3 + 16, 215, 140, ["HGStem + HGNetv2", "第一层卷积加宽 3 → 3+64", "（新通道零初始化）", "COCO 预训练 → P3/P4/P5"], "det")
     arrow(344, y3 + 86, 361, y3 + 86)
-    box(620, y3, 245, 172, ["input_proj（第 19/14/10 层）", "P3 /8、P4 /16、P5 /32", "",
-                            "＋ 侧注入 Inject：", "自适应池化 → 1×1 零初始化"], "det")
+    box(620, y3, 245, 172, ["input_proj（第 19/14/10 层）", "P3 /8、P4 /16、P5 /32",
+                            "＋ 侧注入：光谱特征池化到本层", "P3/P4 先对 AIFI 全局 token", "做交叉注意力",
+                            "→ 1×1 零初始化后相加"], "det")
     arrow(580, y3 + 86, 616, y3 + 86)
-    box(905, y3 + 16, 245, 140, ["Hybrid encoder", "AIFI（P5 自注意力）", "CCFM 跨尺度融合"], "det")
+    box(905, y3 + 16, 245, 140, ["Hybrid encoder", "AIFI（P5 全局自注意力）", "CCFM 跨尺度融合"], "det")
+    # spatial -> spectral: AIFI's context goes back to the P3/P4 injections
+    path(f"M 905 {y3 + 132} L 869 {y3 + 132}", c="#15803d")
+    text(872, y3 + 172, "↖ AIFI 全局上下文回送 P3/P4 交叉注意力（空间 → 光谱）", c="#15803d", fs=12, anchor="start")
     arrow(865, y3 + 86, 901, y3 + 86)
     box(1190, y3 + 16, 270, 140, ["Transformer decoder", "300 个 query，去噪训练", "→ 框 ＋ 18 类"], "det")
     arrow(1150, y3 + 86, 1186, y3 + 86)

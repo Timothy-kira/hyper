@@ -2,7 +2,7 @@
 <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker><marker id="o" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#c2410c"/></marker></defs>
 <rect width="1500" height="1110" fill="#ffffff"/>
 <text x="40" y="44" font-size="26" font-weight="700" fill="#0f172a" text-anchor="start">S3T-DETR 模型结构</text>
-<text x="40" y="70" font-size="14" font-weight="400" fill="#475569" text-anchor="start">光谱 Transformer（自研，MAE 预训练）＋ COCO 预训练 RT-DETR-L（负责空间）。S3M 的光谱 Mamba 在这里换成了 Transformer。</text>
+<text x="40" y="70" font-size="14" font-weight="400" fill="#475569" text-anchor="start">双流：光谱 Transformer（自研，MAE 预训练）＋ COCO 预训练 RT-DETR-L（空间）。光谱 → 空间在 stem 和 P3/P4/P5 两处融合，空间 → 光谱在 P3/P4 读 AIFI 全局上下文。S3M 的光谱 Mamba 换成了 Transformer。</text>
 <rect x="1040" y="80" width="16" height="14" rx="3" fill="#f1f5f9" stroke="#64748b"/>
 <text x="1062" y="92" font-size="12" font-weight="400" fill="#475569" text-anchor="start">固定预处理</text>
 <rect x="1190" y="80" width="16" height="14" rx="3" fill="#eff6ff" stroke="#2563eb"/>
@@ -126,16 +126,19 @@
 <text x="472.5" y="785.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">COCO 预训练 → P3/P4/P5</text>
 <line x1="344" y1="754" x2="361" y2="754" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
 <rect x="620" y="668" width="245" height="172" rx="9" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.6"/>
-<text x="742.5" y="722.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">input_proj（第 19/14/10 层）</text>
-<text x="742.5" y="740.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">P3 /8、P4 /16、P5 /32</text>
-<text x="742.5" y="758.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle"></text>
-<text x="742.5" y="776.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">＋ 侧注入 Inject：</text>
-<text x="742.5" y="794.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">自适应池化 → 1×1 零初始化</text>
+<text x="742.5" y="713.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">input_proj（第 19/14/10 层）</text>
+<text x="742.5" y="731.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">P3 /8、P4 /16、P5 /32</text>
+<text x="742.5" y="749.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">＋ 侧注入：光谱特征池化到本层</text>
+<text x="742.5" y="767.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">P3/P4 先对 AIFI 全局 token</text>
+<text x="742.5" y="785.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">做交叉注意力</text>
+<text x="742.5" y="803.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">→ 1×1 零初始化后相加</text>
 <line x1="580" y1="754" x2="616" y2="754" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
 <rect x="905" y="684" width="245" height="140" rx="9" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.6"/>
 <text x="1027.5" y="740.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">Hybrid encoder</text>
-<text x="1027.5" y="758.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">AIFI（P5 自注意力）</text>
+<text x="1027.5" y="758.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">AIFI（P5 全局自注意力）</text>
 <text x="1027.5" y="776.3333333333334" font-size="12" font-weight="400" fill="#334155" text-anchor="middle">CCFM 跨尺度融合</text>
+<path d="M 905 800 L 869 800" fill="none" stroke="#15803d" stroke-width="1.8" marker-end="url(#a)"/>
+<text x="872" y="840" font-size="12" font-weight="400" fill="#15803d" text-anchor="start">↖ AIFI 全局上下文回送 P3/P4 交叉注意力（空间 → 光谱）</text>
 <line x1="865" y1="754" x2="901" y2="754" stroke="#475569" stroke-width="1.8" marker-end="url(#a)"/>
 <rect x="1190" y="684" width="270" height="140" rx="9" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.6"/>
 <text x="1325.0" y="740.3333333333334" font-size="13" font-weight="700" fill="#0f172a" text-anchor="middle">Transformer decoder</text>

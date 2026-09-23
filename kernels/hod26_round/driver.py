@@ -666,7 +666,8 @@ def find_mae_checkpoint():
 
 
 def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5,
-                      inject=(19, 14, 10), dim=64, depth=4, heads=4, widen=True, **_):
+                      inject=(19, 14, 10), dim=64, depth=4, heads=4, widen=True,
+                      context=True, ctx_layer=11, **_):
     """S3T encoder in front of the pretrained first block, plus side injections.
 
     The encoder is loaded from the MAE checkpoint when one is given. inject
@@ -703,16 +704,27 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
         if hasattr(block, attr):
             setattr(wrapper, attr, getattr(block, attr))
     net.model[0] = wrapper
+    ctx_ch = None
+    if context:
+        # AIFI (layer 11 in rtdetr-l) runs before the P4/P3 input projections
+        # (14, 19), so its global context is ready when those injections run.
+        aifi = net.model[ctx_layer]
+        ctx_ch = getattr(getattr(aifi, "ma", None), "embed_dim", 256)
+        net.model[ctx_layer] = Tap(aifi, front).to(dev)
     for i in inject:
         layer = net.model[i]
         out_ch = [m for m in layer.modules() if isinstance(m, torch.nn.Conv2d)][-1].out_channels
-        net.model[i] = Inject(layer, front, out_ch).to(dev)
+        if context and i > ctx_layer:
+            net.model[i] = ContextInject(layer, front, out_ch, ctx_ch=ctx_ch).to(dev)
+        else:
+            net.model[i] = Inject(layer, front, out_ch).to(dev)
     net.__dict__["_hod26_mixer"] = front.base
     net.__dict__["_hod26_mixer_init"] = front.base.weight.detach().clone()
     n_enc = sum(p.numel() for p in enc.parameters())
     log(f"  S3T front: {n_enc / 1e6:.2f}M-param spectral Transformer at {scale}x input "
         f"scale, {'3+' + str(enc.dim) if widen else '16->3'} channels into the pretrained "
-        f"{type(block).__name__}, zero-init side injections at layers {list(inject)}")
+        f"{type(block).__name__}, zero-init side injections at layers {list(inject)}"
+        + (f"; P3/P4 read AIFI's global context (layer {ctx_layer}, {ctx_ch}-d)" if context else ""))
     return True
 
 
@@ -1512,7 +1524,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
             adapter = {"kind": "s3t", "n_bands": tr["in_channels"], "projection": proj,
                        "mae_ckpt": str(mae) if mae else None,
                        "scale": float(tr.get("s3t_scale", 0.5)),
-                       "widen": bool(tr.get("s3t_widen", True))}
+                       "widen": bool(tr.get("s3t_widen", True)),
+                       "context": bool(tr.get("s3t_context", True))}
         elif tr.get("spectral_stem", "adapter") == "adapter":
             adapter = {"n_bands": tr["in_channels"], "projection": proj,
                        "ckpt_name": tr["model"], "srf_k": tr.get("srf_k", 0),

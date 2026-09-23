@@ -1158,7 +1158,11 @@ see. Two paths out of the spectral encoder:
    (widen=False keeps the older form: features mapped to 3 channels by a
    zero-init 1x1 and added to the projection -- a 64 -> 3 bottleneck);
 2. side: the same features pooled to P3/P4/P5 and added, through zero-
-   initialised 1x1 convs, to the hybrid encoder's input projections.
+   initialised 1x1 convs, to the hybrid encoder's input projections. At P3
+   and P4 the pooled spectral features first cross-attend to AIFI's output --
+   the detector's global, COCO-pretrained context -- which is already
+   computed by then (layer 11 runs before 14 and 19). That is the
+   spatial -> spectral direction; the two paths above are spectral -> spatial.
 
 Both new outputs start at zero, so step 0 is the projection alone and the
 pretrained detector sees a sane image; the spectral features are phased in by
@@ -1231,6 +1235,7 @@ class S3TFront(nn.Module):
         # never pickle or deepcopy them into a checkpoint or the EMA.
         state = self.__dict__.copy()
         state.pop("_side", None)
+        state.pop("_ctx", None)
         return state
 
     def _encode(self, x):
@@ -1301,6 +1306,81 @@ class Inject(nn.Module):
             return y
         return y + self.proj(F.adaptive_avg_pool2d(f, y.shape[-2:]).to(y.dtype))
 
+
+
+def sincos_2d(h: int, w: int, dim: int, like: torch.Tensor) -> torch.Tensor:
+    """(h*w, dim) sine-cosine encoding of *normalised* (y, x) in (0, 1).
+
+    Normalised rather than integer positions, so a P3 query and a P5 key at the
+    same place in the image get the same code whatever the grid sizes.
+    """
+    nf = dim // 4
+    ys = (torch.arange(h, device=like.device, dtype=torch.float32) + 0.5) / h
+    xs = (torch.arange(w, device=like.device, dtype=torch.float32) + 0.5) / w
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+    freq = torch.pi * 2.0 ** torch.arange(nf, device=like.device, dtype=torch.float32)
+    ay = gy.reshape(-1, 1) * freq
+    ax = gx.reshape(-1, 1) * freq
+    return torch.cat([ay.sin(), ay.cos(), ax.sin(), ax.cos()], 1).to(like.dtype)
+
+
+class Tap(nn.Module):
+    """Wraps AIFI and leaves its output (the global context) on the front."""
+
+    def __init__(self, layer: nn.Module, front: S3TFront):
+        super().__init__()
+        self.layer = layer
+        self.__dict__["front"] = front
+        for attr in ("i", "f", "type", "np"):
+            if hasattr(layer, attr):
+                setattr(self, attr, getattr(layer, attr))
+
+    def forward(self, x):
+        y = self.layer(x)
+        self.front.__dict__["_ctx"] = y
+        return y
+
+
+class ContextInject(Inject):
+    """Inject, after letting the spectral features read the detector's global context.
+
+    Queries: the spectral features pooled to this level's grid. Keys/values:
+    AIFI's tokens (P5, about 32x16 at imgsz 1024, 256-d). One multi-head
+    cross-attention with normalised 2-D sin-cos positions on both sides, added
+    residually, then the zero-initialised 1x1 projection as in Inject -- so
+    step 0 is still exactly the pretrained detector.
+    """
+
+    def __init__(self, layer: nn.Module, front: S3TFront, out_ch: int, ctx_ch: int = 256,
+                 dk: int = 64, heads: int = 4):
+        super().__init__(layer, front, out_ch)
+        d = front.enc.dim
+        self.heads, self.dk = heads, dk
+        self.nq, self.nk = nn.LayerNorm(d), nn.LayerNorm(ctx_ch)
+        self.q, self.k, self.v = nn.Linear(d, dk), nn.Linear(ctx_ch, dk), nn.Linear(ctx_ch, dk)
+        self.o = nn.Linear(dk, d)
+
+    def forward(self, x):
+        y = self.layer(x)
+        f = self.front.__dict__.get("_side")
+        if f is None:
+            return y
+        h, w = y.shape[-2:]
+        fp = F.adaptive_avg_pool2d(f, (h, w)).to(y.dtype)          # (B, D, h, w)
+        ctx = self.front.__dict__.get("_ctx")
+        if ctx is not None:
+            b, d = fp.shape[:2]
+            tq = fp.flatten(2).transpose(1, 2)                        # (B, N, D)
+            kv = ctx.flatten(2).transpose(1, 2).to(y.dtype)           # (B, M, C)
+            q = self.q(self.nq(tq)) + sincos_2d(h, w, self.dk, tq)
+            k = self.k(self.nk(kv)) + sincos_2d(ctx.shape[-2], ctx.shape[-1], self.dk, kv)
+            v = self.v(self.nk(kv))
+            split = lambda t: t.view(b, t.shape[1], self.heads, self.dk // self.heads).transpose(1, 2)
+            o = F.scaled_dot_product_attention(split(q), split(k), split(v))
+            o = o.transpose(1, 2).reshape(b, -1, self.dk)
+            fp = (tq + self.o(o)).transpose(1, 2).reshape(b, d, h, w)
+        return y + self.proj(fp)
+
 ROUND_CONFIG = json.loads(r'''
 {
   "round": "hod26-s3t-detr",
@@ -1365,7 +1445,8 @@ ROUND_CONFIG = json.loads(r'''
         "deterministic": false,
         "s3t_scale": 0.5,
         "s3t_require_pretrain": true,
-        "s3t_widen": true
+        "s3t_widen": true,
+        "s3t_context": true
       },
       "infer": {
         "conf": 0.001,
@@ -2061,7 +2142,8 @@ def find_mae_checkpoint():
 
 
 def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5,
-                      inject=(19, 14, 10), dim=64, depth=4, heads=4, widen=True, **_):
+                      inject=(19, 14, 10), dim=64, depth=4, heads=4, widen=True,
+                      context=True, ctx_layer=11, **_):
     """S3T encoder in front of the pretrained first block, plus side injections.
 
     The encoder is loaded from the MAE checkpoint when one is given. inject
@@ -2098,16 +2180,27 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
         if hasattr(block, attr):
             setattr(wrapper, attr, getattr(block, attr))
     net.model[0] = wrapper
+    ctx_ch = None
+    if context:
+        # AIFI (layer 11 in rtdetr-l) runs before the P4/P3 input projections
+        # (14, 19), so its global context is ready when those injections run.
+        aifi = net.model[ctx_layer]
+        ctx_ch = getattr(getattr(aifi, "ma", None), "embed_dim", 256)
+        net.model[ctx_layer] = Tap(aifi, front).to(dev)
     for i in inject:
         layer = net.model[i]
         out_ch = [m for m in layer.modules() if isinstance(m, torch.nn.Conv2d)][-1].out_channels
-        net.model[i] = Inject(layer, front, out_ch).to(dev)
+        if context and i > ctx_layer:
+            net.model[i] = ContextInject(layer, front, out_ch, ctx_ch=ctx_ch).to(dev)
+        else:
+            net.model[i] = Inject(layer, front, out_ch).to(dev)
     net.__dict__["_hod26_mixer"] = front.base
     net.__dict__["_hod26_mixer_init"] = front.base.weight.detach().clone()
     n_enc = sum(p.numel() for p in enc.parameters())
     log(f"  S3T front: {n_enc / 1e6:.2f}M-param spectral Transformer at {scale}x input "
         f"scale, {'3+' + str(enc.dim) if widen else '16->3'} channels into the pretrained "
-        f"{type(block).__name__}, zero-init side injections at layers {list(inject)}")
+        f"{type(block).__name__}, zero-init side injections at layers {list(inject)}"
+        + (f"; P3/P4 read AIFI's global context (layer {ctx_layer}, {ctx_ch}-d)" if context else ""))
     return True
 
 
@@ -2907,7 +3000,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
             adapter = {"kind": "s3t", "n_bands": tr["in_channels"], "projection": proj,
                        "mae_ckpt": str(mae) if mae else None,
                        "scale": float(tr.get("s3t_scale", 0.5)),
-                       "widen": bool(tr.get("s3t_widen", True))}
+                       "widen": bool(tr.get("s3t_widen", True)),
+                       "context": bool(tr.get("s3t_context", True))}
         elif tr.get("spectral_stem", "adapter") == "adapter":
             adapter = {"n_bands": tr["in_channels"], "projection": proj,
                        "ckpt_name": tr["model"], "srf_k": tr.get("srf_k", 0),
