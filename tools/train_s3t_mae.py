@@ -207,22 +207,39 @@ def main():
     if cuda:
         # Largest per-GPU batch that fits, halving from --batch on OOM, agreed
         # across ranks. A wrong guess used to kill the whole session at step 1.
+        # Probe through torch.compile when it is on: the compiled graph fuses
+        # the elementwise chains and needed a quarter of eager's memory in the
+        # smoke run (3.6 GB vs 13.8 GB at 8 crops), so an eager probe would
+        # shrink the batch for nothing.
+        probe = model
+        if args.compile:
+            try:
+                probe = torch.compile(model)
+            except Exception as e:                               # noqa: BLE001
+                log(f"memory probe: compile unavailable, probing eager ({e})")
         bs = args.batch
         while True:
             try:
                 torch.cuda.reset_peak_memory_stats(device)
                 xp = torch.randn(bs, 3, 16, args.crop, args.crop, device=device)
                 with torch.autocast("cuda", dtype=amp_dtype):
-                    lp, *_ = model(xp)
+                    lp, *_ = probe(xp)
                 lp.backward()
                 peak = torch.cuda.max_memory_allocated(device) / 2**30
                 fits = peak < 0.75 * torch.cuda.get_device_properties(device).total_memory / 2**30
             except torch.OutOfMemoryError:
                 fits, peak = False, float("nan")
+            except Exception as e:                               # noqa: BLE001
+                if probe is model:
+                    raise
+                log(f"memory probe: compiled probe failed ({type(e).__name__}), probing eager")
+                probe = model
+                continue
             model.zero_grad(set_to_none=True)
             xp = lp = None
             torch.cuda.empty_cache()
-            log(f"memory probe: {bs} crops/GPU -> peak {peak:.2f} GB {'fits' if fits else 'too big'}")
+            log(f"memory probe ({'compiled' if probe is not model else 'eager'}): {bs} crops/GPU "
+                f"-> peak {peak:.2f} GB {'fits' if fits else 'too big'}")
             if fits or bs <= args.crops_per_frame:
                 break
             bs //= 2
@@ -238,6 +255,7 @@ def main():
                 drop_last=True, prefetch_factor=4 if args.workers > 0 else None)
             log(f"batch reduced to {frames_per_step * args.crops_per_frame} crops/GPU/step")
         report["batch_per_gpu"] = frames_per_step * args.crops_per_frame
+        probe = None
         torch.cuda.reset_peak_memory_stats(device)
 
     net = model
