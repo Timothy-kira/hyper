@@ -311,9 +311,13 @@ def main():
     log("channels_last: on (conv weights)")
     n_par = sum(p.numel() for p in model.parameters())
     n_enc = sum(p.numel() for p in enc.parameters())
-    log(f"model: encoder {n_enc / 1e6:.2f}M params, MAE total {n_par / 1e6:.2f}M; "
-        f"mask 0.75 spatial (units of 4x4 tokens) + 0.15 contiguous bands; "
-        f"encoder computes visible positions only (25% of tokens)")
+    if args.mae_version == 2:
+        mask_desc = (f"v2: 2x2-token units, ratio {args.ratio_start} -> {args.ratio_end} over the first "
+                     f"{args.curriculum:.0%}, 1-4 bands (contiguous 70%), global-attention decoder")
+    else:
+        mask_desc = "v1: mask 0.75 spatial (units of 4x4 tokens) + 0.15 contiguous bands"
+    log(f"model: encoder {n_enc / 1e6:.2f}M params, MAE total {n_par / 1e6:.2f}M; {mask_desc}; "
+        f"encoder computes visible positions only")
     enc_ids = {id(p) for p in enc.parameters()}
     groups = [{"params": [p for p in model.parameters() if id(p) in enc_ids], "name": "encoder"},
               {"params": [p for p in model.parameters() if id(p) not in enc_ids], "name": "decoder"}]
