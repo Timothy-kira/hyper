@@ -1,0 +1,131 @@
+"""The whole S3T-X detection session on CPU, on a miniature dataset.
+
+run_submission end to end, the way the Kaggle kernel runs it: render the
+16-band frames with augmentation, build RT-DETR-L with the S3T-X front (MAE v3
+checkpoint mounted under INPUT), D-FINE's distribution refinement and MAL,
+train one epoch through ultralytics' trainer (EMA, validation, checkpoint
+saving), keep best.pt and last.pt in the output, reload best.pt and write a
+submission. Every stage that only ran on a GPU before now runs here first.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
+sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(REPO / "tests"))
+
+from test_datapath import load_kernel  # noqa: E402
+
+
+def synth_dataset(dest: Path, n_train: int = 12, n_test: int = 3, h: int = 241, w: int = 493) -> Path:
+    """Band-planar frames with a few spectrally distinct boxes, and their VOC XML."""
+    import numpy as np
+    from PIL import Image
+
+    from hod26.cube import to_planar
+    from hod26.voc import CLASSES
+
+    rng = np.random.default_rng(0)
+    for split, n in (("train", n_train), ("test", n_test)):
+        (dest / split / "images").mkdir(parents=True, exist_ok=True)
+        if split == "train":
+            (dest / split / "annotations").mkdir(parents=True, exist_ok=True)
+        for i in range(n):
+            pid = (1000 if split == "train" else 2000) + i
+            cube = rng.integers(300, 900, (h, w, 16)).astype(np.uint16)
+            objs = []
+            for _ in range(int(rng.integers(2, 5))):
+                bw, bh = int(rng.integers(12, 60)), int(rng.integers(12, 60))
+                x1, y1 = int(rng.integers(0, w - bw)), int(rng.integers(0, h - bh))
+                c = int(rng.integers(0, len(CLASSES)))
+                cube[y1:y1 + bh, x1:x1 + bw] = (rng.integers(1500, 3500, 16) * (1 + c / 18)).astype(np.uint16)
+                objs.append((CLASSES[c], x1, y1, x1 + bw, y1 + bh))
+            Image.fromarray(to_planar(cube)).save(dest / split / "images" / f"{pid}.png", compress_level=1)
+            if split == "train":
+                body = "".join(
+                    f"<object><name>{nm}</name><difficult>0</difficult><bndbox><xmin>{a}</xmin>"
+                    f"<ymin>{b}</ymin><xmax>{c_}</xmax><ymax>{d}</ymax></bndbox></object>"
+                    for nm, a, b, c_, d in objs)
+                (dest / split / "annotations" / f"{pid}.xml").write_text(
+                    f"<annotation><filename>{pid}.png</filename><size><width>{w}</width>"
+                    f"<height>{h}</height><depth>16</depth></size>{body}</annotation>")
+    return dest
+
+
+def main() -> int:
+    import torch
+
+    from hod26.s3t.xca import XCAEncoder
+    from tools.s3t_round import s3t_candidate
+
+    fails = []
+
+    def check(name, ok, detail=""):
+        print(("ok   " if ok else "FAIL ") + name + (f"  ({detail})" if detail and not ok else ""))
+        if not ok:
+            fails.append(name)
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        data = synth_dataset(tmp / "input" / "hod26-planar")
+        k = load_kernel(tmp / "work", data)
+        k.INPUT = tmp / "input"
+        mae_dir = k.INPUT / "hod26-s3t-mae-pretrain3" / "s3t_mae"
+        mae_dir.mkdir(parents=True)
+        enc = XCAEncoder()
+        torch.save({"encoder": enc.state_dict(), "config": enc.config(), "step": 1},
+                   mae_dir / "pretrain3_mae.pt")
+
+        cand = s3t_candidate(total=1, batch=2, mae_file="pretrain3_mae.pt", arch="xca")
+        tr = cand["train"]
+        # CPU: no AMP, no compile; everything else as the real run.
+        # nbs = batch: an optimizer step every batch. At the real nbs of 64 a
+        # run this short makes one step, at warmup step 0 where every lr is 0.
+        tr.update(epochs=2, imgsz=128, amp=False, s3t_compile=False, workers=0, nbs=2)
+        round_cfg = {"round": "e2e", "candidates": [], "submit": {
+            "candidate": cand, "use_all_train": False, "predict": True, "session_hours": 1.0}}
+        k.run_submission(round_cfg)
+
+        work = k.WORK
+        check("submission.csv written", (work / "submission.csv").exists())
+        res = json.loads((work / "results.json").read_text())
+        check("results.json says predicted", res.get("predicted") is True, str(res)[:200])
+        check("final_last.pt kept in the output", (work / "final_last.pt").exists())
+        check("final_best.pt kept in the output", (work / "final_best.pt").exists())
+        ck = torch.load(work / "final_best.pt", map_location="cpu", weights_only=False)
+        net = ck.get("ema") or ck.get("model")
+        dec = net.model[-1].decoder
+        front = net.model[0].front
+        check("best.pt carries the S3T-X front", type(front).__name__ == "S3TXFront",
+              type(front).__name__)
+        check("best.pt carries the D-FINE decoder", type(dec).__name__ == "FDRDecoder",
+              type(dec).__name__)
+        moved = float(front.fuse.weight.abs().sum())
+        check("the zero-initialised stem fusion trained", moved > 0, f"{moved}")
+        fdr_moved = float(sum(m.layers[-1].weight.abs().sum() for m in dec.fdr))
+        check("the zero-initialised distribution heads trained", fdr_moved > 0, f"{fdr_moved}")
+        inj = float(net.model[19].proj.weight.abs().sum())
+        check("the zero-initialised P3 injection trained", inj > 0, f"{inj}")
+        enc_w = torch.load(k.INPUT / "hod26-s3t-mae-pretrain3" / "s3t_mae" / "pretrain3_mae.pt",
+                           weights_only=True)["encoder"]["blocks.0.attn.qkv.weight"]
+        d_enc = float((front.enc.blocks[0].attn.qkv.weight.float() - enc_w).abs().max())
+        check("the MAE encoder is fine-tuned, not frozen", d_enc > 0, f"{d_enc}")
+        opt = torch.load(work / "final_last.pt", map_location="cpu", weights_only=False)["optimizer"]
+        check("the optimizer is really fused (every group)",
+              all(g.get("fused") is True for g in opt["param_groups"]),
+              str([g.get("fused") for g in opt["param_groups"]]))
+        lines = [ln for ln in (work / "final_metrics.jsonl").read_text().splitlines() if ln.strip()]
+        check("per-epoch metrics logged", len(lines) >= 1)
+
+    print(f"\n{len(fails)} failure(s)" if fails else "\nS3T-X end-to-end session passed")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

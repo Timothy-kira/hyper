@@ -553,6 +553,9 @@ try:
     from ultralytics.models.utils.loss import RTDETRDetectionLoss as _RTDETRLoss
     from ultralytics.utils.loss import VarifocalLoss as _VFL
     from ultralytics.utils.metrics import bbox_iou as _bbox_iou
+    from ultralytics.nn.modules.transformer import MLP as _MLP
+    from ultralytics.nn.modules.transformer import DeformableTransformerDecoder as _DTD
+    from ultralytics.nn.modules.utils import inverse_sigmoid as _inv_sig
 except ImportError:                                  # pragma: no cover
     _RTDETRLoss = None
 
@@ -573,10 +576,17 @@ if _RTDETRLoss is not None:
         """
 
         beta: float = 0.0
+        # MAL (DEIM, CVPR 2025) is beta=1 with the target raised to a power:
+        # every matched query gets full weight, and its target is IoU^1.5, so a
+        # low-IoU match is taught a low score instead of being down-weighted
+        # out of the loss.
+        target_pow: float = 1.0
 
         def forward(self, pred_score, gt_score, label):
             if not self.beta:
                 return super().forward(pred_score, gt_score, label)
+            if self.target_pow != 1.0:
+                gt_score = gt_score.clamp_min(0).pow(self.target_pow)
             pos = gt_score + self.beta * (1.0 - gt_score)
             weight = (self.alpha * pred_score.sigmoid().pow(self.gamma) * (1 - label)
                       + pos * label)
@@ -620,6 +630,45 @@ if _RTDETRLoss is not None:
         alpha_iou: float = 1.0
         log_size: bool = False
         EPS = 1e-4
+        # D-FINE (ICLR 2025) on top of the decoder (FDRDecoder): FGL trains
+        # each layer's edge distributions on the matched boxes, DDF distils
+        # the last layer's box into the earlier layers' distributions (GO-LSD).
+        # Gains are D-FINE's.
+        fdr: bool = False
+        fgl_gain: float = 0.15
+        ddf_gain: float = 1.5
+
+        def __getstate__(self):
+            state = self.__dict__.copy()
+            state.pop("_fdr_calls", None)
+            return state
+
+        def _get_loss(self, pred_bboxes, pred_scores, gt_bboxes, gt_cls, gt_groups, masks=None,
+                      gt_mask=None, postfix="", match_indices=None):
+            # Same matching, recorded, so the distribution losses reuse it.
+            if match_indices is None:
+                match_indices = self.matcher(pred_bboxes, pred_scores, gt_bboxes, gt_cls, gt_groups,
+                                             masks=masks, gt_mask=gt_mask)
+            calls = self.__dict__.get("_fdr_calls")
+            if calls is not None:
+                calls.append((match_indices, pred_bboxes, pred_scores))
+            return super()._get_loss(pred_bboxes, pred_scores, gt_bboxes, gt_cls, gt_groups,
+                                     masks=masks, gt_mask=gt_mask, postfix=postfix,
+                                     match_indices=match_indices)
+
+        def forward(self, preds, batch, dn_bboxes=None, dn_scores=None, dn_meta=None):
+            dec = self.__dict__.get("_fdr_decoder")
+            stash = dec.__dict__.get("_fdr") if (self.fdr and dec is not None) else None
+            if stash is None:
+                return super().forward(preds, batch, dn_bboxes, dn_scores, dn_meta)
+            dec.__dict__["_fdr"] = None                     # one loss per forward
+            self.__dict__["_fdr_calls"] = calls = []
+            try:
+                loss = super().forward(preds, batch, dn_bboxes, dn_scores, dn_meta)
+            finally:
+                self.__dict__.pop("_fdr_calls", None)
+            loss.update(fdr_losses(self, dec, stash, calls, batch, dn_meta))
+            return loss
 
         def _l1(self, pred_bboxes, gt_bboxes):
             if not self.log_size:
@@ -653,8 +702,176 @@ if _RTDETRLoss is not None:
                 name_giou: (self.loss_gain["giou"] * overlap.sum() / n).squeeze(),
             }
 
+    def fdr_weighting(reg_max=32, up=0.5, reg_scale=4.0):
+        """D-FINE's W(n): reg_max + 1 edge offsets, dense near 0, +-2*up*reg_scale at the ends."""
+        ub1 = abs(up) * abs(reg_scale)
+        step = (ub1 + 1) ** (2 / (reg_max - 2))
+        left = [-(step ** i) + 1 for i in range(reg_max // 2 - 1, 0, -1)]
+        right = [step ** i - 1 for i in range(1, reg_max // 2)]
+        return _torch.tensor([-2 * ub1] + left + [0.0] + right + [2 * ub1], dtype=_torch.float32)
+
+    def fdr_apply(box, corners, project, reg_scale):
+        """cxcywh box, corner logits (..., 4 * (R + 1)) -> the box with its edges moved.
+
+        Each edge moves by the expectation of W under its distribution, in units
+        of the box's side / reg_scale (D-FINE's distance2bbox). Uniform logits
+        give an expectation of 0 (W is odd), so zero-initialised heads leave the
+        box exactly where the pretrained head put it.
+        """
+        p = project.float()
+        d = (corners.float().unflatten(-1, (4, p.numel())).softmax(-1) * p).sum(-1)
+        cx, cy, w, h = box.float().unbind(-1)
+        half = 0.5 * reg_scale
+        x1 = cx - (half + d[..., 0]) * w / reg_scale
+        y1 = cy - (half + d[..., 1]) * h / reg_scale
+        x2 = cx + (half + d[..., 2]) * w / reg_scale
+        y2 = cy + (half + d[..., 3]) * h / reg_scale
+        c = _torch.stack([(x1 + x2) / 2, (y1 + y2) / 2], -1).clamp(0.0, 1.0)
+        wh = _torch.stack([x2 - x1, y2 - y1], -1).clamp(1e-4, 1.0)
+        return _torch.cat([c, wh], -1).to(box.dtype)
+
+    def fdr_targets(ref, gt, project, reg_scale):
+        """Where gt's edges sit relative to ref, as two adjacent bins of W and their weights.
+
+        D-FINE's bbox2distance + translate_gt: an edge offset between W[k] and
+        W[k+1] is split linearly between them, so the expectation reproduces it
+        exactly; beyond either end it goes wholly to the end bin.
+        """
+        p = project.float()
+        rmax = p.numel() - 1
+        ref, gt = ref.float(), gt.float()
+        sw = ref[..., 2] / reg_scale + 1e-16
+        sh = ref[..., 3] / reg_scale + 1e-16
+        g1, g2 = gt[..., :2] - gt[..., 2:] / 2, gt[..., :2] + gt[..., 2:] / 2
+        d = _torch.stack([(ref[..., 0] - g1[..., 0]) / sw, (ref[..., 1] - g1[..., 1]) / sh,
+                          (g2[..., 0] - ref[..., 0]) / sw, (g2[..., 1] - ref[..., 1]) / sh],
+                         -1).reshape(-1) - 0.5 * reg_scale
+        k = (p[None, :] <= d[:, None]).sum(1) - 1
+        lo = k.clamp(0, rmax - 1)
+        wr = ((d - p[lo]) / (p[lo + 1] - p[lo])).clamp(0.0, 1.0)
+        wr = _torch.where(k < 0, _torch.zeros_like(wr), wr)
+        wr = _torch.where(k >= rmax, _torch.ones_like(wr), wr)
+        return lo, 1.0 - wr, wr
+
+    def _two_bin_kl(logits, lo, wl, wr):
+        """KL(two-bin target || softmax(logits)) per edge; its gradient is D-FINE's FGL/DDF's."""
+        lp = logits.float().log_softmax(-1)
+        ce = -(lp.gather(1, lo[:, None])[:, 0] * wl + lp.gather(1, (lo + 1)[:, None])[:, 0] * wr)
+        ent = -(wl * wl.clamp_min(1e-12).log() + wr * wr.clamp_min(1e-12).log())
+        return ce - ent
+
+    def fdr_losses(crit, dec, stash, calls, batch, dn_meta):
+        """FGL on every decoder layer's matched boxes; DDF from the last layer to the rest.
+
+        calls are the loss's own matchings, in DETRLoss's order: the main
+        queries' last layer, then its aux layers (encoder, decoder 0..L-2), then
+        the same for the denoising queries (no encoder layer there).
+        """
+        proj, rs = dec.fdr_project.float(), float(dec.fdr_reg_scale)
+        corners, refs = stash["corners"].float(), stash["refs"].float()
+        L, R1 = corners.shape[0], proj.numel()
+        if dn_meta is not None:
+            dn_c, mc = corners.split(dn_meta["dn_num_split"], dim=2)
+            dn_r, mr = refs.split(dn_meta["dn_num_split"], dim=2)
+            parts = [(mc, mr, [L - 1, None] + list(range(L - 1))),
+                     (dn_c, dn_r, [L - 1] + list(range(L - 1)))]
+        else:
+            parts = [(corners, refs, [L - 1, None] + list(range(L - 1)))]
+        if sum(len(pl) for _, _, pl in parts) != len(calls):
+            raise RuntimeError(f"FDR loss: {len(calls)} matchings for layers "
+                               f"{[pl for _, _, pl in parts]} -- DETRLoss changed its call order")
+        gt = batch["bboxes"].float()
+        fgl = ddf = corners.sum() * 0.0
+        k = 0
+        for C, Rf, plan in parts:
+            t_idx, t_box, t_score = calls[k]                     # this part's last layer: the teacher
+            t_box = t_box.detach().float()
+            t_conf = t_score.detach().float().sigmoid().max(-1).values
+            b = t_box.shape[0]
+            for layer in plan:
+                mi, pb, _ = calls[k]
+                k += 1
+                if layer is None:
+                    continue
+                idx, gt_idx = crit._get_index(mi)
+                if len(gt_idx):
+                    lo, wl, wr = fdr_targets(Rf[layer][idx], gt[gt_idx], proj, rs)
+                    iou = _bbox_iou(pb[idx].detach().float(), gt[gt_idx], xywh=True).view(-1).clamp_min(0)
+                    fgl = fgl + (_two_bin_kl(C[layer][idx].reshape(-1, R1), lo, wl, wr)
+                                 * iou.repeat_interleave(4)).sum() / len(gt_idx)
+                if crit.ddf_gain and layer < L - 1:
+                    lo, wl, wr = fdr_targets(Rf[layer].reshape(-1, 4), t_box.reshape(-1, 4), proj, rs)
+                    kl = _two_bin_kl(C[layer].reshape(-1, R1), lo, wl, wr)
+                    wt = t_conf.clone()
+                    pos = _torch.zeros_like(wt, dtype=_torch.bool)
+                    tidx, tgt_idx = crit._get_index(t_idx)
+                    if len(tgt_idx):
+                        pos[tidx] = True
+                        wt[tidx] = _bbox_iou(t_box[tidx], gt[tgt_idx], xywh=True).view(-1).clamp_min(0)
+                    wt, pos = wt.reshape(-1).repeat_interleave(4), pos.reshape(-1).repeat_interleave(4)
+                    kl = kl * wt
+                    scale = 8.0 / b                               # D-FINE: independent of batch per GPU
+                    n_pos, n_neg = (pos.sum() * scale) ** 0.5, ((~pos).sum() * scale) ** 0.5
+                    l_pos = kl[pos].mean() if pos.any() else kl.sum() * 0.0
+                    l_neg = kl[~pos].mean() if (~pos).any() else kl.sum() * 0.0
+                    ddf = ddf + (l_pos * n_pos + l_neg * n_neg) / (n_pos + n_neg).clamp_min(1e-6)
+        return {"loss_fgl": crit.fgl_gain * fgl, "loss_ddf": crit.ddf_gain * ddf}
+
+    class FDRDecoder(_DTD):
+        """RT-DETR's pretrained decoder with D-FINE's distribution refinement added.
+
+        D-FINE replaces the box head: each layer predicts, per edge, a
+        distribution over reg_max + 1 offsets and the box is its expectation.
+        Replacing it here would throw away the COCO-pretrained box heads, so
+        the distributions are added *on top*: layer i's box is the pretrained
+        head's box with each edge moved by the expectation of its distribution
+        (fdr_apply), and the heads producing the logits start at zero -- a
+        uniform distribution, an offset of exactly 0, the pretrained decoder at
+        step 0. The refined box is also the next layer's reference.
+
+        Swapped in by class (install_fdr), like SDPAMultiheadAttention: the
+        layers, heads and weights are the pretrained ones.
+        """
+
+        def __getstate__(self):
+            state = self.__dict__.copy()
+            state.pop("_fdr", None)
+            return state
+
+        def forward(self, embed, refer_bbox, feats, shapes, bbox_head, score_head, pos_mlp,
+                    attn_mask=None, padding_mask=None):
+            output = embed
+            boxes, logits, corners, refs = [], [], [], []
+            last = None
+            proj, rs = self.fdr_project, self.fdr_reg_scale
+            refer_bbox = refer_bbox.sigmoid()
+            for i, layer in enumerate(self.layers):
+                output = layer(output, refer_bbox, feats, shapes, padding_mask, attn_mask,
+                               pos_mlp(refer_bbox))
+                delta = bbox_head[i](output)
+                c = self.fdr[i](output)
+                refined = fdr_apply(_torch.sigmoid(delta + _inv_sig(refer_bbox)), c, proj, rs)
+                if self.training:
+                    logits.append(score_head[i](output))
+                    # ultralytics' look-forward-twice: from layer 1 on, the box
+                    # the loss sees is built on the previous layer's undetached box.
+                    coarse = (_torch.sigmoid(delta + _inv_sig(refer_bbox)) if i == 0
+                              else _torch.sigmoid(delta + _inv_sig(last)))
+                    boxes.append(refined if i == 0 else fdr_apply(coarse, c, proj, rs))
+                    corners.append(c)
+                    refs.append(coarse.detach())
+                elif i == self.eval_idx:
+                    logits.append(score_head[i](output))
+                    boxes.append(refined)
+                    break
+                last = refined
+                refer_bbox = refined.detach() if self.training else refined
+            self.__dict__["_fdr"] = ({"corners": _torch.stack(corners), "refs": _torch.stack(refs)}
+                                     if self.training else None)
+            return _torch.stack(boxes), _torch.stack(logits)
+
 else:                                                # pragma: no cover
-    IoUKindDETRLoss = IoUKindVFL = None
+    IoUKindDETRLoss = IoUKindVFL = FDRDecoder = None
 
 if SpectralFront is not None:
     # The trained model is pickled into every checkpoint, and pickle stores the
@@ -669,7 +886,7 @@ if SpectralFront is not None:
     _mod.SpectralFront = SpectralFront
     SpectralFront.__module__ = "hod26_kernel"
     if IoUKindDETRLoss is not None:
-        for _c in (IoUKindDETRLoss, IoUKindVFL):
+        for _c in (IoUKindDETRLoss, IoUKindVFL, FDRDecoder):
             setattr(_mod, _c.__name__, _c)
             _c.__module__ = "hod26_kernel"
 
@@ -1038,9 +1255,33 @@ IOU_KINDS = {"GIoU": {"GIoU": True}, "DIoU": {"DIoU": True},
              "CIoU": {"CIoU": True}, "IoU": {}}
 
 
+def install_fdr(net, reg_max: int = 32, reg_scale: float = 4.0, up: float = 0.5):
+    """D-FINE's distribution refinement on RT-DETR's decoder (see FDRDecoder).
+
+    One zero-initialised 3-layer MLP per decoder layer, hidden -> 4 x (reg_max
+    + 1) edge logits, as D-FINE initialises its heads. Returns the decoder.
+    """
+    import torch
+    head = net.model[-1]
+    dec = head.decoder
+    if isinstance(dec, FDRDecoder):
+        return dec
+    hd = int(getattr(head, "hidden_dim", 256))
+    dev = next(dec.parameters()).device
+    heads = torch.nn.ModuleList(_MLP(hd, hd, 4 * (reg_max + 1), 3) for _ in range(len(dec.layers)))
+    for m in heads:
+        torch.nn.init.zeros_(m.layers[-1].weight)
+        torch.nn.init.zeros_(m.layers[-1].bias)
+    dec.__class__ = FDRDecoder
+    dec.fdr = heads.to(dev)
+    dec.register_buffer("fdr_project", fdr_weighting(reg_max, up, reg_scale).to(dev), persistent=False)
+    dec.fdr_reg_scale = float(reg_scale)
+    return dec
+
+
 def install_bbox_loss(net, nc: int, kind: str = "GIoU", alpha: float = 1.0,
                       beta: float = 0.0, log_size: bool = False,
-                      loss_gain: dict | None = None):
+                      loss_gain: dict | None = None, fdr: bool = False, mal: bool = False):
     """Condition RT-DETR's box and class losses on how good each match is.
 
     Every default reproduces the stock loss exactly, which is what makes an A/B
@@ -1054,16 +1295,27 @@ def install_bbox_loss(net, nc: int, kind: str = "GIoU", alpha: float = 1.0,
     crit.iou_flag = IOU_KINDS[kind]
     crit.alpha_iou = float(alpha)
     crit.log_size = bool(log_size)
-    if beta:
+    if mal:
+        # MAL: every matched query at full weight, target IoU^1.5 (DEIM's
+        # gamma); negatives keep RT-DETR's alpha * p^gamma focal weight.
+        vfl = IoUKindVFL(gamma=crit.vfl.gamma, alpha=crit.vfl.alpha)
+        vfl.beta, vfl.target_pow = 1.0, 1.5
+        crit.vfl = vfl
+    elif beta:
         vfl = IoUKindVFL()
         vfl.beta = float(beta)
         crit.vfl = vfl
+    if fdr:
+        crit.fdr = True
+        crit.__dict__["_fdr_decoder"] = install_fdr(net)
     if loss_gain:
         crit.loss_gain.update(loss_gain)
     net.criterion = crit
     log(f"  box loss: {kind}"
         + (f", alpha={alpha}" if alpha != 1.0 else "")
-        + (f", vfl_beta={beta}" if beta else "")
+        + (", MAL (target IoU^1.5, positives at full weight)" if mal else "")
+        + (f", vfl_beta={beta}" if beta and not mal else "")
+        + (", D-FINE FDR (+FGL 0.15, GO-LSD/DDF 1.5) on the pretrained decoder" if fdr else "")
         + (", log-space wh" if log_size else "")
         + (f", gains {loss_gain}" if loss_gain else ""))
     return True
@@ -1096,7 +1348,7 @@ def restore_state(net, src):
 def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                   bbox_loss="GIoU", loss_gain=None, is_rtdetr=True,
                   bbox_alpha=1.0, vfl_beta=0.0, log_size_l1=False,
-                  reset_best_fitness=True, accel=None):
+                  reset_best_fitness=True, accel=None, fdr=False, mal=False):
     """A trainer that seeds the head from COCO by name and installs the adapter.
 
     Both have to happen inside get_model, and for the same reason: ultralytics
@@ -1126,7 +1378,14 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
             cls = type(opt)
             # Rebuilt from the same groups (each carries its own lr, momentum /
             # betas and weight decay), with the fused CUDA kernel. No fallback.
+            # The flag has to go on each group: the groups already carry
+            # fused=None from the first build, and a group's own value wins
+            # over the constructor's default -- passing fused=True alone
+            # silently kept the foreach kernels.
+            for g in opt.param_groups:
+                g["fused"], g["foreach"] = True, None
             fused = cls(opt.param_groups, lr=opt.defaults["lr"], fused=True)
+            is_fused = all(g.get("fused") is True for g in fused.param_groups)
             done = getattr(self, "_hod26_accel", {}) or {}
             table = [
                 ("AMP fp16 (+GradScaler)", bool(getattr(self, "amp", False)),
@@ -1134,7 +1393,7 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                 ("loss + Hungarian matching in fp32", bool(done.get("fp32_loss")), ""),
                 ("RT-DETR attention via SDPA", done.get("mha_to_sdpa", 0) > 0,
                  f"{done.get('mha_to_sdpa', 0)} nn.MultiheadAttention swapped"),
-                (f"fused {cls.__name__}", True, ""),
+                (f"fused {cls.__name__}", is_fused, "" if is_fused else "a group is not fused"),
                 ("cudnn.benchmark", bool(torch.backends.cudnn.benchmark), ""),
                 ("FlashAttention / TF32 / bf16", False, "not supported on T4 (sm75)"),
             ]
@@ -1142,6 +1401,8 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                 log("  acceleration table:")
                 for name, on, why in table:
                     log(f"    {'ON ' if on else 'off'}  {name}" + (f"  ({why})" if why else ""))
+            if not is_fused:
+                raise RuntimeError("fused optimizer requested but a parameter group is not fused")
             if accel.get("require_amp") and not getattr(self, "amp", False):
                 raise RuntimeError("AMP was requested but ultralytics turned it off "
                                    "(check_amp failed); stopping instead of training in fp32")
@@ -1238,9 +1499,9 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
             # RTDETRDetectionLoss only: the YOLO head computes its box loss
             # somewhere else entirely, so this override would silently miss.
             if is_rtdetr and any((bbox_loss not in ("", "GIoU"), loss_gain,
-                                  bbox_alpha != 1.0, vfl_beta, log_size_l1)):
+                                  bbox_alpha != 1.0, vfl_beta, log_size_l1, fdr, mal)):
                 install_bbox_loss(net, self.data["nc"], bbox_loss or "GIoU",
-                                  bbox_alpha, vfl_beta, log_size_l1, loss_gain)
+                                  bbox_alpha, vfl_beta, log_size_l1, loss_gain, fdr=fdr, mal=mal)
             if adapter:
                 install_spectral_adapter(net, **adapter)
             if accel:
@@ -1520,6 +1781,12 @@ def snapshot_for_resume(tag, run):
                      (run / "results.csv", WORK / f"{tag}_results.csv")):
         if src.exists():
             shutil.copy2(src, dst)
+    # best.pt too, whenever an epoch rewrote it: the runs directory is scratch
+    # and is not saved, so a session that ends in an exception would otherwise
+    # keep last.pt and lose the best weights it had already found.
+    best, kept = run / "weights" / "best.pt", WORK / f"{tag}_best.pt"
+    if best.exists() and (not kept.exists() or best.stat().st_mtime > kept.stat().st_mtime):
+        shutil.copy2(best, kept)
 
 
 def keep_for_resume(tag):
@@ -1705,7 +1972,9 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                        "ckpt_chunks": int(tr.get("s3t_ckpt_chunks", 8)),
                        "compile_blocks": bool(tr.get("s3t_compile", False)),
                        "fast_kernels": bool(tr.get("s3t_fast_kernels", False)),
-                       "train_encoder": bool(tr.get("s3t_train_encoder", True))}
+                       "train_encoder": bool(tr.get("s3t_train_encoder", True)),
+                       "arch": tr.get("s3t_arch", "tokens"),
+                       "grad_ckpt": bool(tr.get("s3t_grad_ckpt", True))}
         elif tr.get("spectral_stem", "adapter") == "adapter":
             adapter = {"n_bands": tr["in_channels"], "projection": proj,
                        "ckpt_name": tr["model"], "srf_k": tr.get("srf_k", 0),
@@ -1721,6 +1990,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                                 bbox_alpha=float(tr.get("bbox_alpha", 1.0)),
                                 vfl_beta=float(tr.get("vfl_beta", 0.0)),
                                 log_size_l1=bool(tr.get("log_size_l1", False)),
+                                fdr=bool(tr.get("fdr", False)), mal=bool(tr.get("mal", False)),
                                 accel=({"fp32_loss": bool(tr.get("amp_fp32_loss", True)),
                                         "fused_optimizer": True,
                                         "require_amp": bool(tr.get("amp", False))}
@@ -1751,7 +2021,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
         hsv_h=tr["hsv_h"], hsv_s=tr["hsv_s"], hsv_v=tr["hsv_v"],
         fliplr=tr["fliplr"], scale=tr["scale"], cos_lr=tr.get("cos_lr", True),
         multi_scale=tr.get("multi_scale", False),
-        warmup_epochs=tr.get("warmup_epochs", 3.0),
+        warmup_epochs=tr.get("warmup_epochs", 3.0), nbs=int(tr.get("nbs", 64)),
         project=str(RUNS), name=tag, exist_ok=True,
         verbose=False, plots=False, val=True, seed=0,
         amp=tr.get("amp", True), deterministic=tr.get("deterministic", True),
@@ -2546,10 +2816,21 @@ def preflight(round_cfg):
         if mae is None and (cand.get("train") or {}).get("s3t_require_pretrain", True):
             bad.append("spectral_stem=s3t but no MAE checkpoint (*_mae.pt) is "
                        "attached. Add the pretraining notebook's output "
-                       "(qwyi123/hod26-s3t-mae-pretrain) as an input. Attached: "
+                       "(zetaoxia/hod26-s3t-mae-pretrain3 for S3T-X) as an input. Attached: "
                        + str([q.name for q in sorted(INPUT.glob('*'))]))
         elif mae is not None and mae != "ambiguous":
-            note.append(f"S3T MAE encoder {mae}")
+            want = (cand.get("train") or {}).get("s3t_arch", "tokens")
+            try:
+                import torch
+                got = (torch.load(mae, map_location="cpu", weights_only=True).get("config")
+                       or {}).get("arch", "tokens")
+            except Exception as exc:                            # noqa: BLE001
+                got = f"unreadable ({exc})"
+            if got != want:
+                bad.append(f"MAE checkpoint {mae} is arch={got!r}; the run asks for "
+                           f"s3t_arch={want!r}")
+            else:
+                note.append(f"S3T MAE encoder {mae} (arch {got})")
     if sub.get("weights_from"):
         if find_weights(sub["weights_from"]) is None:
             bad.append(f"weights_from={sub['weights_from']} not found under "

@@ -7,7 +7,7 @@ in front of a COCO-pretrained RT-DETR-L, trained on 2x T4 with augmentation.
 
 Inputs the kernel needs attached:
   - dataset  xishengfeng/hod26-planar                  (the frames)
-  - notebook qwyi123/hod26-s3t-mae-pretrain output    (pretrain_mae.pt)
+  - notebook zetaoxia/hod26-s3t-mae-pretrain3 output  (pretrain3_mae.pt, MAE v3)
 The preflight refuses to start without either, before any GPU time is spent.
 
 Augmentation, both kinds:
@@ -32,7 +32,7 @@ sys.path.insert(0, str(REPO))
 from tools.final_runs import full_candidate  # noqa: E402
 
 OUT = REPO / "kernels" / "s3t_detr" / "build"
-MAE_KERNEL = "qwyi123/hod26-s3t-mae-pretrain"
+MAE_KERNEL = "zetaoxia/hod26-s3t-mae-pretrain3"      # MAE v3, the S3T-X encoder
 TOTAL = 16            # epochs the schedule is laid out over
 SESSION_HOURS = 11.0
 
@@ -41,7 +41,7 @@ AUGMENT = {"sg_window": 7, "sg_polyorder": 2, "sg_chain": True,
 
 
 def s3t_candidate(total: int = TOTAL, batch: int = 2, mae_file: str | None = None,
-                  compile_blocks: bool = False) -> dict:
+                  compile_blocks: bool = False, arch: str = "tokens") -> dict:
     cand = full_candidate("transformer", total, {
         "channels.mode": "s3t_level",
         "train.spectral_stem": "s3t",
@@ -58,6 +58,15 @@ def s3t_candidate(total: int = TOTAL, batch: int = 2, mae_file: str | None = Non
                          s3t_ckpt_chunks=8, s3t_compile=False, amp=True, amp_fp32_loss=True,
                          mosaic=1.0, fliplr=0.5, scale=0.5, close_mosaic=3)
     cand["train"]["s3t_compile"] = bool(compile_blocks)
+    if arch == "xca":
+        # S3T-X (handoff/S3T.md, "probe"): on one T4 at 1024^2, AMP, b2/card,
+        # compiled blocks and no checkpoints are the fastest measured (0.50
+        # s/step, 5.3 GB); the encoder is small enough to keep its activations.
+        cand["train"].update(s3t_arch="xca", s3t_grad_ckpt=False, s3t_compile=True)
+    # Head and losses (handoff/S3T.md, "head"): D-FINE's distribution refinement
+    # on the pretrained decoder, DEIM's MAL for the classes, log-space w/h L1.
+    # Mosaic already gives DEIM's dense one-to-one supervision.
+    cand["train"].update(fdr=True, mal=True, log_size_l1=True)
     if mae_file:
         cand["train"]["s3t_mae_file"] = mae_file
     cand["augment"].update(AUGMENT)
@@ -76,11 +85,15 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=2, help="images per GPU")
     ap.add_argument("--compile-blocks", action="store_true",
                     help="torch.compile the S3T blocks (measure with the probe first)")
+    ap.add_argument("--arch", choices=["xca", "tokens"], default="xca",
+                    help="xca: S3T-X (MAE v3); tokens: the band-token encoder (MAE v1/v2)")
     args = ap.parse_args()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cfg = args.out_dir / "round-config.json"
     cfg.write_text(json.dumps({"round": "hod26-s3t-detr", "candidates": [], "submit": {
-        "candidate": s3t_candidate(args.total, args.batch, args.mae_file, args.compile_blocks),
+        "candidate": s3t_candidate(args.total, args.batch,
+                                   args.mae_file or ("pretrain3_mae.pt" if args.arch == "xca" else None),
+                                   args.compile_blocks, args.arch),
         "use_all_train": False,          # keep the 600 held out: they are the ruler
         "predict": True,                 # a submission comes out wherever the clock stops
         "session_hours": SESSION_HOURS,
