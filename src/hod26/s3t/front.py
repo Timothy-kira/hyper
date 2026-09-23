@@ -70,7 +70,7 @@ class S3TFront(nn.Module):
 
     def __init__(self, encoder: SpectralEncoder, projection=None, scale: float = 0.5,
                  grad_ckpt: bool = True, amp: bool = True, widen: bool = True,
-                 ckpt_chunks: int = 8):
+                 ckpt_chunks: int = 8, fast_kernels: bool = False, train_encoder: bool = True):
         super().__init__()
         n, d = encoder.n_bands, encoder.dim
         self.enc, self.scale, self.grad_ckpt, self.amp = encoder, scale, grad_ckpt, amp
@@ -80,6 +80,22 @@ class S3TFront(nn.Module):
         # layers (spectral blocks, the pool, the stem) into N chunks of
         # positions, so a backward holds one chunk of one layer at a time.
         self.ckpt_chunks = int(ckpt_chunks)
+        # Kernel choices that keep the arithmetic: 16-token attention as batched
+        # matmuls, depthwise convs in channels_last. Weights are untouched.
+        if fast_kernels:
+            from .spectral import SpatialMix, SpectralAttention
+            for m in encoder.modules():
+                if isinstance(m, SpectralAttention):
+                    m.impl = "bmm"
+                elif isinstance(m, SpatialMix):
+                    m.channels_last = True
+        # False: the encoder is a fixed feature extractor during detection (no
+        # backward through it, no recomputation); the stem channels and the
+        # injections still train. An option to measure, not the default.
+        self.train_encoder = bool(train_encoder)
+        if not self.train_encoder:
+            for p_ in encoder.parameters():
+                p_.requires_grad_(False)
         self.widen = widen
         # Channels this front hands the stem: 3 (projection) + d when widened.
         self.out_channels = 3 + d if widen else 3
@@ -109,6 +125,9 @@ class S3TFront(nn.Module):
                                   align_corners=False, antialias=True)
         feats = level_features(level)
         with torch.autocast("cuda", dtype=torch.float16, enabled=self.amp and x.is_cuda):
+            if not getattr(self, "train_encoder", True):
+                with torch.no_grad():
+                    return self.enc(feats).float()
             ckpt = self.grad_ckpt and self.training and torch.is_grad_enabled()
             if ckpt and self.ckpt_chunks > 0:
                 return self._encode_chunked(feats).float()

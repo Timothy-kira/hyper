@@ -741,7 +741,8 @@ def find_mae_checkpoint(name=None):
 
 def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5,
                       inject=(19, 14, 10), dim=64, depth=4, heads=4, widen=True,
-                      context=True, ctx_layer=11, ckpt_chunks=8, compile_blocks=False, **_):
+                      context=True, ctx_layer=11, ckpt_chunks=8, compile_blocks=False,
+                      fast_kernels=False, train_encoder=True, **_):
     """S3T encoder in front of the pretrained first block, plus side injections.
 
     The encoder is loaded from the MAE checkpoint when one is given. inject
@@ -766,7 +767,7 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
     else:
         log("  S3T encoder: NO pretrained weights -- random initialisation")
     front = S3TFront(enc, projection=projection, scale=scale, widen=widen,
-                     ckpt_chunks=ckpt_chunks)
+                     ckpt_chunks=ckpt_chunks, fast_kernels=fast_kernels, train_encoder=train_encoder)
     if compile_blocks:
         # Fuse each block's LayerNorm/GELU/residual chains (nn.Module.compile,
         # in place, so DDP and pickling see ordinary modules). No fallback: a
@@ -809,6 +810,8 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
     n_enc = sum(p.numel() for p in enc.parameters())
     log(f"  S3T memory: per-layer checkpoints, per-position layers in {ckpt_chunks} chunks"
         if ckpt_chunks else "  S3T memory: one checkpoint around the whole encoder")
+    log(f"  S3T kernels: {'16-token attention as batched matmul, depthwise conv channels_last' if fast_kernels else 'SDPA attention, NCHW depthwise conv'}; "
+        f"encoder {'trained' if train_encoder else 'FROZEN (feature extractor)'}")
     log(f"  S3T front: {n_enc / 1e6:.2f}M-param spectral Transformer at {scale}x input "
         f"scale, {'3+' + str(enc.dim) if widen else '16->3'} channels into the pretrained "
         f"{type(block).__name__}, zero-init side injections at layers {list(inject)}"
@@ -1672,7 +1675,9 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                        "widen": bool(tr.get("s3t_widen", True)),
                        "context": bool(tr.get("s3t_context", True)),
                        "ckpt_chunks": int(tr.get("s3t_ckpt_chunks", 8)),
-                       "compile_blocks": bool(tr.get("s3t_compile", False))}
+                       "compile_blocks": bool(tr.get("s3t_compile", False)),
+                       "fast_kernels": bool(tr.get("s3t_fast_kernels", False)),
+                       "train_encoder": bool(tr.get("s3t_train_encoder", True))}
         elif tr.get("spectral_stem", "adapter") == "adapter":
             adapter = {"n_bands": tr["in_channels"], "projection": proj,
                        "ckpt_name": tr["model"], "srf_k": tr.get("srf_k", 0),

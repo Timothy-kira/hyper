@@ -43,10 +43,19 @@ class SpectralAttention(nn.Module):
         self.heads, self.hd = heads, dim // heads
         self.qkv = nn.Linear(dim, 3 * dim)
         self.proj = nn.Linear(dim, dim)
+        # "sdpa": F.scaled_dot_product_attention (flash / memory-efficient
+        # kernels). "bmm": two batched matmuls. The fused kernels tile 64
+        # queries x 64 keys; with 16 band tokens most of each tile is padding,
+        # while a 16x16x16 matmul is one tensor-core tile. Same arithmetic.
+        self.impl = "sdpa"
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         n, c, d = t.shape
         q, k, v = self.qkv(t).view(n, c, 3, self.heads, self.hd).permute(2, 0, 3, 1, 4)
+        if getattr(self, "impl", "sdpa") == "bmm":
+            a = torch.matmul(q, k.transpose(-1, -2)) * (self.hd ** -0.5)
+            o = torch.matmul(a.softmax(-1).to(v.dtype), v)
+            return self.proj(o.transpose(1, 2).reshape(n, c, d))
         # Contiguous on purpose: inductor's SDPA lowering asserted on the strided
         # views (stride 96 where it traced 32) in the first 2xT4 pretrain.
         o = F.scaled_dot_product_attention(q.contiguous(), k.contiguous(), v.contiguous())
@@ -101,13 +110,21 @@ class SpatialMix(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.pw = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
         self.g = nn.Parameter(torch.full((dim,), ls))
+        # True: run the depthwise conv in channels_last (NHWC), which is the
+        # token layout already, so one transpose is saved and cuDNN's NHWC
+        # kernels are used instead of the native NCHW depthwise kernel.
+        self.channels_last = False
 
     def forward(self, t, idx, hw):
         h, w = hw
         dense = scatter_dense(t, idx, h * w)
         b, s, c, d = dense.shape
-        x = dense.permute(0, 2, 3, 1).reshape(b * c, d, h, w)
-        y = self.dw(x).view(b, c, d, s).permute(0, 3, 1, 2)
+        if getattr(self, "channels_last", False):
+            x = dense.transpose(1, 2).reshape(b * c, h, w, d).permute(0, 3, 1, 2)   # NCHW view, NHWC storage
+            y = self.dw(x).permute(0, 2, 3, 1).reshape(b, c, s, d).transpose(1, 2)
+        else:
+            x = dense.permute(0, 2, 3, 1).reshape(b * c, d, h, w)
+            y = self.dw(x).view(b, c, d, s).permute(0, 3, 1, 2)
         y = gather(y, idx)
         return t + self.g * self.pw(self.norm(y))
 

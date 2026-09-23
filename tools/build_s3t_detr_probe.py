@@ -59,7 +59,7 @@ mae = find_mae_checkpoint(MAE_FILE)
 say(f"MAE encoder: {mae}")
 
 
-def build_net(chunks, compile_blocks, s3t=True, scale=0.5):
+def build_net(chunks, compile_blocks, s3t=True, scale=0.5, fast=False, freeze=False):
     # Built the way RTDETRTrainer.get_model builds it: the 18-class graph from
     # the yaml, then every shape-compatible COCO tensor loaded into it.
     net = RTDETRDetectionModel("rtdetr-l.yaml", ch=3, nc=18, verbose=False)
@@ -67,7 +67,8 @@ def build_net(chunks, compile_blocks, s3t=True, scale=0.5):
     if s3t:
         install_spectral_adapter(net, 16, projection=LDA_16_TO_3, kind="s3t",
                                  mae_ckpt=str(mae) if mae else None, scale=scale, widen=True,
-                                 context=True, ckpt_chunks=chunks, compile_blocks=compile_blocks)
+                                 context=True, ckpt_chunks=chunks, compile_blocks=compile_blocks,
+                                 fast_kernels=fast, train_encoder=not freeze)
     done = enable_transformer_accel(net, fp32_loss=True, nc=18)
     return net.to(dev).train(), done
 
@@ -148,9 +149,10 @@ def run(cfg):
     try:
         s3t = cfg.get("s3t", True)
         ch = 16 if s3t else 3
-        net, done = build_net(cfg["chunks"], cfg["compile"], s3t, cfg.get("scale", 0.5))
+        net, done = build_net(cfg["chunks"], cfg["compile"], s3t, cfg.get("scale", 0.5),
+                              cfg.get("fast", False), cfg.get("freeze", False))
         rec["accel"] = done
-        opt = torch.optim.AdamW(net.parameters(), lr=1e-5, fused=CUDA)
+        opt = torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=1e-5, fused=CUDA)
         scaler = torch.amp.GradScaler("cuda", enabled=cfg["amp"] and CUDA)
         g = torch.Generator(device=dev).manual_seed(0)
         nan, times, scales = 0, [], []
