@@ -73,6 +73,10 @@ def s3t_candidate(total: int = TOTAL, batch: int = 2, mae_file: str | None = Non
     # deformable attention's grid_sample among them). The probe's 0.50 s/step
     # was measured without them.
     cand["train"]["deterministic"] = False
+    # ultralytics converts the whole model to channels_last on CUDA by default.
+    # Measured on a T4 with this exact model (S3T-X + D-FINE, AMP, b2): slower
+    # (0.586 vs 0.565 s/step) and 12.5 GB peak instead of 5.3 GB. Off.
+    cand["train"]["channels_last"] = False
     if mae_file:
         cand["train"]["s3t_mae_file"] = mae_file
     cand["augment"].update(AUGMENT)

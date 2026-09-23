@@ -766,6 +766,10 @@ if _RTDETRLoss is not None:
         calls are the loss's own matchings, in DETRLoss's order: the main
         queries' last layer, then its aux layers (encoder, decoder 0..L-2), then
         the same for the denoising queries (no encoder layer there).
+
+        Batched across layers -- one target encoding, one IoU, one KL per part
+        and loss -- and free of host syncs: the per-layer loop it replaces cost
+        ~0.09 s of a 0.42 s step on a T4 in small kernels alone.
         """
         proj, rs = dec.fdr_project.float(), float(dec.fdr_reg_scale)
         corners, refs = stash["corners"].float(), stash["refs"].float()
@@ -781,40 +785,59 @@ if _RTDETRLoss is not None:
             raise RuntimeError(f"FDR loss: {len(calls)} matchings for layers "
                                f"{[pl for _, _, pl in parts]} -- DETRLoss changed its call order")
         gt = batch["bboxes"].float()
-        fgl = ddf = corners.sum() * 0.0
+        zero = corners.sum() * 0.0
+        fgl = ddf = zero
         k = 0
         for C, Rf, plan in parts:
             t_idx, t_box, t_score = calls[k]                     # this part's last layer: the teacher
-            t_box = t_box.detach().float()
-            t_conf = t_score.detach().float().sigmoid().max(-1).values
-            b = t_box.shape[0]
+            # FGL: every layer's matched (corners, reference, gt, box), each
+            # row weighted by its IoU / the layer's match count.
+            pcs, rfs, gts, pbs, inv = [], [], [], [], []
             for layer in plan:
                 mi, pb, _ = calls[k]
                 k += 1
                 if layer is None:
                     continue
                 idx, gt_idx = crit._get_index(mi)
-                if len(gt_idx):
-                    lo, wl, wr = fdr_targets(Rf[layer][idx], gt[gt_idx], proj, rs)
-                    iou = _bbox_iou(pb[idx].detach().float(), gt[gt_idx], xywh=True).view(-1).clamp_min(0)
-                    fgl = fgl + (_two_bin_kl(C[layer][idx].reshape(-1, R1), lo, wl, wr)
-                                 * iou.repeat_interleave(4)).sum() / len(gt_idx)
-                if crit.ddf_gain and layer < L - 1:
-                    lo, wl, wr = fdr_targets(Rf[layer].reshape(-1, 4), t_box.reshape(-1, 4), proj, rs)
-                    kl = _two_bin_kl(C[layer].reshape(-1, R1), lo, wl, wr)
-                    wt = t_conf.clone()
-                    pos = _torch.zeros_like(wt, dtype=_torch.bool)
-                    tidx, tgt_idx = crit._get_index(t_idx)
-                    if len(tgt_idx):
-                        pos[tidx] = True
-                        wt[tidx] = _bbox_iou(t_box[tidx], gt[tgt_idx], xywh=True).view(-1).clamp_min(0)
-                    wt, pos = wt.reshape(-1).repeat_interleave(4), pos.reshape(-1).repeat_interleave(4)
-                    kl = kl * wt
-                    scale = 8.0 / b                               # D-FINE: independent of batch per GPU
-                    n_pos, n_neg = (pos.sum() * scale) ** 0.5, ((~pos).sum() * scale) ** 0.5
-                    l_pos = kl[pos].mean() if pos.any() else kl.sum() * 0.0
-                    l_neg = kl[~pos].mean() if (~pos).any() else kl.sum() * 0.0
-                    ddf = ddf + (l_pos * n_pos + l_neg * n_neg) / (n_pos + n_neg).clamp_min(1e-6)
+                n = len(gt_idx)
+                if n:
+                    pcs.append(C[layer][idx])
+                    rfs.append(Rf[layer][idx])
+                    gts.append(gt[gt_idx])
+                    pbs.append(pb[idx])
+                    inv.append(_torch.full((n,), 1.0 / n, device=gt.device))
+            if pcs:
+                g_all = _torch.cat(gts)
+                lo, wl, wr = fdr_targets(_torch.cat(rfs), g_all, proj, rs)
+                iou = _bbox_iou(_torch.cat(pbs).detach().float(), g_all, xywh=True).view(-1).clamp_min(0)
+                w = (iou * _torch.cat(inv)).repeat_interleave(4)
+                fgl = fgl + (_two_bin_kl(_torch.cat(pcs).reshape(-1, R1), lo, wl, wr) * w).sum()
+            if not crit.ddf_gain or L < 2:
+                continue
+            # DDF: layers 0..L-2 against the teacher's box, all at once. The
+            # weights (teacher IoU where matched, its confidence elsewhere) and
+            # the pos/neg balance are the same for every layer.
+            t_box = t_box.detach().float()
+            b = t_box.shape[0]
+            wt = t_score.detach().float().sigmoid().max(-1).values
+            pos = _torch.zeros_like(wt, dtype=_torch.bool)
+            tidx, tgt_idx = crit._get_index(t_idx)
+            if len(tgt_idx):
+                pos[tidx] = True
+                wt = wt.index_put(tidx, _bbox_iou(t_box[tidx], gt[tgt_idx], xywh=True).view(-1).clamp_min(0))
+            m = L - 1
+            lo, wl, wr = fdr_targets(Rf[:m].reshape(-1, 4), t_box.expand(m, *t_box.shape).reshape(-1, 4),
+                                     proj, rs)
+            kl = _two_bin_kl(C[:m].reshape(-1, R1), lo, wl, wr)
+            wt4 = wt.expand(m, *wt.shape).reshape(-1).repeat_interleave(4)
+            pos4 = pos.expand(m, *pos.shape).reshape(-1).repeat_interleave(4).float()
+            kl = kl * wt4
+            scale = 8.0 / b                                       # D-FINE: independent of batch per GPU
+            n_pos, n_neg = (pos4.sum() / m * scale) ** 0.5, ((1 - pos4).sum() / m * scale) ** 0.5
+            l_pos = (kl * pos4).sum() / pos4.sum().clamp_min(1.0)  # mean over layers' pos edges
+            l_neg = (kl * (1 - pos4)).sum() / (1 - pos4).sum().clamp_min(1.0)
+            # sum over layers of each layer's balanced mean == m x the pooled one
+            ddf = ddf + m * (l_pos * n_pos + l_neg * n_neg) / (n_pos + n_neg).clamp_min(1e-6)
         return {"loss_fgl": crit.fgl_gain * fgl, "loss_ddf": crit.ddf_gain * ddf}
 
     class FDRDecoder(_DTD):
