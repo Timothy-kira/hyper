@@ -13,7 +13,7 @@
 | 速度探针（T4，1024²，真实 loss） | **完成**，S3T-X 通过，见下 | `zetaoxia/hod26-s3t-detr-probe` v5 |
 | MAE v3 预训练（S3T-X，修掉特征泄漏） | **运行中**，公开 notebook，双 T4，90 分钟 | `zetaoxia/hod26-s3t-mae-pretrain3`，输出 `s3t_mae/pretrain3_mae.pt` |
 | 检测：S3T-X 前端 + D-FINE + MAL + 数据增强 | **代码完成**，CPU 上端到端跑通（渲染 → 训练 → 保存 best/last → 重载 → submission.csv） | `tools/s3t_round.py` 生成 `handoff/s3t/hod26_round.py` |
-| 正式检测训练 | 等 MAE v3 跑完就推（从 COCO 开始，48 epoch，约 11 小时） | `zetaoxia/hod26-s3t-detr` |
+| 正式检测训练 | 等 MAE v3 跑完就推（从 COCO 开始，45 epoch，约 9.2 小时） | `zetaoxia/hod26-s3t-detr` |
 
 旧的 band-token 编码器（MAE v1/v2）已经停用。v2 那一轮是按用户要求中途删除的，原因见"为什么换成 S3T-X"。
 
@@ -45,7 +45,20 @@ XCA(Q, K, V) = V · softmax(K̂ᵀ Q̂ / τ)，Q̂、K̂ 沿像素做 L2 归一�
 
 - S3T-X 比旧编码器**快 6.8 倍**，是纯 RT-DETR 的 1.55 倍。
 - 没有 NaN。attention 实际走的是 `fmha_cutlassF/B`（mem-efficient 融合 kernel）。
-- 估算：双卡每步 4 张图，训练集 2400 张加 1 份增强副本共 4800 张，**约 12 分钟一个 epoch**，11 小时能跑约 50 个 epoch。旧流程 52 个 epoch 到了 held-out 0.695。
+### 第二轮探针：正式配置（S3T-X + D-FINE/MAL，编译，AMP，b2）
+
+| 配置 | s/step | 峰值显存 |
+| --- | --- | --- |
+| 纯 RT-DETR + D-FINE/MAL，逐层算 loss | 0.422 | — |
+| 纯 RT-DETR + D-FINE/MAL，批量 loss | 0.373 | — |
+| S3T-X + D-FINE，逐层算 loss | 0.565 | 5.3 GB |
+| S3T-X + D-FINE，逐层算 loss，**channels_last** | 0.586 | **12.5 GB** |
+| **S3T-X + D-FINE，批量 loss（正式配置）** | **0.508** | 5.3 GB |
+
+- **channels_last 要关**：ultralytics 8.4 在 CUDA 上默认把整个模型转成 channels_last。在这个模型上它更慢，峰值显存还翻了一倍多，离 14.6 GB 上限很近。S3T 这条线显式设成 `channels_last=False`。
+- **D-FINE 的 loss 改成跨层批量计算**，去掉逐层循环和 `.any()` 的同步，数值和原实现一致（误差 1e-7）。原先它每步多花约 0.09 s，现在基本没有额外开销。
+- **`deterministic=False`**：确定性模式会限制 cudnn 的算法选择，grid_sample 的反向也会变慢。
+- **估算**：双卡每步 4 张图，训练集 2400 张加 1 份增强副本共 4800 张，**约 12.3 分钟一个 epoch**。45 个 epoch 约 9.2 小时，留约 1 小时余量，保证最后 3 个关闭 mosaic 的 epoch 一定能跑完。旧流程 52 个 epoch 到了 held-out 0.695。
 
 ## 模型结构
 
@@ -189,7 +202,7 @@ MAE 预训练**不做**任何增强：只用官方的 4000 帧原图裁块。验
 | 时间（UTC） | 内容 |
 | --- | --- |
 | 09:54 – 约 11:30 | MAE v3 预训练（90 分钟，公开 notebook） |
-| 约 11:40 – 约 22:40 | 检测训练 48 epoch（时钟保护会在超时前停下，并保存 best/last） |
+| 约 11:40 – 约 21:30 | 检测训练 45 epoch（时钟保护会在超时前停下，并保存 best/last） |
 | 之后 | 同一个 session 里预测测试集，写 `submission.csv` |
 
 还有余量：如果第一轮结束后时间和额度都够，可以挂上 `final_last.pt` 再续一轮。

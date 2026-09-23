@@ -33,7 +33,8 @@ from tools.final_runs import full_candidate  # noqa: E402
 
 OUT = REPO / "kernels" / "s3t_detr" / "build"
 MAE_KERNEL = "zetaoxia/hod26-s3t-mae-pretrain3"      # MAE v3, the S3T-X encoder
-TOTAL = 48            # epochs; S3T-X at ~12 min/epoch on 2x T4 fits an 11 h session
+TOTAL = 45            # epochs: 0.508 s/step (probe v7) -> ~12.3 min/epoch on 2x T4, ~9.2 h,
+                      # leaving an hour so the 3 closing no-mosaic epochs always run
 SESSION_HOURS = 11.0
 
 AUGMENT = {"sg_window": 7, "sg_polyorder": 2, "sg_chain": True,
