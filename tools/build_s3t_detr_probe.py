@@ -59,20 +59,21 @@ mae = find_mae_checkpoint(MAE_FILE)
 say(f"MAE encoder: {mae}")
 
 
-def build_net(chunks, compile_blocks):
+def build_net(chunks, compile_blocks, s3t=True, scale=0.5):
     # Built the way RTDETRTrainer.get_model builds it: the 18-class graph from
     # the yaml, then every shape-compatible COCO tensor loaded into it.
     net = RTDETRDetectionModel("rtdetr-l.yaml", ch=3, nc=18, verbose=False)
     net.load(COCO, verbose=False)
-    install_spectral_adapter(net, 16, projection=LDA_16_TO_3, kind="s3t", mae_ckpt=str(mae) if mae else None,
-                             scale=0.5, widen=True, context=True, ckpt_chunks=chunks,
-                             compile_blocks=compile_blocks)
+    if s3t:
+        install_spectral_adapter(net, 16, projection=LDA_16_TO_3, kind="s3t",
+                                 mae_ckpt=str(mae) if mae else None, scale=scale, widen=True,
+                                 context=True, ckpt_chunks=chunks, compile_blocks=compile_blocks)
     done = enable_transformer_accel(net, fp32_loss=True, nc=18)
     return net.to(dev).train(), done
 
 
-def fake_batch(b, g):
-    img = torch.rand(b, 16, IMGSZ, IMGSZ, device=dev, generator=g)  # [0,1], as ultralytics feeds u8/255
+def fake_batch(b, g, ch=16):
+    img = torch.rand(b, ch, IMGSZ, IMGSZ, device=dev, generator=g)  # [0,1], as ultralytics feeds u8/255
     n = 6
     xy = torch.rand(b * n, 2, device=dev, generator=g) * 0.7 + 0.15
     wh = torch.rand(b * n, 2, device=dev, generator=g) * 0.1 + 0.02
@@ -105,14 +106,16 @@ def run(cfg):
     rec = dict(cfg)
     net = opt = scaler = loss = batch = None
     try:
-        net, done = build_net(cfg["chunks"], cfg["compile"])
+        s3t = cfg.get("s3t", True)
+        ch = 16 if s3t else 3
+        net, done = build_net(cfg["chunks"], cfg["compile"], s3t, cfg.get("scale", 0.5))
         rec["accel"] = done
         opt = torch.optim.AdamW(net.parameters(), lr=1e-5, fused=CUDA)
         scaler = torch.amp.GradScaler("cuda", enabled=cfg["amp"] and CUDA)
         g = torch.Generator(device=dev).manual_seed(0)
         nan, times, scales = 0, [], []
         for step in range(cfg["steps"]):
-            batch = fake_batch(cfg["batch"], g)
+            batch = fake_batch(cfg["batch"], g, ch)
             sync()
             t = time.time()
             with torch.autocast(dev.type, dtype=torch.float16, enabled=cfg["amp"] and CUDA):
@@ -132,7 +135,7 @@ def run(cfg):
                    s_per_step=sum(times) / max(1, len(times)), nan_steps=nan,
                    final_scale=scales[-1], min_scale=min(scales))
         if cfg.get("profile"):
-            rec["attention_kernels"] = attention_kernels(net, fake_batch(cfg["batch"], g), cfg["amp"])
+            rec["attention_kernels"] = attention_kernels(net, fake_batch(cfg["batch"], g, ch), cfg["amp"])
     except torch.OutOfMemoryError as e:
         rec.update(ok=False, error="OOM", peak_gb=peak())
     except Exception as e:                                        # noqa: BLE001
@@ -184,6 +187,9 @@ def main() -> None:
     ap.add_argument("--mae-kernel", default="qwyi123/hod26-s3t-mae-pretrain")
     ap.add_argument("--mae-file", default=None)
     ap.add_argument("--imgsz", type=int, default=1024)
+    ap.add_argument("--configs", default=None,
+                    help="JSON list replacing the default configurations (keys: name, amp, chunks, "
+                         "batch, compile, steps, [s3t], [scale], [profile])")
     args = ap.parse_args()
     cand = s3t_candidate(total=2)
     src = build({"round": "probe", "candidates": [], "submit": {"candidate": cand}})
@@ -192,7 +198,8 @@ def main() -> None:
         raise RuntimeError("generated kernel no longer ends with the main() guard")
     src = src.rstrip()[: -len(tail)]
     head = (f"MAE_FILE = {args.mae_file!r}\nIMGSZ = {args.imgsz}\n"
-            f"CONFIGS = {json.dumps(CONFIGS)}\n".replace("true", "True").replace("false", "False"))
+            f"CONFIGS = {json.dumps(json.loads(args.configs) if args.configs else CONFIGS)}\n"
+            .replace("true", "True").replace("false", "False"))
     args.out_dir.mkdir(parents=True, exist_ok=True)
     (args.out_dir / "s3t_detr_probe.py").write_text(src + "\n" + head + PROBE)
     (args.out_dir / "kernel-metadata.json").write_text(json.dumps({
