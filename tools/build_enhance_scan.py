@@ -86,25 +86,37 @@ Sinv_res = np.linalg.inv(np.cov(res.T) + 1e-6 * np.eye(16))
 print(f"background stats from {len(bg)} pixels", flush=True)
 
 
+def annulus_mean(x, inner, outer):
+    """Mean over an outer x outer window with the inner x inner centre removed.
+
+    A plain local mean includes the object itself: for a 20-45 px object a
+    31 px window is mostly object, so object / local-mean cancels the very
+    contrast it is meant to expose. Dual-window background estimation, as in
+    local RX, keeps a guard region out of the estimate.
+    """
+    so = cv2.blur(x, (outer, outer), borderType=cv2.BORDER_REFLECT) * outer * outer
+    si = cv2.blur(x, (inner, inner), borderType=cv2.BORDER_REFLECT) * inner * inner
+    return (so - si) / (outer * outer - inner * inner)
+
+
 def transforms(cube):
     X = cube.astype(np.float32)
     L = np.log1p(X)
-    M31 = np.stack([box_mean(L[:, :, b], 31) for b in range(16)], -1)
-    S31 = np.sqrt(np.maximum(np.stack([box_mean(L[:, :, b] ** 2, 31) for b in range(16)], -1) - M31 ** 2, 1e-6))
     shape = X / (np.linalg.norm(X, axis=-1, keepdims=True) + 1e-6)
-    lratio = L - M31
-    D = lratio
-    T = {
+    MA = np.stack([annulus_mean(L[:, :, b], 31, 63) for b in range(16)], -1)
+    SA = np.sqrt(np.maximum(np.stack([annulus_mean(L[:, :, b] ** 2, 31, 63) for b in range(16)], -1) - MA ** 2, 1e-6))
+    MB = np.stack([annulus_mean(L[:, :, b], 47, 95) for b in range(16)], -1)
+    la, lb = L - MA, L - MB
+    return {
         "raw16 (baseline)": L,
-        "shape16": shape,
-        "lratio31": lratio,
-        "lcn31": (L - M31) / S31,
-        "lrx31": np.einsum("hwi,ij,hwj->hw", D, Sinv_res, D)[..., None],
-        "deriv15": np.diff(shape[:, :, CHAIN], axis=-1),
-        "whiten16": (L - mu_g) @ W_white,
-        "shape+lratio": np.concatenate([shape, lratio], -1),
+        "shape+raw": np.concatenate([shape, L], -1),
+        "lratio_ann63": la,
+        "lratio_ann95": lb,
+        "lcn_ann63": la / SA,
+        "lrx_ann63": np.einsum("hwi,ij,hwj->hw", la, Sinv_res, la)[..., None],
+        "shape+lr_ann63": np.concatenate([shape, la], -1),
+        "raw+lr_ann63+lr95": np.concatenate([L, la, lb], -1),
     }
-    return T
 
 
 samples = defaultdict(lambda: defaultdict(lambda: {"core": [], "ring": [], "ie": [], "oe": [], "gid": []}))
@@ -210,7 +222,7 @@ print(f"\ndone in {time.time() - T0:.0f}s")
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out-dir", type=Path, required=True)
-    ap.add_argument("--slug", default="qwyi123/hod26-enhance-scan")
+    ap.add_argument("--slug", default="qwyi123/hod26-enhance-scan2")
     ap.add_argument("--dataset", default="xishengfeng/hod26-planar")
     args = ap.parse_args()
     parts = [HEAD, strip("src/hod26/voc.py"), strip("src/hod26/cube.py"),
