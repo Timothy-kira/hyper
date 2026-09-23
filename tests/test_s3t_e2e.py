@@ -247,6 +247,21 @@ def smoke_checks(check):
         check("smoke over its s/it limit stops the session (no fallback)",
               stopped and any(m.startswith("SMOKE FAILED") for m in said))
 
+        # smoke_only: every stage small, then stop
+        said.clear()
+        sub = {"candidate": cand, "use_all_train": False, "predict": True, "session_hours": 1.0,
+               "smoke_only": True, "smoke_max_s_per_it": 1e9}
+        try:
+            k.run_submission({"round": "smoke", "candidates": [], "submit": sub})
+            ok = True
+        except Exception as e:                                  # noqa: BLE001
+            ok = str(e)[:300]
+        check("smoke_only: train / val / best+last / final eval / reload / predict / submission",
+              ok is True and any(m.startswith("SMOKE ALL OK") for m in said), str(ok))
+        check("  and it stops there: no long run, nothing of the smoke left behind",
+              not (k.WORK / "final_last.pt").exists() and not list(k.WORK.glob("smoke_*"))
+              and json.loads((k.WORK / "results.json").read_text()).get("mode") == "smoke_only")
+
 
 def mosaic_check(check):
     """The kernel's mosaic canvas reuse: installed, and byte-identical to ultralytics'."""

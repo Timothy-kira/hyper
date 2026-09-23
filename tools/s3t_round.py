@@ -101,6 +101,9 @@ def main() -> None:
     ap.add_argument("--render-only", action="store_true",
                     help="build the CPU render notebook: materialise this candidate's dataset "
                          "into its output (no GPU, no training)")
+    ap.add_argument("--smoke-only", action="store_true",
+                    help="run every stage small (smoke train, val, best/last, fp16 eval, predict, "
+                         "submission) and stop -- proves the pipeline on scarce quota")
     ap.add_argument("--render-kernel", default=None,
                     help="a render notebook to mount; its dataset is used instead of rendering")
     args = ap.parse_args()
@@ -115,6 +118,7 @@ def main() -> None:
         "session_hours": SESSION_HOURS,
         "require_gpus": 2,
         "render_only": bool(args.render_only),
+        "smoke_only": bool(args.smoke_only),
     }}, indent=2))
     subprocess.run([sys.executable, str(REPO / "tools" / "build_kernel.py"),
                     "--round-config", str(cfg), "--out-dir", str(args.out_dir),

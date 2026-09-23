@@ -2212,7 +2212,7 @@ def attach_speed_probe(model, path, skip=4):
     model.add_callback("on_train_epoch_end", on_epoch)
 
 
-def run_smoke(cand, index, train_ids, val_ids, anns, sub):
+def run_smoke(cand, index, train_ids, val_ids, anns, sub, keep=False):
     """A few minutes on the real GPUs through the real training path, first.
 
     Both GPU-only failures of the S3T-X run surfaced only after the full render
@@ -2253,14 +2253,56 @@ def run_smoke(cand, index, train_ids, val_ids, anns, sub):
                                f"(probe: 0.51 s/step on one T4) -- not starting the long run")
         log(f"SMOKE ok: {spi:.3f} s/it after warm-up ({rec['iterations']} its, {rec['world']} GPU), "
             f"accel all ON, peak {rec['peak_gb']:.2f} GB/card, {time.time() - t0:.0f}s")
+        kept = {n: (WORK / f"smoke_{n}.pt").exists() for n in ("best", "last")}
+        if not all(kept.values()):
+            raise RuntimeError(f"best/last not kept in the output: {kept}")
+        log("SMOKE ok: smoke_best.pt and smoke_last.pt kept in the output")
+        if keep:
+            return RUNS / "smoke" / "weights" / "best.pt"
     except Exception as exc:
         log(f"SMOKE FAILED: {type(exc).__name__}: {str(exc)[:600]}")
         raise
     finally:
-        shutil.rmtree(SCRATCH / "ds_smoke", ignore_errors=True)
-        shutil.rmtree(RUNS / "smoke", ignore_errors=True)
-        for f in WORK.glob("smoke_*"):
-            f.unlink(missing_ok=True)
+        if not keep:
+            clean_smoke()
+
+
+def clean_smoke():
+    shutil.rmtree(SCRATCH / "ds_smoke", ignore_errors=True)
+    shutil.rmtree(RUNS / "smoke", ignore_errors=True)
+    for f in WORK.glob("smoke_*"):
+        f.unlink(missing_ok=True)
+
+
+def run_smoke_only(round_cfg, cand, index, train_ids, val_ids, anns, test_dir):
+    """Every stage of a submission session, small: smoke training (DDP, every
+    acceleration), validation, best/last kept, the fp16 final evaluation, then
+    best.pt reloaded, a slice of the test set predicted and a submission written
+    and checked. For proving a pipeline before a long run on scarce quota."""
+    t0 = time.time()
+    try:
+        weights = run_smoke(cand, index, train_ids, val_ids, anns, round_cfg["submit"], keep=True)
+        model = build_model(cand["train"]["model"], str(weights))
+        test_ids = require_ids(sorted(int(p.stem) for p in test_dir.glob("*.png")), test_dir)[:24]
+        preds, sizes = predict_test(model, cand, test_dir, test_ids)
+        out = WORK / "smoke_submission.csv"
+        n = write(out, preds, clip_to=sizes)
+        header = out.read_text().splitlines()[0] if out.exists() else ""
+        if n <= 0 or not header:
+            raise RuntimeError(f"submission empty ({n} rows)")
+        imgs = len({p[0] for p in preds})
+        log(f"SMOKE ok: predicted {len(test_ids)} test frames with best.pt -> {n} rows over {imgs} "
+            f"images; header {header!r}")
+        log(f"SMOKE ALL OK in {time.time() - t0:.0f}s: train (DDP, accel) / val / best+last kept / "
+            f"fp16 final eval / reload / predict / submission")
+        (WORK / "results.json").write_text(json.dumps({"mode": "smoke_only", "ok": True,
+                                                       "rows": n, "images": imgs}, indent=2))
+    except Exception as exc:
+        log(f"SMOKE FAILED: {type(exc).__name__}: {str(exc)[:600]}")
+        raise
+    finally:
+        clean_smoke()
+        shutil.rmtree(SCRATCH / "test_images", ignore_errors=True)
 
 
 def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
@@ -3002,6 +3044,8 @@ def run_submission(round_cfg):
     budget = float(round_cfg["submit"].get("session_hours", 0) or 0) * 3600
     reserve = 1800 if want else 300
 
+    if round_cfg["submit"].get("smoke_only"):
+        return run_smoke_only(round_cfg, cand, index, train_ids, val_ids, anns, test_dir)
     if round_cfg["submit"].get("smoke", True) and visible_gpus() > 0:
         run_smoke(cand, index, train_ids, val_ids, anns, round_cfg["submit"])
     scores, _, weights = run_candidate(cand, index, train_ids, val_ids, anns, "final",
