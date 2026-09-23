@@ -13,6 +13,7 @@
     "xishengfeng/hod26-planar"
   ],
   "kernel_sources": [
-    "zetaoxia/hod26-s3t-mae-pretrain3"
+    "zetaoxia/hod26-s3t-mae-pretrain3",
+    "zetaoxia/hod26-s3t-render"
   ]
 }

@@ -58,6 +58,213 @@ def synth_dataset(dest: Path, n_train: int = 12, n_test: int = 3, h: int = 241, 
     return dest
 
 
+class _Emulated(Exception):
+    pass
+
+
+def ddp_worker_emulation(check):
+    """The training process of a 2-GPU run, on CPU, exactly as ultralytics 8.4 makes it.
+
+    ultralytics builds the model in the parent (Model.train -> trainer.get_model),
+    cloudpickles {trainer class, args, model, callbacks} to each DDP worker, and
+    the worker constructs a fresh trainer, assigns the unpickled model, runs
+    setup_model, wraps it in DistributedDataParallel and only then calls
+    build_optimizer. Both GPU-only failures so far lived on that path (lost
+    compilation and cudnn.benchmark; a DDP wrapper handed to ensure_accel), and a
+    single-process run never takes it. Here the production run_candidate builds
+    the trainer class and the parent side for real; trainer.train() is replaced
+    by the worker side, with a real single-process gloo DDP.
+    """
+    import os
+    import torch
+    import torch.distributed as dist
+    import cloudpickle
+    from ultralytics.utils import DEFAULT_CFG_DICT
+
+    from hod26.s3t.xca import XCAEncoder
+    from tools.s3t_round import s3t_candidate
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        data = synth_dataset(tmp / "input" / "hod26-planar")
+        k = load_kernel(tmp / "work", data)
+        k.INPUT = tmp / "input"
+        mae_dir = k.INPUT / "hod26-s3t-mae-pretrain3" / "s3t_mae"
+        mae_dir.mkdir(parents=True)
+        enc = XCAEncoder()
+        torch.save({"encoder": enc.state_dict(), "config": enc.config(), "step": 1},
+                   mae_dir / "pretrain3_mae.pt")
+        cand = s3t_candidate(total=1, batch=2, mae_file="pretrain3_mae.pt", arch="xca")
+        # the production flags, compile included; CPU only drops AMP
+        cand["train"].update(epochs=1, imgsz=128, amp=False, workers=0)
+        seen = {}
+        factory = k.hod26_trainer
+
+        def emulating_factory(*a, **kw):
+            cls = factory(*a, **kw)
+
+            class Parent(cls):
+                def train(self):                           # the parent stops here and spawns
+                    blob = cloudpickle.dumps({"trainer": cls, "args": vars(self.args),
+                                              "model": self.model, "callbacks": self.callbacks})
+                    state = cloudpickle.loads(blob)
+                    cfg = DEFAULT_CFG_DICT.copy()
+                    cfg.update(save_dir="")
+                    w = state["trainer"](cfg=cfg, overrides=state["args"], _callbacks=state["callbacks"])
+                    w.model = state["model"]
+                    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+                    os.environ.setdefault("MASTER_PORT", "29533")
+                    dist.init_process_group("gloo", rank=0, world_size=1)
+                    try:
+                        w.setup_model()
+                        w.model = torch.nn.parallel.DistributedDataParallel(w.model, find_unused_parameters=True)
+                        w.build_optimizer(model=w.model, name="auto", lr=1e-4, momentum=0.9,
+                                          decay=1e-5, iterations=1000)
+                        seen["table"] = w.__dict__.get("_hod26_accel_table") or []
+                        g = torch.Generator().manual_seed(0)
+                        n = 3
+                        batch = {"img": torch.rand(2, 16, 128, 128, generator=g),
+                                 "batch_idx": torch.arange(2).repeat_interleave(n).float(),
+                                 "cls": torch.randint(0, 18, (2 * n, 1), generator=g).float(),
+                                 "bboxes": torch.cat([torch.rand(2 * n, 2, generator=g) * 0.6 + 0.2,
+                                                      torch.rand(2 * n, 2, generator=g) * 0.2 + 0.05], 1)}
+                        loss, _ = w.model(batch)
+                        loss.sum().backward()
+                        seen["loss"] = float(loss.sum())
+                    finally:
+                        dist.destroy_process_group()
+                    raise _Emulated()
+
+            return Parent
+
+        k.hod26_trainer = emulating_factory
+        said = []
+        base_log = k.log
+        k.log = lambda msg: (said.append(str(msg)), base_log(msg))
+        root = k.data_root()
+        train_ids, val_ids = k.submission_split(root, {"use_all_train": False})
+        ann = root / "train" / "annotations"
+        anns = {p: k.parse(ann / f"{p}.xml") for p in train_ids + val_ids}
+        try:
+            k.run_candidate(cand, k.frame_index(root, "train", train_ids + val_ids),
+                            train_ids, val_ids, anns, "ddpemu")
+            err = "trainer.train() was never reached"
+        except _Emulated:
+            err = None
+        except Exception as e:                                  # noqa: BLE001
+            import traceback
+            err = "".join(traceback.format_exception(e))[-1500:]
+        check("DDP worker path (pickled model, DDP wrapper): setup_model + build_optimizer "
+              "+ a training step", err is None, str(err))
+        # Read from the worker's own trainer: its class travelled by value, so
+        # a log hook set here would only see the parent's copy.
+        table = seen.get("table") or []
+        want = ("loss + Hungarian", "RT-DETR attention via SDPA", "S3T blocks torch.compile",
+                "fused AdamW", "cudnn.benchmark", "mosaic canvas reuse")
+        off = [w_ for w_ in want if not any(on and w_ in n for n, on, _ in table)]
+        check("DDP worker: every requested acceleration ON in the worker's table", not off, str(off))
+        check("DDP worker: finite loss through the DDP-wrapped model",
+              seen.get("loss") is not None and seen["loss"] == seen["loss"], str(seen.get("loss")))
+
+
+def smoke_checks(check):
+    """run_smoke: passes and cleans up under its limit, stops the session over it."""
+    import torch
+
+    from hod26.s3t.xca import XCAEncoder
+    from tools.s3t_round import s3t_candidate
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        data = synth_dataset(tmp / "input" / "hod26-planar")
+        k = load_kernel(tmp / "work", data)
+        k.INPUT = tmp / "input"
+        mae_dir = k.INPUT / "hod26-s3t-mae-pretrain3" / "s3t_mae"
+        mae_dir.mkdir(parents=True)
+        enc = XCAEncoder()
+        torch.save({"encoder": enc.state_dict(), "config": enc.config(), "step": 1},
+                   mae_dir / "pretrain3_mae.pt")
+        cand = s3t_candidate(total=5, batch=2, mae_file="pretrain3_mae.pt", arch="xca")
+        cand["train"].update(imgsz=128, amp=False, s3t_compile=False, workers=0)
+        root = k.data_root()
+        tr, va = k.submission_split(root, {"use_all_train": False})
+        ann = root / "train" / "annotations"
+        anns = {p: k.parse(ann / f"{p}.xml") for p in tr + va}
+        index = k.frame_index(root, "train", tr + va)
+        said = []
+        base_log = k.log
+        k.log = lambda msg: (said.append(str(msg)), base_log(msg))
+        try:
+            k.run_smoke(cand, index, tr, va, anns, {"smoke_max_s_per_it": 1e9})
+            ok = True
+        except Exception as e:                                  # noqa: BLE001
+            ok = str(e)[:300]
+        check("smoke passes under its limit", ok is True and any(m.startswith("SMOKE ok") for m in said), str(ok))
+        check("  and leaves nothing behind (dataset, run, output files)",
+              not (k.SCRATCH / "ds_smoke").exists() and not (k.RUNS / "smoke").exists()
+              and not list(k.WORK.glob("smoke_*")))
+        check("  and does not touch the real run's epochs", cand["train"]["epochs"] == 5)
+        try:
+            k.run_smoke(cand, index, tr, va, anns, {"smoke_max_s_per_it": 1e-6})
+            stopped = False
+        except RuntimeError as e:
+            stopped = "limit" in str(e)
+        check("smoke over its s/it limit stops the session (no fallback)",
+              stopped and any(m.startswith("SMOKE FAILED") for m in said))
+
+
+def mosaic_check(check):
+    """The kernel's mosaic canvas reuse: installed, and byte-identical to ultralytics'."""
+    import copy
+
+    import numpy as np
+    from ultralytics.cfg import get_cfg
+    from ultralytics.data.augment import Mosaic
+    from ultralytics.data.utils import check_det_dataset
+    from ultralytics.models.rtdetr.train import RTDETRDataset
+
+    from tools.s3t_round import s3t_candidate
+
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        data = synth_dataset(tmp / "input" / "hod26-planar", n_train=16)
+        k = load_kernel(tmp / "work", data)
+        check("mosaic canvas reuse installed at import", k.mosaic_canvas_patched())
+        cand = s3t_candidate(total=1, arch="xca")
+        root = k.data_root()
+        tr, va = k.submission_split(root, {"use_all_train": False})
+        ann = root / "train" / "annotations"
+        anns = {p: k.parse(ann / f"{p}.xml") for p in tr + va}
+        yaml = k.materialize(cand, k.frame_index(root, "train", tr + va), tr, va, anns, tmp / "ds")
+        d = check_det_dataset(str(yaml))
+        args = get_cfg(overrides=dict(imgsz=256, mosaic=1.0, hsv_h=0, hsv_s=0, hsv_v=0))
+        ds = RTDETRDataset(img_path=d["train"], imgsz=256, batch_size=2, augment=True, hyp=args,
+                           rect=False, cache=False, single_cls=False, prefix="", classes=None,
+                           data=d, fraction=1.0)
+        patched = Mosaic.apply_image
+        orig = patched._hod26_orig
+        cap = []
+
+        def capture(self, labels, params=None):
+            cap.append((self, copy.deepcopy(labels), copy.deepcopy(params)))
+            return orig(self, labels, params)
+
+        Mosaic.apply_image = capture
+        try:
+            for i in range(5):
+                ds[i]
+        finally:
+            Mosaic.apply_image = patched
+        same = []
+        for self_, lab, par in cap:
+            a = orig(self_, copy.deepcopy(lab), par)["img"].copy()
+            b = patched(self_, copy.deepcopy(lab), par)["img"].copy()
+            c = patched(self_, copy.deepcopy(lab), par)["img"]        # the buffer reused
+            same.append(np.array_equal(a, b) and np.array_equal(a, c))
+        check("mosaic canvas reuse: byte-identical to ultralytics' mosaic (buffer reused twice)",
+              bool(cap) and all(same), f"{sum(same)}/{len(cap)}")
+
+
 def main() -> int:
     import torch
 
@@ -185,6 +392,10 @@ def main() -> int:
         check("same channels but another split: refused, not silently used", refused, man["key"])
         for dirpath, dirnames, filenames in os.walk(mount):
             os.chmod(dirpath, 0o755)
+
+    ddp_worker_emulation(check)
+    smoke_checks(check)
+    mosaic_check(check)
 
     print(f"\n{len(fails)} failure(s)" if fails else "\nS3T-X end-to-end session passed")
     return 1 if fails else 0

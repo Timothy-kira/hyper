@@ -142,14 +142,39 @@ ultralytics 的 `runs/` 目录在 scratch 盘上，session 结束不会保存，
 - **"fused AdamW" 以前其实没开**：重建 optimizer 时，每个 param group 里已经带着 `fused=None`，它会覆盖构造函数传的 `fused=True`，但加速表照样显示 ON。现在逐个 group 设置，并且检查每个 group 都真的是 fused，否则直接报错。
 - 以前 best.pt 只在训练正常返回后才复制到输出目录，现在每次更新都复制。
 
+## 两次只在 GPU 上出现的问题，以及怎么在一开始就拦住（2026-09-23 下午）
+
+1. **第一次正式训练**（11:28）：加速表里 fp32 loss、SDPA、cudnn.benchmark 显示 off，速度只有 1.2 it/s。
+   - 原因：ultralytics 8.4 的 DDP 是**父进程**调用 `get_model` 建模，再用 cloudpickle 把模型传给 worker，worker 不会再调用 `get_model`。
+   - 查下来 SDPA 和 fp32 loss 其实跟着模型带过去了，加速表只是读了一个父进程里的标志；但 **S3T 的 `torch.compile` 在 pickle 时丢了，`cudnn.benchmark` 是进程级设置，在 worker 里也是关的**。
+   - 修复：新增 `ensure_accel()`，在 `setup_model` 里执行（worker 也会执行），重新打开这些加速；加速表改为读模型的实际状态，任何一项没开就报错。
+2. **第二次**（12:00）：刚开始训练就崩了，`'DistributedDataParallel' object has no attribute 'init_criterion'`。
+   - 原因：`build_optimizer` 调用时，模型已经被 DDP 包了一层。
+   - 修复：`ensure_accel` 先解开包装。
+
+**以后怎么在一开始就发现**：
+- **本地**：`tests/test_s3t_e2e.py` 的 `ddp_worker_emulation` 按 ultralytics 的真实做法，在 CPU 上走一遍 worker 路径：父进程建模 → cloudpickle → worker 调用 `setup_model` → 单进程 gloo 的真 DDP → `build_optimizer` → 一步前向和反向。它会读 worker 端的加速表。
+  - 上面两个问题，它在本地都能复现：去掉修复就失败，报错和 GPU 上一模一样。
+- **GPU**：正式训练前先跑**冒烟**（`run_smoke`）：同一个 trainer、DDP、编译、AMP、D-FINE，用 40 帧训练 1 个 epoch，检查三件事：
+  - worker 的加速表全部 ON；
+  - 预热后的 s/it 不超过 0.82（探针 0.51 的 1.6 倍）；
+  - 保存和验证正常。
+  - 通过打印 `SMOKE ok: x s/it ...`，失败打印 `SMOKE FAILED: ...` 并停止。**约 3 分钟就能知道**，不用等渲染完、跑完一个 epoch。
+- **渲染单独成 notebook**：`zetaoxia/hod26-s3t-render`，只用 CPU（`python3 tools/s3t_round.py --render-only --slug <账号>/hod26-s3t-render`）。
+  - 输出 `ds_<key>/` 和 `render_manifest.json`，manifest 里的指纹覆盖通道、增强、重复采样和 train/val 划分。
+  - 训练 kernel 挂上它（`--render-kernel <账号>/hod26-s3t-render`），直接用渲染好的数据，省掉约 6.5 分钟；配置对不上就在 preflight 报错。
+- **数据加载提速**：mosaic 画布改为每个加载进程复用一块缓冲区，不再每个样本新分配 67 MB。单核每个样本从 173 ms 降到 106 ms，输出逐字节一致。加速表里有这一行。
+- 每个 epoch 的日志多了两张卡的 GPU 利用率，用来判断瓶颈在 GPU 还是数据加载。
+
 ## 你要做的（等 MAE v3 跑完）
 
 1. **检查额度**：约 11–12 小时 GPU。
 2. **确认能打开数据集** `xishengfeng/hod26-planar`。
 3. 生成并上传检测 kernel：
    ```bash
+   python3 tools/s3t_round.py --render-only --slug <你的账号>/hod26-s3t-render   # 先渲染（CPU）
    python3 tools/s3t_round.py --slug <你的账号>/hod26-s3t-detr --arch xca \
-       --mae-kernel zetaoxia/hod26-s3t-mae-pretrain3
+       --mae-kernel zetaoxia/hod26-s3t-mae-pretrain3 --render-kernel <你的账号>/hod26-s3t-render
    kaggle kernels push -p kernels/s3t_detr/build
    ```
    或者在网页上 Import `handoff/s3t/hod26_round.py`，Input 里挂两项：`hod26-planar` 和 notebook `zetaoxia/hod26-s3t-mae-pretrain3`（公开）。

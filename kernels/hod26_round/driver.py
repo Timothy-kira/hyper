@@ -1206,6 +1206,60 @@ def enable_transformer_accel(net, fp32_loss=True, nc=None):
 S3T_COMPILE_UNITS = ("SpectralBlock", "SpatialMix", "SpectralPool", "XCABlock")
 
 
+def _install_mosaic_canvas_reuse():
+    """Reuse one mosaic canvas per loader process instead of a fresh np.full.
+
+    A 4-image mosaic at imgsz 1024 with 16 channels allocates a 2048x2048x16
+    uint8 canvas (67 MB) per sample; the page faults of the fresh allocation
+    were 40% of a sample's loading time (67 of 165 ms on one core), and a T4
+    pair is fed by 4 vCPUs. The canvas lives only until RandomPerspective,
+    which always warps it into a new array (the mosaic border is never zero),
+    so a per-process buffer refilled with 114 gives byte-identical samples
+    (tested) at 1.6-1.7x the loader throughput. Installed at import, so the
+    DDP workers (which import this module) and their forked loader workers
+    all have it.
+    """
+    try:
+        import numpy as _np
+        from ultralytics.data.augment import Mosaic
+    except Exception:                                           # noqa: BLE001
+        return False
+    if getattr(Mosaic.apply_image, "_hod26_canvas", False):
+        return True
+    orig = Mosaic.apply_image
+
+    def apply_image(self, labels, params=None):
+        if self.n != 4 or params is None or "layout" not in params:
+            return orig(self, labels, params)
+        shape = (self.imgsz * 2, self.imgsz * 2, labels["img"].shape[2])
+        buf = self.__dict__.get("_hod26_buf")
+        if buf is None or buf.shape != shape:
+            buf = self.__dict__["_hod26_buf"] = _np.empty(shape, dtype=_np.uint8)
+        buf.fill(114)
+        for item in params["layout"]:
+            img = item["labels_patch"]["img"]
+            buf[item["y1a"]:item["y2a"], item["x1a"]:item["x2a"]] = \
+                img[item["y1b"]:item["y2b"], item["x1b"]:item["x2b"]]
+        labels["img"] = buf
+        return labels
+
+    apply_image._hod26_canvas = True
+    apply_image._hod26_orig = orig
+    Mosaic.apply_image = apply_image
+    return True
+
+
+def mosaic_canvas_patched():
+    try:
+        from ultralytics.data.augment import Mosaic
+        return bool(getattr(Mosaic.apply_image, "_hod26_canvas", False))
+    except Exception:                                           # noqa: BLE001
+        return False
+
+
+_install_mosaic_canvas_reuse()
+
+
 def ensure_accel(net, nc=None, fp32_loss=True, compile_blocks=False):
     """(Re)apply every acceleration and report what is *actually* in effect.
 
@@ -1219,6 +1273,10 @@ def ensure_accel(net, nc=None, fp32_loss=True, compile_blocks=False):
     table, which read a flag set in the parent, said nothing was wrong.
     """
     import torch
+    # build_optimizer runs after ultralytics has wrapped the model in DDP; the
+    # first S3T-X session with this function died on the wrapper's missing
+    # init_criterion. Everything below acts on the model itself.
+    net = getattr(net, "module", net)
     torch.backends.cudnn.benchmark = True
     enable_transformer_accel(net, fp32_loss=fp32_loss, nc=nc)
     front = getattr(getattr(net, "model", [None])[0], "front", None)
@@ -1236,6 +1294,7 @@ def ensure_accel(net, nc=None, fp32_loss=True, compile_blocks=False):
         "compiled": sum(m.__dict__.get("_compiled_call_impl") is not None for m in blocks),
         "blocks": len(blocks), "compile_wanted": bool(compile_blocks),
         "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "mosaic_canvas_reuse": mosaic_canvas_patched(),
     }
 
 
@@ -1562,11 +1621,14 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                  f"{done['compiled']}/{done['blocks']} blocks" if comp_ok is not None else "not requested"),
                 (f"fused {cls.__name__}", is_fused, "" if is_fused else "a group is not fused"),
                 ("cudnn.benchmark", done["cudnn_benchmark"], ""),
+                ("mosaic canvas reuse (data loader)", done["mosaic_canvas_reuse"],
+                 "" if done["mosaic_canvas_reuse"] else "patch not installed"),
                 ("non-deterministic kernels (fastest cudnn / grid_sample)",
                  not bool(torch.backends.cudnn.deterministic),
                  "deterministic=True in the candidate" if torch.backends.cudnn.deterministic else ""),
                 ("FlashAttention / TF32 / bf16", False, "not supported on T4 (sm75)"),
             ]
+            self.__dict__["_hod26_accel_table"] = [(n, bool(on), why) for n, on, why in table]
             if is_main_rank():
                 log("  acceleration table:")
                 for name, on, why in table:
@@ -1575,7 +1637,8 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                 raise RuntimeError("fused optimizer requested but a parameter group is not fused")
             missing = [n for n, ok in (("fp32 loss", done["fp32_loss"] or not accel.get("fp32_loss", True)),
                                        ("SDPA attention", sdpa_ok), ("cudnn.benchmark", done["cudnn_benchmark"]),
-                                       ("S3T torch.compile", comp_ok is not False)) if not ok]
+                                       ("S3T torch.compile", comp_ok is not False),
+                                       ("mosaic canvas reuse", done["mosaic_canvas_reuse"])) if not ok]
             if missing:
                 raise RuntimeError(f"accelerations requested but not in effect in this process: {missing}")
             if accel.get("require_amp") and not getattr(self, "amp", False):
@@ -2123,8 +2186,85 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
     return state
 
 
+def attach_speed_probe(model, path, skip=4):
+    """The training process writes its own seconds/iteration, peak memory and
+    acceleration table to `path` at the end of the first epoch (rank 0).
+    Registered as callbacks, so it travels to the DDP workers with them."""
+    stamps = []
+
+    def on_batch(trainer):
+        if is_main_rank():
+            stamps.append(time.time())
+
+    def on_epoch(trainer):
+        if not is_main_rank() or Path(path).exists():
+            return
+        import statistics
+        import torch
+        d = [b - a for a, b in zip(stamps[skip:], stamps[skip + 1:])]
+        rec = {"iterations": len(stamps), "s_per_it": statistics.median(d) if d else None,
+               "peak_gb": (torch.cuda.max_memory_allocated() / 2**30) if torch.cuda.is_available() else 0.0,
+               "table": trainer.__dict__.get("_hod26_accel_table") or [],
+               "world": int(os.environ.get("WORLD_SIZE", 1))}
+        Path(path).write_text(json.dumps(rec, default=str))
+
+    model.add_callback("on_train_batch_end", on_batch)
+    model.add_callback("on_train_epoch_end", on_epoch)
+
+
+def run_smoke(cand, index, train_ids, val_ids, anns, sub):
+    """A few minutes on the real GPUs through the real training path, first.
+
+    Both GPU-only failures of the S3T-X run surfaced only after the full render
+    and model build (a crash in the DDP worker; accelerations silently absent
+    in it). This trains the same candidate -- same trainer, DDP, compile, AMP,
+    D-FINE -- on 40 frames for one epoch and checks, before the long run:
+    the worker's acceleration table (build_optimizer already refuses a missing
+    one), seconds per iteration after the compile warm-up against the probe's
+    0.51 s/step, and that saving and validation work. No fallback: a failure
+    stops the session with the numbers, after ~3 minutes instead of hours.
+    """
+    import copy
+    sc = copy.deepcopy(cand)
+    sc["train"]["epochs"] = 1
+    sc["require_resume"] = False
+    speed = WORK / "smoke_speed.json"
+    speed.unlink(missing_ok=True)
+    limit = float(sub.get("smoke_max_s_per_it", 0.82))
+    t0 = time.time()
+    log(f"SMOKE: 1 epoch on {min(40, len(train_ids))} frames through the real training path")
+    try:
+        run_candidate(sc, index, train_ids[:40], val_ids[:8], anns, "smoke",
+                      root=SCRATCH / "ds_smoke", prerendered=False, speed_file=speed)
+        rec = json.loads(speed.read_text()) if speed.exists() else None
+        if rec is None:
+            raise RuntimeError("the training process wrote no speed record")
+        off = [n for n, on, why in rec["table"]
+               if not on and why != "not requested"
+               and not n.startswith("FlashAttention")
+               and not (n.startswith("AMP") and not sc["train"].get("amp"))]
+        spi = rec.get("s_per_it")
+        if off:
+            raise RuntimeError(f"accelerations off in the training process: {off}")
+        if spi is None:
+            raise RuntimeError(f"too few iterations to time ({rec['iterations']})")
+        if spi > limit:
+            raise RuntimeError(f"{spi:.3f} s/it after warm-up, over the {limit:.2f} s/it limit "
+                               f"(probe: 0.51 s/step on one T4) -- not starting the long run")
+        log(f"SMOKE ok: {spi:.3f} s/it after warm-up ({rec['iterations']} its, {rec['world']} GPU), "
+            f"accel all ON, peak {rec['peak_gb']:.2f} GB/card, {time.time() - t0:.0f}s")
+    except Exception as exc:
+        log(f"SMOKE FAILED: {type(exc).__name__}: {str(exc)[:600]}")
+        raise
+    finally:
+        shutil.rmtree(SCRATCH / "ds_smoke", ignore_errors=True)
+        shutil.rmtree(RUNS / "smoke", ignore_errors=True)
+        for f in WORK.glob("smoke_*"):
+            f.unlink(missing_ok=True)
+
+
 def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
-                  reserve_seconds=300, root=None, prerendered=True):
+                  reserve_seconds=300, root=None, prerendered=True, speed_file=None):
 
     root = root or SCRATCH / f"ds_{channels_key(cand)}"
     log(f"  scratch {SCRATCH} ({free_gb(SCRATCH):.1f} GB free), "
@@ -2221,6 +2361,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
         + (f"DDP across {list(range(gpus))}" if use_ddp else "single card")
         + f", batch {batch} ({tr['batch']}/card)")
     log_state = attach_epoch_log(model, tag, budget_seconds, reserve_seconds)
+    if speed_file is not None:
+        attach_speed_probe(model, speed_file)
     results = model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=batch,
         lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=close_mosaic,
@@ -2860,6 +3002,8 @@ def run_submission(round_cfg):
     budget = float(round_cfg["submit"].get("session_hours", 0) or 0) * 3600
     reserve = 1800 if want else 300
 
+    if round_cfg["submit"].get("smoke", True) and visible_gpus() > 0:
+        run_smoke(cand, index, train_ids, val_ids, anns, round_cfg["submit"])
     scores, _, weights = run_candidate(cand, index, train_ids, val_ids, anns, "final",
                                        budget_seconds=budget, reserve_seconds=reserve)
     note = " (optimistic: seen in training)" if round_cfg["submit"].get("use_all_train", True) else ""

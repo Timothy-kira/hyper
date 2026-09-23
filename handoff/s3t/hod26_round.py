@@ -1922,7 +1922,8 @@ ROUND_CONFIG = json.loads(r'''
     "use_all_train": false,
     "predict": true,
     "session_hours": 11.0,
-    "require_gpus": 2
+    "require_gpus": 2,
+    "render_only": false
   }
 }
 ''')
@@ -2344,6 +2345,98 @@ def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
         f"nc: {len(CLASSES)}\nnames: {json.dumps(CLASSES)}\n"
     )
     return yaml
+
+
+def render_fingerprint(cand, train_ids, val_ids):
+    """Everything a rendered dataset depends on: channels, augmentation, repeat
+    factors and the exact split. channels_key names the directory; this is
+    what a prerendered one must match to be used."""
+    spec = {"channels": cand["channels"], "augment": cand.get("augment", {}),
+            "repeat_threshold": float(cand["train"].get("repeat_threshold", 0.0)),
+            "train": sorted(int(i) for i in train_ids), "val": sorted(int(i) for i in val_ids)}
+    return hashlib.sha1(json.dumps(spec, sort_keys=True).encode()).hexdigest()
+
+
+def find_prerendered(cand, train_ids, val_ids):
+    """A dataset rendered by the render notebook (render_only), mounted under INPUT.
+
+    None when none is attached (render here, as before). A mounted one for this
+    channel spec whose fingerprint differs is an error: silently training on a
+    render made for another configuration is the failure this guards.
+    """
+    key = channels_key(cand)
+    want = render_fingerprint(cand, train_ids, val_ids)
+    for man in sorted(INPUT.rglob("render_manifest.json")) if INPUT.exists() else []:
+        try:
+            m = json.loads(man.read_text())
+        except Exception:                                        # noqa: BLE001
+            continue
+        if m.get("key") != key:
+            continue
+        if m.get("fingerprint") != want:
+            raise RuntimeError(
+                f"prerendered dataset {man.parent} is for a different configuration "
+                f"(fingerprint {m.get('fingerprint', '?')[:12]} != {want[:12]}): its "
+                f"channels/augment/split do not match this run. Re-run the render "
+                f"notebook with this candidate, or detach it to render here.")
+        return man.parent
+    return None
+
+
+def adopt_prerendered(src, root):
+    """Use a mounted render: images linked (read-only input), labels copied so
+    ultralytics can write its label cache beside them."""
+    if root.exists():
+        shutil.rmtree(root)
+    root.mkdir(parents=True)
+    (root / "images").mkdir()
+    for split in ("train", "val"):
+        (root / "images" / split).symlink_to(src / "images" / split, target_is_directory=True)
+    shutil.copytree(src / "labels", root / "labels")
+    for c in (root / "labels").glob("*.cache"):
+        c.unlink()
+    text = (src / "data.yaml").read_text().splitlines()
+    text = [f"path: {root}" if ln.startswith("path:") else ln for ln in text]
+    (root / "data.yaml").write_text("\n".join(text) + "\n")
+    m = json.loads((src / "render_manifest.json").read_text())
+    log(f"  using prerendered dataset {src} ({m.get('counts')}, rendered in "
+        f"{m.get('seconds', 0):.0f}s by the render notebook): no rendering here")
+    return root / "data.yaml"
+
+
+def submission_split(root, sub):
+    """(train_ids, val_ids) for a submission run -- the render notebook, the
+    preflight and the training all derive it here, so their fingerprints agree."""
+    ann_dir = root / "train" / "annotations"
+    ids = require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
+    train_ids, val_ids = split_ids(ids)
+    if sub.get("use_all_train", True):
+        train_ids, val_ids = ids, val_ids[:60]
+    return train_ids, val_ids
+
+
+def run_render(round_cfg):
+    """render_only: materialise the submission candidate's dataset into the
+    output, with a manifest, for the training kernel to mount."""
+    sub = round_cfg["submit"]
+    cand = sub["candidate"]
+    root = data_root()
+    train_ids, val_ids = submission_split(root, sub)
+    ann_dir = root / "train" / "annotations"
+    anns = {pid: parse(ann_dir / f"{pid}.xml") for pid in set(train_ids) | set(val_ids)}
+    index = frame_index(root, "train", sorted(set(train_ids) | set(val_ids)))
+    out = WORK / f"ds_{channels_key(cand)}"
+    t0 = time.time()
+    materialize(cand, index, train_ids, val_ids, anns, out)
+    counts = {sp: len(list((out / "images" / sp).glob("*.tiff"))) + len(list((out / "images" / sp).glob("*.png")))
+              for sp in ("train", "val")}
+    (out / "render_manifest.json").write_text(json.dumps({
+        "key": channels_key(cand), "fingerprint": render_fingerprint(cand, train_ids, val_ids),
+        "counts": counts, "seconds": time.time() - t0, "channels": cand["channels"],
+        "augment": cand.get("augment", {})}, indent=1))
+    for c in (out / "labels").glob("*.cache"):
+        c.unlink()
+    log(f"RENDER DONE: {out.name} {counts} in {time.time() - t0:.0f}s")
 
 
 # ------------------------------------------------------------ evaluate ------
@@ -3040,6 +3133,101 @@ def enable_transformer_accel(net, fp32_loss=True, nc=None):
     return {"mha_to_sdpa": n_mha, "fp32_loss": wrapped}
 
 
+S3T_COMPILE_UNITS = ("SpectralBlock", "SpatialMix", "SpectralPool", "XCABlock")
+
+
+def _install_mosaic_canvas_reuse():
+    """Reuse one mosaic canvas per loader process instead of a fresh np.full.
+
+    A 4-image mosaic at imgsz 1024 with 16 channels allocates a 2048x2048x16
+    uint8 canvas (67 MB) per sample; the page faults of the fresh allocation
+    were 40% of a sample's loading time (67 of 165 ms on one core), and a T4
+    pair is fed by 4 vCPUs. The canvas lives only until RandomPerspective,
+    which always warps it into a new array (the mosaic border is never zero),
+    so a per-process buffer refilled with 114 gives byte-identical samples
+    (tested) at 1.6-1.7x the loader throughput. Installed at import, so the
+    DDP workers (which import this module) and their forked loader workers
+    all have it.
+    """
+    try:
+        import numpy as _np
+        from ultralytics.data.augment import Mosaic
+    except Exception:                                           # noqa: BLE001
+        return False
+    if getattr(Mosaic.apply_image, "_hod26_canvas", False):
+        return True
+    orig = Mosaic.apply_image
+
+    def apply_image(self, labels, params=None):
+        if self.n != 4 or params is None or "layout" not in params:
+            return orig(self, labels, params)
+        shape = (self.imgsz * 2, self.imgsz * 2, labels["img"].shape[2])
+        buf = self.__dict__.get("_hod26_buf")
+        if buf is None or buf.shape != shape:
+            buf = self.__dict__["_hod26_buf"] = _np.empty(shape, dtype=_np.uint8)
+        buf.fill(114)
+        for item in params["layout"]:
+            img = item["labels_patch"]["img"]
+            buf[item["y1a"]:item["y2a"], item["x1a"]:item["x2a"]] = \
+                img[item["y1b"]:item["y2b"], item["x1b"]:item["x2b"]]
+        labels["img"] = buf
+        return labels
+
+    apply_image._hod26_canvas = True
+    apply_image._hod26_orig = orig
+    Mosaic.apply_image = apply_image
+    return True
+
+
+def mosaic_canvas_patched():
+    try:
+        from ultralytics.data.augment import Mosaic
+        return bool(getattr(Mosaic.apply_image, "_hod26_canvas", False))
+    except Exception:                                           # noqa: BLE001
+        return False
+
+
+_install_mosaic_canvas_reuse()
+
+
+def ensure_accel(net, nc=None, fp32_loss=True, compile_blocks=False):
+    """(Re)apply every acceleration and report what is *actually* in effect.
+
+    Idempotent, and called where the training process sets its model up
+    (HOD26Trainer.setup_model), because under DDP that is not where the model
+    was built: ultralytics builds it in the parent with get_model and hands each
+    worker a cloudpickled copy. The SDPA class swap and the fp32 criterion
+    travel with the model; cudnn.benchmark is a per-process flag and
+    nn.Module.compile's compiled call is not pickled. The first S3T-X session
+    trained that way -- S3T blocks eager, cudnn not autotuning -- while its
+    table, which read a flag set in the parent, said nothing was wrong.
+    """
+    import torch
+    # build_optimizer runs after ultralytics has wrapped the model in DDP; the
+    # first S3T-X session with this function died on the wrapper's missing
+    # init_criterion. Everything below acts on the model itself.
+    net = getattr(net, "module", net)
+    torch.backends.cudnn.benchmark = True
+    enable_transformer_accel(net, fp32_loss=fp32_loss, nc=nc)
+    front = getattr(getattr(net, "model", [None])[0], "front", None)
+    enc = getattr(front, "enc", None)
+    blocks = [m for m in enc.modules() if type(m).__name__ in S3T_COMPILE_UNITS] if enc is not None else []
+    if compile_blocks:
+        for m in blocks:
+            if m.__dict__.get("_compiled_call_impl") is None:
+                m.compile()
+    mods = list(net.modules())
+    return {
+        "sdpa_mha": sum(isinstance(m, SDPAMultiheadAttention) for m in mods),
+        "plain_mha": sum(type(m) is torch.nn.MultiheadAttention for m in mods),
+        "fp32_loss": isinstance(getattr(net, "criterion", None), FP32Criterion),
+        "compiled": sum(m.__dict__.get("_compiled_call_impl") is not None for m in blocks),
+        "blocks": len(blocks), "compile_wanted": bool(compile_blocks),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+        "mosaic_canvas_reuse": mosaic_canvas_patched(),
+    }
+
+
 def install_spectral_adapter(net, n_bands, projection=None, ckpt_name=None,
                              srf_k=0, srf_width=2.0, stem_src=None, kind="mixer", **s3t):
     if kind == "s3t":
@@ -3322,6 +3510,16 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
     """
 
     class HOD26Trainer(base_cls):
+        def setup_model(self):
+            # Runs in the process that trains -- a DDP worker included, where
+            # get_model never ran (see ensure_accel).
+            ckpt = super().setup_model()
+            if accel:
+                self.__dict__["_hod26_accel"] = ensure_accel(
+                    self.model, nc=self.data["nc"], fp32_loss=accel.get("fp32_loss", True),
+                    compile_blocks=bool(adapter and adapter.get("compile_blocks")))
+            return ckpt
+
         def build_optimizer(self, *args, **kwargs):
             opt = super().build_optimizer(*args, **kwargs)
             if not accel or not accel.get("fused_optimizer"):
@@ -3338,26 +3536,41 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                 g["fused"], g["foreach"] = True, None
             fused = cls(opt.param_groups, lr=opt.defaults["lr"], fused=True)
             is_fused = all(g.get("fused") is True for g in fused.param_groups)
-            done = getattr(self, "_hod26_accel", {}) or {}
+            # What this process's model actually has (ensure_accel), not a flag.
+            done = ensure_accel(self.model, nc=self.data["nc"], fp32_loss=accel.get("fp32_loss", True),
+                                compile_blocks=bool(adapter and adapter.get("compile_blocks")))
+            sdpa_ok = done["sdpa_mha"] > 0 and done["plain_mha"] == 0
+            comp_ok = done["compiled"] == done["blocks"] > 0 if done["compile_wanted"] else None
             table = [
                 ("AMP fp16 (+GradScaler)", bool(getattr(self, "amp", False)),
                  "ultralytics check_amp result" if not getattr(self, "amp", False) else ""),
-                ("loss + Hungarian matching in fp32", bool(done.get("fp32_loss")), ""),
-                ("RT-DETR attention via SDPA", done.get("mha_to_sdpa", 0) > 0,
-                 f"{done.get('mha_to_sdpa', 0)} nn.MultiheadAttention swapped"),
+                ("loss + Hungarian matching in fp32", done["fp32_loss"], ""),
+                ("RT-DETR attention via SDPA", sdpa_ok,
+                 f"{done['sdpa_mha']} SDPA, {done['plain_mha']} plain nn.MultiheadAttention"),
+                ("S3T blocks torch.compile", bool(comp_ok),
+                 f"{done['compiled']}/{done['blocks']} blocks" if comp_ok is not None else "not requested"),
                 (f"fused {cls.__name__}", is_fused, "" if is_fused else "a group is not fused"),
-                ("cudnn.benchmark", bool(torch.backends.cudnn.benchmark), ""),
+                ("cudnn.benchmark", done["cudnn_benchmark"], ""),
+                ("mosaic canvas reuse (data loader)", done["mosaic_canvas_reuse"],
+                 "" if done["mosaic_canvas_reuse"] else "patch not installed"),
                 ("non-deterministic kernels (fastest cudnn / grid_sample)",
                  not bool(torch.backends.cudnn.deterministic),
                  "deterministic=True in the candidate" if torch.backends.cudnn.deterministic else ""),
                 ("FlashAttention / TF32 / bf16", False, "not supported on T4 (sm75)"),
             ]
+            self.__dict__["_hod26_accel_table"] = [(n, bool(on), why) for n, on, why in table]
             if is_main_rank():
                 log("  acceleration table:")
                 for name, on, why in table:
                     log(f"    {'ON ' if on else 'off'}  {name}" + (f"  ({why})" if why else ""))
             if not is_fused:
                 raise RuntimeError("fused optimizer requested but a parameter group is not fused")
+            missing = [n for n, ok in (("fp32 loss", done["fp32_loss"] or not accel.get("fp32_loss", True)),
+                                       ("SDPA attention", sdpa_ok), ("cudnn.benchmark", done["cudnn_benchmark"]),
+                                       ("S3T torch.compile", comp_ok is not False),
+                                       ("mosaic canvas reuse", done["mosaic_canvas_reuse"])) if not ok]
+            if missing:
+                raise RuntimeError(f"accelerations requested but not in effect in this process: {missing}")
             if accel.get("require_amp") and not getattr(self, "amp", False):
                 raise RuntimeError("AMP was requested but ultralytics turned it off "
                                    "(check_amp failed); stopping instead of training in fp32")
@@ -3829,6 +4042,13 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
                                                 box.maps[box.ap_class_index])}
         except Exception:
             rec["per_class"] = {}
+        # Mean GPU utilisation over the epoch, per card: high means the GPU
+        # is the limit, low means the data loader (4 vCPUs for 2 ranks) is.
+        g = state.get("_gpu") or []
+        if g:
+            n = min(len(x) for x in g)
+            rec["gpu_util"] = [round(sum(x[i] for x in g) / len(g)) for i in range(n)]
+            g.clear()
         drift = adapter_drift(trainer)
         if drift:
             rec["adapter_drift"] = round(drift["rel"], 6)
@@ -3845,6 +4065,7 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
             f"mAP50-95 {m.get('metrics/mAP50-95(B)', float('nan')):.4f}  "
             f"lr {next(iter(rec['lr'].values()), float('nan')):.2e}  "
             f"{rec['seconds']:.0f}s"
+            + (f"  gpu {rec['gpu_util']}%" if rec.get("gpu_util") else "")
             + (f"  drift {drift['rel']:.4%}" if drift else ""))
 
         if rec["final_eval"]:
@@ -3867,6 +4088,27 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
     def announce(trainer):
         log(f"  training starts at epoch {trainer.start_epoch + 1} of "
             f"{trainer.epochs} (resume={bool(trainer.resume)})")
+        if is_main_rank() and "_gpu" not in state:
+            # Started here, in the process that trains: the callbacks are
+            # pickled to the DDP workers before training, and a thread is not.
+            import subprocess
+            import threading
+            samples = state.setdefault("_gpu", [])
+
+            def sample():
+                while True:
+                    try:
+                        out = subprocess.run(["nvidia-smi", "--query-gpu=utilization.gpu",
+                                              "--format=csv,noheader,nounits"],
+                                             capture_output=True, text=True, timeout=5).stdout
+                        vals = [float(v) for v in out.split()]
+                        if vals:
+                            samples.append(vals)
+                    except Exception:                           # noqa: BLE001
+                        pass
+                    time.sleep(5)
+
+            threading.Thread(target=sample, daemon=True).start()
 
     model.add_callback("on_fit_epoch_end", record)
     model.add_callback("on_train_start", announce)
@@ -3874,13 +4116,92 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
     return state
 
 
-def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
-                  reserve_seconds=300):
+def attach_speed_probe(model, path, skip=4):
+    """The training process writes its own seconds/iteration, peak memory and
+    acceleration table to `path` at the end of the first epoch (rank 0).
+    Registered as callbacks, so it travels to the DDP workers with them."""
+    stamps = []
 
-    root = SCRATCH / f"ds_{channels_key(cand)}"
+    def on_batch(trainer):
+        if is_main_rank():
+            stamps.append(time.time())
+
+    def on_epoch(trainer):
+        if not is_main_rank() or Path(path).exists():
+            return
+        import statistics
+        import torch
+        d = [b - a for a, b in zip(stamps[skip:], stamps[skip + 1:])]
+        rec = {"iterations": len(stamps), "s_per_it": statistics.median(d) if d else None,
+               "peak_gb": (torch.cuda.max_memory_allocated() / 2**30) if torch.cuda.is_available() else 0.0,
+               "table": trainer.__dict__.get("_hod26_accel_table") or [],
+               "world": int(os.environ.get("WORLD_SIZE", 1))}
+        Path(path).write_text(json.dumps(rec, default=str))
+
+    model.add_callback("on_train_batch_end", on_batch)
+    model.add_callback("on_train_epoch_end", on_epoch)
+
+
+def run_smoke(cand, index, train_ids, val_ids, anns, sub):
+    """A few minutes on the real GPUs through the real training path, first.
+
+    Both GPU-only failures of the S3T-X run surfaced only after the full render
+    and model build (a crash in the DDP worker; accelerations silently absent
+    in it). This trains the same candidate -- same trainer, DDP, compile, AMP,
+    D-FINE -- on 40 frames for one epoch and checks, before the long run:
+    the worker's acceleration table (build_optimizer already refuses a missing
+    one), seconds per iteration after the compile warm-up against the probe's
+    0.51 s/step, and that saving and validation work. No fallback: a failure
+    stops the session with the numbers, after ~3 minutes instead of hours.
+    """
+    import copy
+    sc = copy.deepcopy(cand)
+    sc["train"]["epochs"] = 1
+    sc["require_resume"] = False
+    speed = WORK / "smoke_speed.json"
+    speed.unlink(missing_ok=True)
+    limit = float(sub.get("smoke_max_s_per_it", 0.82))
+    t0 = time.time()
+    log(f"SMOKE: 1 epoch on {min(40, len(train_ids))} frames through the real training path")
+    try:
+        run_candidate(sc, index, train_ids[:40], val_ids[:8], anns, "smoke",
+                      root=SCRATCH / "ds_smoke", prerendered=False, speed_file=speed)
+        rec = json.loads(speed.read_text()) if speed.exists() else None
+        if rec is None:
+            raise RuntimeError("the training process wrote no speed record")
+        off = [n for n, on, why in rec["table"]
+               if not on and why != "not requested"
+               and not n.startswith("FlashAttention")
+               and not (n.startswith("AMP") and not sc["train"].get("amp"))]
+        spi = rec.get("s_per_it")
+        if off:
+            raise RuntimeError(f"accelerations off in the training process: {off}")
+        if spi is None:
+            raise RuntimeError(f"too few iterations to time ({rec['iterations']})")
+        if spi > limit:
+            raise RuntimeError(f"{spi:.3f} s/it after warm-up, over the {limit:.2f} s/it limit "
+                               f"(probe: 0.51 s/step on one T4) -- not starting the long run")
+        log(f"SMOKE ok: {spi:.3f} s/it after warm-up ({rec['iterations']} its, {rec['world']} GPU), "
+            f"accel all ON, peak {rec['peak_gb']:.2f} GB/card, {time.time() - t0:.0f}s")
+    except Exception as exc:
+        log(f"SMOKE FAILED: {type(exc).__name__}: {str(exc)[:600]}")
+        raise
+    finally:
+        shutil.rmtree(SCRATCH / "ds_smoke", ignore_errors=True)
+        shutil.rmtree(RUNS / "smoke", ignore_errors=True)
+        for f in WORK.glob("smoke_*"):
+            f.unlink(missing_ok=True)
+
+
+def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
+                  reserve_seconds=300, root=None, prerendered=True, speed_file=None):
+
+    root = root or SCRATCH / f"ds_{channels_key(cand)}"
     log(f"  scratch {SCRATCH} ({free_gb(SCRATCH):.1f} GB free), "
         f"output {WORK} ({free_gb(WORK):.1f} GB free)")
-    yaml = materialize(cand, index, train_ids, val_ids, anns, root)
+    pre = find_prerendered(cand, train_ids, val_ids) if prerendered else None
+    yaml = (adopt_prerendered(pre, root) if pre is not None
+            else materialize(cand, index, train_ids, val_ids, anns, root))
     tr, inf = cand["train"], cand["infer"]
 
     # Defensive clamp: a candidate that reached here without normalization must
@@ -3970,6 +4291,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
         + (f"DDP across {list(range(gpus))}" if use_ddp else "single card")
         + f", batch {batch} ({tr['batch']}/card)")
     log_state = attach_epoch_log(model, tag, budget_seconds, reserve_seconds)
+    if speed_file is not None:
+        attach_speed_probe(model, speed_file)
     results = model.train(
         data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=batch,
         lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=close_mosaic,
@@ -4584,11 +4907,9 @@ def run_submission(round_cfg):
     ann_dir = root / "train" / "annotations"
     test_dir = root / "test" / "images"
 
-    ids = require_ids(sorted(int(p.stem) for p in ann_dir.glob("*.xml")), ann_dir)
-    train_ids, val_ids = split_ids(ids)
-    if round_cfg["submit"].get("use_all_train", True):
-        # Config was already selected on val; refit on everything for the final run.
-        train_ids, val_ids = ids, val_ids[:60]   # a token val set keeps YOLO happy
+    # use_all_train: config was already selected on val; refit on everything,
+    # with a token val set that keeps YOLO happy.
+    train_ids, val_ids = submission_split(root, round_cfg["submit"])
     log(f"submission fit: {len(train_ids)} train / {len(val_ids)} val")
 
     anns = {pid: parse(ann_dir / f"{pid}.xml") for pid in set(train_ids) | set(val_ids)}
@@ -4611,6 +4932,8 @@ def run_submission(round_cfg):
     budget = float(round_cfg["submit"].get("session_hours", 0) or 0) * 3600
     reserve = 1800 if want else 300
 
+    if round_cfg["submit"].get("smoke", True) and visible_gpus() > 0:
+        run_smoke(cand, index, train_ids, val_ids, anns, round_cfg["submit"])
     scores, _, weights = run_candidate(cand, index, train_ids, val_ids, anns, "final",
                                        budget_seconds=budget, reserve_seconds=reserve)
     note = " (optimistic: seen in training)" if round_cfg["submit"].get("use_all_train", True) else ""
@@ -4669,9 +4992,12 @@ def preflight(round_cfg):
     import shutil as _sh
     bad, note = [], []
 
+    render_only = bool((round_cfg.get("submit") or {}).get("render_only"))
     try:
         import torch
-        if not torch.cuda.is_available():
+        if render_only:
+            note.append("render only: no GPU needed")
+        elif not torch.cuda.is_available():
             bad.append("no GPU visible: the notebook's accelerator is off. "
                        "Settings -> Accelerator -> GPU T4 x2 before running.")
         else:
@@ -4765,7 +5091,16 @@ def preflight(round_cfg):
                     "Attached: " + ", ".join(q.name for q in srcs))
             else:
                 note.append(f"resume from {ck}")
-    if (cand.get("train") or {}).get("spectral_stem") == "s3t":
+    if cand and not render_only and not sub.get("weights_from"):
+        # A mounted render must be the one this run would make -- checked now,
+        # not after the MAE, the model and the DDP spawn.
+        try:
+            pre = find_prerendered(cand, *submission_split(data_root(), sub))
+            note.append(f"prerendered dataset {pre}" if pre else
+                        "no prerendered dataset attached: rendering here")
+        except Exception as exc:                                 # noqa: BLE001
+            bad.append(str(exc))
+    if (cand.get("train") or {}).get("spectral_stem") == "s3t" and not render_only:
         try:
             mae = find_mae_checkpoint((cand.get("train") or {}).get("s3t_mae_file"))
         except RuntimeError as exc:
@@ -4820,6 +5155,8 @@ def main():
     preflight(round_cfg)
 
     if round_cfg.get("submit"):
+        if round_cfg["submit"].get("render_only"):
+            return run_render(round_cfg)
         if round_cfg["submit"].get("weights_from"):
             return run_from_checkpoint(round_cfg)
         return run_submission(round_cfg)
