@@ -114,6 +114,61 @@ def encoder_checks():
     return enc
 
 
+def mae3_checks():
+    import torch
+    from hod26.s3t.front import level_features, observed_features
+    from hod26.s3t.mae3 import S3TMAE3
+    from hod26.s3t.xca import XCAEncoder
+
+    torch.manual_seed(0)
+    L = torch.rand(2, 16, 100, 140) * 1.2 - 0.1
+    a, b = observed_features(L), level_features(L)
+    check("observed_features == level_features away from the border",
+          float((a - b)[..., 31:-31, 31:-31].abs().max()) < 1e-5)
+    check("  level and shape identical everywhere", float((a[:, :2] - b[:, :2]).abs().max()) == 0.0)
+    vis = (torch.rand(2, 1, 100, 140) > 0.7).float()
+    bv = torch.ones(2, 16)
+    bv[:, 3] = 0
+    bv[1, 9] = 0
+    L2 = L + (1 - vis) * torch.randn_like(L) * 3
+    L2[:, 3] += 5
+    L2[1, 9] -= 2
+    d = (observed_features(L, vis, bv) - observed_features(L2, vis, bv)).abs().max()
+    check("features carry nothing of masked pixels or bands (v1/v2 leaks closed)", float(d) == 0.0,
+          f"{float(d):.2e}")
+    # the v1/v2 leak, for the record: one masked band is recoverable from shape
+    sh = L - L.mean(1, keepdim=True)
+    rec = 16 * (L[:, 0] - sh[:, 0]) - (L.sum(1) - L[:, 3])
+    check("  (v1/v2 features did leak it: masked band recovered exactly from shape)",
+          torch.allclose(rec, L[:, 3], atol=1e-4))
+
+    enc = XCAEncoder(dim=32, depth=2, heads=4, windows=(8, None))
+    mae = S3TMAE3(enc, dec_dim=32)
+    x = torch.rand(3, 16, 64, 96) * 1.2 - 0.1
+    loss, parts, pred, idx, bm = mae(x, ratio=0.6)
+    check("MAE v3 forward: finite loss, per-position prediction of 16 bands x 2x2 px",
+          bool(torch.isfinite(loss)) and tuple(pred.shape) == (3, 32 * 48, 16, 4), str(tuple(pred.shape)))
+    check("  v2's reference ratios are reported",
+          all(k in parts for k in ("band_vs_interp", "spat_vs_mean", "grey", "norm_s", "norm_b")))
+    loss.backward()
+    check("  every parameter gets a gradient (DDP)",
+          all(p_.grad is not None for p_ in mae.parameters() if p_.requires_grad),
+          str([n for n, p_ in mae.named_parameters() if p_.grad is None]))
+
+    # With the masks held fixed, nothing hidden reaches any prediction.
+    mae.eval()
+    fixed = mae.masks(3, 32, 48, 0.6, x.device)
+    mae.masks = lambda *a, **k: fixed
+    idx, bm, keep = fixed
+    kp = keep.view(3, 1, 32, 48).repeat_interleave(2, 2).repeat_interleave(2, 3)
+    x2 = x + (1 - kp) * torch.randn_like(x) * 4 + bm[:, :, None, None].float() * 3.0
+    with torch.no_grad():
+        p1, p2 = mae(x, 0.6)[2], mae(x2, 0.6)[2]
+    check("MAE v3: predictions independent of hidden pixels and bands", torch.allclose(p1, p2, atol=1e-5),
+          f"{float((p1 - p2).abs().max()):.2e}")
+    del mae.masks
+
+
 def detector_checks(enc):
     import torch
     from ultralytics.nn.tasks import RTDETRDetectionModel
@@ -226,6 +281,7 @@ def detector_checks(enc):
 
 def main() -> int:
     enc = encoder_checks()
+    mae3_checks()
     detector_checks(enc)
     print(f"\n{len(fails)} failure(s)" if fails else "\nall S3T-X checks passed")
     return 1 if fails else 0

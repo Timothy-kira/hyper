@@ -65,6 +65,46 @@ def level_features(level: torch.Tensor, inner: int = 31, outer: int = 63) -> tor
     return torch.stack([level, shape, level - ring], 1)
 
 
+def _box_sum(x: torch.Tensor, k: int) -> torch.Tensor:
+    """k x k window sums over (N, C, H, W), zero outside: two 1-D average pools."""
+    r = k // 2
+    y = F.avg_pool2d(x, (1, k), stride=1, padding=(0, r), count_include_pad=True)
+    return F.avg_pool2d(y, (k, 1), stride=1, padding=(r, 0), count_include_pad=True) * (k * k)
+
+
+def observed_features(level: torch.Tensor, vis: torch.Tensor | None = None,
+                      band_vis: torch.Tensor | None = None, inner: int = 31,
+                      outer: int = 63) -> torch.Tensor:
+    """(B, 16, H, W) aligned level -> (B, 3, 16, H, W) from the observed part only.
+
+    level, shape and contrast as in level_features, but every statistic is
+    taken over what is observed, so none of the three carries anything of a
+    masked pixel or band:
+      shape     level minus the mean of the *present* bands (band_vis, (B, 16));
+      contrast  level minus the mean of the *observed* pixels of the 31/63
+                annulus (vis, (B, 1, H, W)): a normalised convolution. Outside
+                the image counts as unobserved, so a border pixel's ring is the
+                part of it inside the image.
+    Masked pixels and bands come out as zero. With nothing masked this is the
+    detector's input; S3T-X is fine-tuned on exactly what it was pretrained on.
+    """
+    b, c, h, w = level.shape
+    level = level.float()
+    m = torch.ones(b, 1, h, w, device=level.device) if vis is None else vis.float()
+    bv = torch.ones(b, c, device=level.device) if band_vis is None else band_vis.float()
+    bv = bv[:, :, None, None]
+    obs = m * bv                                                       # (B, C, H, W)
+    lv = level * obs
+    mean_b = lv.sum(1, keepdim=True) / bv.sum(1, keepdim=True).clamp(min=1.0)
+    shape = (level - mean_b) * obs
+    num = _box_sum(lv, outer) - _box_sum(lv, inner)
+    den = _box_sum(m, outer) - _box_sum(m, inner)
+    ok = den > 0.5
+    ring = num / den.clamp(min=1.0)
+    contrast = torch.where(ok, level - ring, torch.zeros_like(level)) * obs
+    return torch.stack([lv, shape, contrast], 1)
+
+
 class S3TFront(nn.Module):
     """(B, 16, H, W) in [0, 1] -> (B, 3, H, W) for the pretrained stem.
 
@@ -267,7 +307,7 @@ class S3TXFront(nn.Module):
         if self.scale != 1.0:
             level = F.interpolate(level, scale_factor=self.scale, mode="bilinear",
                                   align_corners=False, antialias=True)
-        feats = level_features(level)
+        feats = observed_features(level)
         with torch.autocast("cuda", dtype=torch.float16, enabled=self.amp and x.is_cuda):
             if not self.train_encoder:
                 with torch.no_grad():

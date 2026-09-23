@@ -31,10 +31,10 @@ for cand in (HERE.parent / "src", HERE / "src"):
         sys.path.insert(0, str(cand))
 
 from hod26.cube import load_planar                      # noqa: E402
-from hod26.s3t.mae import S3TMAE                        # noqa: E402
-from hod26.s3t.mae2 import S3TMAE2                      # noqa: E402
-from hod26.s3t.preprocess import features               # noqa: E402
+from hod26.s3t.mae3 import build_mae                    # noqa: E402
+from hod26.s3t.preprocess import LEVEL_LO, LEVEL_SPAN, features, level_u8   # noqa: E402
 from hod26.s3t.spectral import SpectralEncoder          # noqa: E402
+from hod26.s3t.xca import XCAEncoder, build_encoder     # noqa: E402
 
 RANK = int(os.environ.get("RANK", 0))
 LOCAL = int(os.environ.get("LOCAL_RANK", 0))
@@ -98,6 +98,31 @@ class Crops(torch.utils.data.Dataset):
         return torch.from_numpy(np.stack(out)).half()
 
 
+class LevelCrops(Crops):
+    """MAE v3: k random crops of the aligned uint8 level -- the detector's input.
+
+    The features are computed on the GPU after masking (S3TMAE3), from the
+    visible part only; precomputing them here is what leaked in v1/v2.
+    """
+
+    def __getitem__(self, i):
+        rng = np.random.default_rng((self.seed, i, int(time.time() * 1e3) & 0xFFFF))
+        lv = level_u8(load_planar(self.files[i])).transpose(2, 0, 1)      # (16, H, W) uint8
+        _, h, w = lv.shape
+        c = self.crop
+        out = []
+        for _ in range(self.k):
+            y = int(rng.integers(0, h - c + 1))
+            x = int(rng.integers(0, w - c + 1))
+            p = lv[:, y:y + c, x:x + c]
+            if self.flip and rng.random() < 0.5:
+                p = p[..., ::-1]
+            if self.flip and rng.random() < 0.5:
+                p = p[..., ::-1, :]
+            out.append(np.ascontiguousarray(p))
+        return torch.from_numpy(np.stack(out))
+
+
 def sdpa_probe(device, hd):
     """Which SDPA kernels run on this GPU for our shapes (fp16, seq 16)."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -122,7 +147,9 @@ def compile_units(model):
     and spatial mix, in the encoder and the decoder."""
     from hod26.s3t.spectral import SpatialMix, SpectralBlock
     from hod26.s3t.mae2 import GlobalBlock
-    return [m for m in model.modules() if isinstance(m, (SpectralBlock, SpatialMix, GlobalBlock))]
+    from hod26.s3t.xca import XCABlock
+    return [m for m in model.modules()
+            if isinstance(m, (SpectralBlock, SpatialMix, GlobalBlock, XCABlock))]
 
 
 def compile_blocks(model, mode):
@@ -211,9 +238,13 @@ def main():
     ap.add_argument("--auto-batch", type=int, default=0,
                     help="0 (default): stop if --batch does not fit, naming the size that does; "
                          "1: halve until it fits")
-    ap.add_argument("--mae-version", type=int, default=1, choices=[1, 2],
+    ap.add_argument("--mae-version", type=int, default=1, choices=[1, 2, 3],
                     help="2: global-attention decoder, split spatial/spectral losses, "
-                         "1-4 band masks, 2x2 units, ratio curriculum (src/hod26/s3t/mae2.py)")
+                         "1-4 band masks, 2x2 units, ratio curriculum (src/hod26/s3t/mae2.py); "
+                         "3: the same objective for the S3T-X encoder, features computed after "
+                         "masking from the visible part only (src/hod26/s3t/mae3.py)")
+    ap.add_argument("--windows", default="16,16,0,0",
+                    help="v3: S3T-X window per block, 0 = global")
     ap.add_argument("--ratio-start", type=float, default=0.5, help="v2: mask ratio at the start")
     ap.add_argument("--ratio-end", type=float, default=0.75, help="v2: mask ratio after the curriculum")
     ap.add_argument("--curriculum", type=float, default=0.2,
@@ -274,7 +305,9 @@ def main():
     log(f"data: {root}  {len(files)} unlabelled frames = all official images "
         f"({n_tr} train + {len(files) - n_tr} test), no labels read, no generated images; "
         f"random {args.crop}px crops, flips {'on' if args.flip else 'off'}")
-    ds = Crops(files, args.crop, args.crops_per_frame, seed=RANK, flip=bool(args.flip))
+    v3 = args.mae_version == 3
+    ds = (LevelCrops if v3 else Crops)(files, args.crop, args.crops_per_frame, seed=RANK,
+                                       flip=bool(args.flip))
     sampler = torch.utils.data.DistributedSampler(ds, WORLD, RANK, shuffle=True, seed=0) if WORLD > 1 else None
     frames_per_step = max(1, args.batch // args.crops_per_frame)
     dl = torch.utils.data.DataLoader(
@@ -284,7 +317,12 @@ def main():
     log(f"loader: {args.workers} workers/rank, pin_memory={cuda}, persistent, "
         f"{frames_per_step} frames x {args.crops_per_frame} crops = {frames_per_step * args.crops_per_frame} crops/GPU/step")
 
-    enc = SpectralEncoder(dim=args.dim, depth=args.depth, heads=args.heads)
+    if v3:
+        wins = [int(v) for v in args.windows.split(",")]
+        enc = XCAEncoder(dim=args.dim, depth=args.depth, heads=args.heads, windows=wins)
+    else:
+        enc = SpectralEncoder(dim=args.dim, depth=args.depth, heads=args.heads)
+    enc_config = enc.config() if v3 else {"dim": args.dim, "depth": args.depth, "heads": args.heads}
     if args.init_encoder:
         src = args.init_encoder
         if src == "auto":
@@ -295,13 +333,14 @@ def main():
             src = str(hits[0])
         ck0 = torch.load(src, map_location="cpu", weights_only=True)
         cfg0 = ck0.get("config") or {}
-        if any(cfg0.get(k) not in (None, getattr(args, k)) for k in ("dim", "depth", "heads")):
+        if cfg0.get("arch", "tokens") != enc_config.get("arch", "tokens") or \
+                any(cfg0.get(k) not in (None, getattr(args, k)) for k in ("dim", "depth", "heads")):
             die(report, out, args.tag, "--init-encoder", f"{src} was trained with {cfg0}, "
                 f"this run asks for dim={args.dim} depth={args.depth} heads={args.heads}")
         enc.load_state_dict(ck0["encoder"], strict=True)
         report["init_encoder"] = {"path": src, "step": ck0.get("step")}
         log(f"encoder: continued from {src} (step {ck0.get('step')}), decoder freshly initialised")
-    model = (S3TMAE2(enc) if args.mae_version == 2 else S3TMAE(enc)).to(device)
+    model = build_mae(args.mae_version, enc).to(device)
     report["mae_version"] = args.mae_version
     # Only the conv weights: channels_last on a 4-D embedding Parameter would
     # just give DDP mismatched gradient strides.
@@ -311,13 +350,17 @@ def main():
     log("channels_last: on (conv weights)")
     n_par = sum(p.numel() for p in model.parameters())
     n_enc = sum(p.numel() for p in enc.parameters())
-    if args.mae_version == 2:
+    if v3:
+        mask_desc = (f"v3: S3T-X encoder (windows {enc.windows}), features from the visible part "
+                     f"only; 2x2-token units, ratio {args.ratio_start} -> {args.ratio_end} over the "
+                     f"first {args.curriculum:.0%}, 1-4 bands (contiguous 70%), global-attention decoder")
+    elif args.mae_version == 2:
         mask_desc = (f"v2: 2x2-token units, ratio {args.ratio_start} -> {args.ratio_end} over the first "
                      f"{args.curriculum:.0%}, 1-4 bands (contiguous 70%), global-attention decoder")
     else:
         mask_desc = "v1: mask 0.75 spatial (units of 4x4 tokens) + 0.15 contiguous bands"
     log(f"model: encoder {n_enc / 1e6:.2f}M params, MAE total {n_par / 1e6:.2f}M; {mask_desc}; "
-        f"encoder computes visible positions only")
+        + ("encoder dense, masked positions held at zero" if v3 else "encoder computes visible positions only"))
     enc_ids = {id(p) for p in enc.parameters()}
     groups = [{"params": [p for p in model.parameters() if id(p) in enc_ids], "name": "encoder"},
               {"params": [p for p in model.parameters() if id(p) not in enc_ids], "name": "decoder"}]
@@ -344,11 +387,12 @@ def main():
             ok = True
             try:
                 torch.cuda.reset_peak_memory_stats(device)
-                xp = torch.randn(bs, 3, 16, args.crop, args.crop, device=device)
+                xp = (torch.rand(bs, 16, args.crop, args.crop, device=device) if v3
+                      else torch.randn(bs, 3, 16, args.crop, args.crop, device=device))
                 with torch.autocast("cuda", dtype=amp_dtype):
                     # v2: the lowest ratio keeps the most positions visible,
                     # which is the step that needs the most memory.
-                    lp, *_ = (model(xp, ratio=args.ratio_start) if args.mae_version == 2 else model(xp))
+                    lp, *_ = (model(xp, ratio=args.ratio_start) if args.mae_version >= 2 else model(xp))
                 lp.backward()
             except torch.OutOfMemoryError:
                 ok = False
@@ -440,7 +484,7 @@ def main():
     def mask_ratio(step):
         """v2 curriculum, quantised to 0.05 so the compiled blocks see a handful
         of shapes, not a new one every step. Same on every rank (step, frac)."""
-        if args.mae_version != 2:
+        if args.mae_version < 2:
             return None
         p = frac if args.schedule == "time" else step / max(1, args.max_steps)
         r = args.ratio_start + (args.ratio_end - args.ratio_start) * min(1.0, p / max(args.curriculum, 1e-6))
@@ -462,6 +506,8 @@ def main():
             if step >= 20:
                 wait += time.time() - t_prev
             xb = xb.flatten(0, 1).to(device, non_blocking=True).float()
+            if v3:
+                xb = xb * (LEVEL_SPAN / 255.0) + LEVEL_LO             # uint8 -> aligned level
             for g in opt.param_groups:
                 mult = 1.0
                 if g.get("name") == "encoder":
@@ -537,7 +583,7 @@ def main():
                     if util and util.mean():
                         rate += f"  gpu-util {util.mean()}%"
                 mem = f"  mem {torch.cuda.max_memory_allocated(device) / 2**30:.2f}G" if cuda else ""
-                if args.mae_version == 2:
+                if args.mae_version >= 2:
                     body = (f"spatial {float(parts['norm_s']):.3f}  spectral {float(parts['norm_b']):.3f}  "
                             f"band/interp {float(parts['band_vs_interp']):.3f}  "
                             f"spat/mean {float(parts['spat_vs_mean']):.3f}  grey {float(parts['grey']):.2f}  "
@@ -561,8 +607,7 @@ def main():
                 dist.all_reduce(stop, op=dist.ReduceOp.MAX)
             frac = float(stop[1])
             if args.save_every_min and RANK == 0 and time.time() - last_save > 60 * args.save_every_min:
-                torch.save({"encoder": enc.state_dict(), "step": step,
-                            "config": {"dim": args.dim, "depth": args.depth, "heads": args.heads}},
+                torch.save({"encoder": enc.state_dict(), "step": step, "config": enc_config},
                            out / f"{args.tag}_encoder_latest.pt")
                 last_save = time.time()
                 log(f"saved {args.tag}_encoder_latest.pt at step {step}")
@@ -591,13 +636,11 @@ def main():
 
     if RANK == 0:
         ck = out / f"{args.tag}_mae.pt"
-        torch.save({"mae": model.state_dict(), "encoder": enc.state_dict(),
-                    "config": {"dim": args.dim, "depth": args.depth, "heads": args.heads},
+        torch.save({"mae": model.state_dict(), "encoder": enc.state_dict(), "config": enc_config,
                     "mae_version": args.mae_version, "step": step,
                     "init_encoder": report.get("init_encoder")}, ck)
         back = torch.load(ck, map_location="cpu", weights_only=True)
-        fresh_enc = SpectralEncoder(dim=args.dim, depth=args.depth, heads=args.heads)
-        fresh = S3TMAE2(fresh_enc) if args.mae_version == 2 else S3TMAE(fresh_enc)
+        fresh = build_mae(args.mae_version, build_encoder(back["config"]))
         fresh.load_state_dict(back["mae"])
         same = all(torch.equal(a.cpu(), b) for a, b in zip(model.state_dict().values(),
                                                            fresh.state_dict().values()))
@@ -609,8 +652,10 @@ def main():
             from PIL import Image
             model.eval()
             xb = ds[0][:1].to(device).float()
+            if v3:
+                xb = xb * (LEVEL_SPAN / 255.0) + LEVEL_LO
             with torch.no_grad(), torch.autocast(device.type, dtype=amp_dtype, enabled=cuda):
-                _, _, pred, idx, bm = (model(xb, ratio=args.ratio_end) if args.mae_version == 2
+                _, _, pred, idx, bm = (model(xb, ratio=args.ratio_end) if args.mae_version >= 2
                                        else model(xb))
             s = enc.stride
             gh, gw = xb.shape[-2] // s, xb.shape[-1] // s
@@ -618,7 +663,7 @@ def main():
             keep[idx[0]] = 1
             kp = keep.view(gh, 1, gw, 1).expand(gh, s, gw, s).reshape(xb.shape[-2:])
             rec = pred[0].float().view(gh, gw, 16, s, s).permute(2, 0, 3, 1, 4).reshape(16, *xb.shape[-2:])
-            lvl = xb[0, 0]
+            lvl = xb[0] if v3 else xb[0, 0]
             panels = [pseudo_rgb(lvl), pseudo_rgb(lvl * kp), pseudo_rgb(rec * (1 - kp) + lvl * kp)]
             Image.fromarray(np.concatenate(panels, 1)).resize(
                 (3 * 256, 256), Image.NEAREST).save(out / f"{args.tag}_recon.png")

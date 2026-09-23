@@ -27,6 +27,9 @@ SOURCES = [
     "src/hod26/s3t/spectral.py",
     "src/hod26/s3t/mae.py",
     "src/hod26/s3t/mae2.py",
+    "src/hod26/s3t/xca.py",
+    "src/hod26/s3t/front.py",
+    "src/hod26/s3t/mae3.py",
     "tools/train_s3t_mae.py",
 ]
 
