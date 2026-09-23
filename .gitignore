@@ -17,3 +17,4 @@ kernels/hod26_round/round_config.json
 runs/
 sample/
 work/
+kernels/s3t_smoke/build/
