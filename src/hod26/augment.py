@@ -45,14 +45,22 @@ def savgol_coeffs(window: int, polyorder: int) -> np.ndarray:
     return np.linalg.pinv(A)[0]
 
 
-def savgol_spectral(cube: np.ndarray, window: int = 5, polyorder: int = 2) -> np.ndarray:
+def savgol_spectral(cube: np.ndarray, window: int = 5, polyorder: int = 2,
+                    order=None) -> np.ndarray:
     """Smooth each pixel's spectrum along the band axis.
 
     Edges are handled by reflection, which keeps the endpoints from being pulled
-    toward zero the way zero-padding would.
+    toward zero the way zero-padding would. ``order`` lists the bands in
+    wavelength order when that differs from index order; the smoothing then
+    runs along it and the result is put back in index order.
     """
     if cube.shape[2] < window:
         return cube
+    if order is not None:
+        order = np.asarray(order)
+        out = np.empty(cube.shape, np.float32)
+        out[:, :, order] = savgol_spectral(cube[:, :, order], window, polyorder)
+        return out
     coeffs = savgol_coeffs(window, polyorder)
     half = window // 2
     padded = np.pad(cube.astype(np.float32), ((0, 0), (0, 0), (half, half)), mode="reflect")

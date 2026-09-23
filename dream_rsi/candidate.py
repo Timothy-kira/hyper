@@ -203,6 +203,7 @@ _BANDS_FOR_MODE = {
     "lda3": list(range(16)),
     "bandgroup3": list(range(16)),
     "srf3": list(range(16)),
+    "s3t_level": list(range(16)),
 }
 
 
@@ -241,7 +242,7 @@ def normalize(cfg: dict) -> dict:
     # Ultralytics builds the model with ch=data["channels"], so 16-band input
     # needs no patching -- but COCO weights cannot transfer into a 16-channel
     # stem, so that one layer trains from scratch while the rest is pretrained.
-    cfg["train"]["in_channels"] = 16 if cfg["channels"]["mode"] == "band_stack" else 3
+    cfg["train"]["in_channels"] = 16 if cfg["channels"]["mode"] in ("band_stack", "s3t_level") else 3
     # The adapter is a 16 -> 3 mixer in front of the pretrained stem, so it only
     # exists when the input is wider than the stem. Asking for it with a
     # 3-channel mode is a contradiction: the mode has already collapsed the

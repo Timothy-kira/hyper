@@ -198,6 +198,10 @@ def build_channels(cube, spec):
                           for i in range(3)])
     if mode == "bandsel":
         return np.dstack([stretch(cube[:, :, b], lo, hi) for b in BEST_BANDS])
+    if mode == "s3t_level":
+        # S3T's input: the 16 bands, log radiance, per-frame scaled and
+        # sub-pixel aligned, quantised on a fixed map the front end inverts.
+        return level_u8(cube)
     if mode == "band_stack":
         # Every band as its own input channel. Ultralytics reads this natively:
         # a multi-page TIFF is decoded with imdecodemulti and stacked on axis 2,
@@ -261,7 +265,10 @@ def class_donors(index, anns, ids, limit=200):
 def augment_cube(cube, boxes, aug, donors, pool, rng):
     """Apply the spectral and spatial operators a candidate asked for."""
     if aug.get("sg_window"):
-        cube = savgol_spectral(cube, aug["sg_window"], aug["sg_polyorder"])
+        # Smoothing is along wavelength, which is not mosaic order (bands 4 and
+        # 11 are out of place); sg_chain smooths along the measured chain.
+        cube = savgol_spectral(cube, aug["sg_window"], aug["sg_polyorder"],
+                               order=BAND_CHAIN if aug.get("sg_chain") else None)
     if aug.get("smote_alpha"):
         cube = spectral_smote(cube, boxes, donors, aug["smote_alpha"], rng)
     if aug.get("cutmix_prob") and pool:
@@ -651,8 +658,67 @@ def visible_gpus():
         return 0
 
 
+def find_mae_checkpoint():
+    """The S3T encoder pretrained by MAE, wherever its kernel output is mounted."""
+    hits = sorted(INPUT.rglob("*_mae.pt")) if INPUT.exists() else []
+    hits.sort(key=lambda p: (0 if "pretrain" in p.name else 1, str(p)))
+    return hits[0] if hits else None
+
+
+def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5,
+                      inject=(19, 14, 10), dim=64, depth=4, heads=4, **_):
+    """S3T encoder in front of the pretrained first block, plus side injections.
+
+    The encoder is loaded from the MAE checkpoint when one is given. inject
+    names the hybrid encoder's input projections (P3, P4, P5 in rtdetr-l); each
+    gets the pooled spectral features through a zero-initialised 1x1 conv.
+    """
+    import torch
+
+    block = net.model[0]
+    if isinstance(block, SpectralFront):
+        return False                      # already installed (resumed model)
+    cfg = {"dim": dim, "depth": depth, "heads": heads}
+    state = None
+    if mae_ckpt:
+        ck = torch.load(mae_ckpt, map_location="cpu", weights_only=True)
+        cfg.update(ck.get("config") or {})
+        state = ck["encoder"]
+    enc = SpectralEncoder(dim=cfg["dim"], depth=cfg["depth"], heads=cfg["heads"])
+    if state is not None:
+        missing, unexpected = enc.load_state_dict(state, strict=True), None
+        log(f"  S3T encoder: MAE weights from {mae_ckpt} (step {ck.get('step')})")
+    else:
+        log("  S3T encoder: NO pretrained weights -- random initialisation")
+    front = S3TFront(enc, projection=projection, scale=scale)
+    dev = next(block.parameters()).device
+    wrapper = SpectralFront(front, block).to(dev)
+    for attr in ("i", "f", "type", "np"):
+        if hasattr(block, attr):
+            setattr(wrapper, attr, getattr(block, attr))
+    net.model[0] = wrapper
+    for i in inject:
+        layer = net.model[i]
+        out_ch = [m for m in layer.modules() if isinstance(m, torch.nn.Conv2d)][-1].out_channels
+        net.model[i] = Inject(layer, front, out_ch).to(dev)
+    net.__dict__["_hod26_mixer"] = front.base
+    net.__dict__["_hod26_mixer_init"] = front.base.weight.detach().clone()
+    n_enc = sum(p.numel() for p in enc.parameters())
+    log(f"  S3T front: {n_enc / 1e6:.2f}M-param spectral Transformer at {scale}x input "
+        f"scale, 16->3 into the pretrained {type(block).__name__}, zero-init side "
+        f"injections at layers {list(inject)}")
+    return True
+
+
 def install_spectral_adapter(net, n_bands, projection=None, ckpt_name=None,
-                             srf_k=0, srf_width=2.0, stem_src=None):
+                             srf_k=0, srf_width=2.0, stem_src=None, kind="mixer", **s3t):
+    if kind == "s3t":
+        return install_s3t_front(net, n_bands=n_bands, projection=projection, **s3t)
+    return _install_mixer(net, n_bands, projection, ckpt_name, srf_k, srf_width, stem_src)
+
+
+def _install_mixer(net, n_bands, projection=None, ckpt_name=None,
+                   srf_k=0, srf_width=2.0, stem_src=None):
     """Put a band mixer in front of an untouched pretrained first block.
 
     Two shapes, selected by ``srf_k``:
@@ -1432,7 +1498,15 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
         # is trainable, so this is a starting point, not a commitment. It is
         # ignored entirely when srf_k selects the two-stage front end.
         proj = PDA_PROJECTIONS.get(str(tr.get("adapter_penalty", "0")), LDA_16_TO_3)
-        if tr.get("spectral_stem", "adapter") == "adapter":
+        if tr.get("spectral_stem") == "s3t":
+            mae = find_mae_checkpoint()
+            if mae is None and tr.get("s3t_require_pretrain", True):
+                raise RuntimeError("spectral_stem=s3t needs the MAE checkpoint "
+                                   f"(*_mae.pt) attached under {INPUT}")
+            adapter = {"kind": "s3t", "n_bands": tr["in_channels"], "projection": proj,
+                       "mae_ckpt": str(mae) if mae else None,
+                       "scale": float(tr.get("s3t_scale", 0.5))}
+        elif tr.get("spectral_stem", "adapter") == "adapter":
             adapter = {"n_bands": tr["in_channels"], "projection": proj,
                        "ckpt_name": tr["model"], "srf_k": tr.get("srf_k", 0),
                        "srf_width": tr.get("srf_width", 2.0)}
@@ -2256,6 +2330,15 @@ def preflight(round_cfg):
                     "Attached: " + ", ".join(q.name for q in srcs))
             else:
                 note.append(f"resume from {ck}")
+    if (cand.get("train") or {}).get("spectral_stem") == "s3t":
+        mae = find_mae_checkpoint()
+        if mae is None and (cand.get("train") or {}).get("s3t_require_pretrain", True):
+            bad.append("spectral_stem=s3t but no MAE checkpoint (*_mae.pt) is "
+                       "attached. Add the pretraining notebook's output "
+                       "(qwyi123/hod26-s3t-mae-pretrain) as an input. Attached: "
+                       + str([q.name for q in sorted(INPUT.glob('*'))]))
+        elif mae is not None:
+            note.append(f"S3T MAE encoder {mae}")
     if sub.get("weights_from"):
         if find_weights(sub["weights_from"]) is None:
             bad.append(f"weights_from={sub['weights_from']} not found under "

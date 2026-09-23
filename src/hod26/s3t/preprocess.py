@@ -103,3 +103,18 @@ def features(cube: np.ndarray, align: bool = True) -> np.ndarray:
     shape = L - L.mean(-1, keepdims=True)
     contrast = L - annulus_mean(L)
     return np.stack([L, shape, contrast]).transpose(0, 3, 1, 2).astype(np.float32)
+
+
+# Detection renders the aligned level into uint8 for ultralytics' TIFF loader,
+# which hands the network x = u8 / 255. A fixed affine map keeps it invertible:
+# level = x * LEVEL_SPAN + LEVEL_LO. Quantising the *log* level rather than the
+# linear radiance spends the 256 codes evenly across brightness ratios, so dark
+# grey objects keep as much resolution as bright ones.
+LEVEL_LO, LEVEL_SPAN = -0.25, 1.5
+
+
+def level_u8(cube: np.ndarray) -> np.ndarray:
+    """(H, W, 16) raw cube -> (H, W, 16) uint8 aligned level for rendering."""
+    L = align_bands(normalise_frame(cube))
+    q = np.round((L - LEVEL_LO) / LEVEL_SPAN * 255.0)
+    return np.clip(q, 0, 255).astype(np.uint8)
