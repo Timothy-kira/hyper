@@ -1249,6 +1249,45 @@ def _install_mosaic_canvas_reuse():
     return True
 
 
+def _install_amp_check_override():
+    """ultralytics' check_amp, overridable for runs that require AMP.
+
+    check_amp compares fp32 and fp16 inference of a *different* model (YOLO26n)
+    on one image and fails on any difference in the number of boxes. On a T4
+    with cudnn.benchmark that flips between processes: the S3T-X smoke passed it
+    and the long run, two minutes later in the same session, failed it -- and
+    would have trained in fp32 at half the speed had the run not refused. AMP
+    on *this* model is measured instead (probes and smokes: finite losses,
+    stable GradScaler), and its loss and Hungarian matching run in fp32. So when
+    HOD26_REQUIRE_AMP=1 (set by run_candidate for such runs, inherited by the
+    DDP workers) a failed check is logged and overridden; otherwise untouched.
+    """
+    try:
+        import ultralytics.engine.trainer as _tr
+    except Exception:                                           # noqa: BLE001
+        return False
+    if getattr(_tr.check_amp, "_hod26", False):
+        return True
+    orig = _tr.check_amp
+
+    def check_amp(model):
+        ok = orig(model)
+        if not ok and os.environ.get("HOD26_REQUIRE_AMP") == "1":
+            os.environ["HOD26_AMP_OVERRIDDEN"] = "1"
+            print("AMP: ultralytics check_amp failed (YOLO26n fp32 vs fp16 box count); "
+                  "overridden -- this run requires AMP, measured stable on its own model, "
+                  "loss and matching in fp32", flush=True)
+            return True
+        return ok
+
+    check_amp._hod26 = True
+    _tr.check_amp = check_amp
+    return True
+
+
+_install_amp_check_override()
+
+
 def mosaic_canvas_patched():
     try:
         from ultralytics.data.augment import Mosaic
@@ -1611,9 +1650,12 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                                 compile_blocks=bool(adapter and adapter.get("compile_blocks")))
             sdpa_ok = done["sdpa_mha"] > 0 and done["plain_mha"] == 0
             comp_ok = done["compiled"] == done["blocks"] > 0 if done["compile_wanted"] else None
+            overridden = os.environ.get("HOD26_AMP_OVERRIDDEN") == "1"
             table = [
                 ("AMP fp16 (+GradScaler)", bool(getattr(self, "amp", False)),
-                 "ultralytics check_amp result" if not getattr(self, "amp", False) else ""),
+                 "ultralytics check_amp result" if not getattr(self, "amp", False) else
+                 ("ultralytics check_amp failed; overridden (required, measured stable)"
+                  if overridden else "")),
                 ("loss + Hungarian matching in fp32", done["fp32_loss"], ""),
                 ("RT-DETR attention via SDPA", sdpa_ok,
                  f"{done['sdpa_mha']} SDPA, {done['plain_mha']} plain nn.MultiheadAttention"),
@@ -2386,6 +2428,8 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
     if tr.get("spectral_stem") == "s3t":
         import torch
         torch.backends.cudnn.benchmark = True
+        if tr.get("amp"):
+            os.environ["HOD26_REQUIRE_AMP"] = "1"
     # One card or both, decided by what the session actually has rather than by
     # what the metadata asked for: a request for two that lands on one must not
     # take the run down with it. Per-card batch stays at tr["batch"], so each
