@@ -278,6 +278,34 @@ def detector_checks(enc):
             rt = str(e)[:200]
         check("weights load into a freshly built S3T-X model", rt is True, str(rt))
 
+        # The DDP path: ultralytics builds the model in the parent and hands each
+        # worker a cloudpickled copy. Compilation does not survive that and
+        # cudnn.benchmark is per process; ensure_accel, run in the worker's
+        # setup_model, must put both back and report the truth.
+        import io
+        import cloudpickle
+        net4 = RTDETRDetectionModel("rtdetr-l.yaml", ch=3, nc=18, verbose=False)
+        m.install_bbox_loss(net4, 18, "GIoU", log_size=True, fdr=True, mal=True)
+        m.install_spectral_adapter(net4, 16, projection=m.LDA_16_TO_3, kind="s3t", mae_ckpt=str(ck),
+                                   scale=0.5, arch="xca", compile_blocks=True, grad_ckpt=False)
+        m.enable_transformer_accel(net4, fp32_loss=True, nc=18)
+        buf = io.BytesIO()
+        torch.save({"model": net4}, buf, pickle_module=cloudpickle)
+        buf.seek(0)
+        worker = torch.load(buf, map_location="cpu", weights_only=False)["model"]
+        comp = lambda n: sum(b.__dict__.get("_compiled_call_impl") is not None
+                             for b in n.modules() if type(b).__name__ == "XCABlock")
+        check("DDP pickle drops the S3T compilation (why ensure_accel exists)", comp(worker) == 0)
+        torch.backends.cudnn.benchmark = False
+        done = m.ensure_accel(worker, nc=18, fp32_loss=True, compile_blocks=True)
+        check("ensure_accel in the worker: every S3T block compiled again",
+              done["compiled"] == done["blocks"] == enc.depth and comp(worker) == enc.depth, str(done))
+        check("ensure_accel in the worker: SDPA attention, fp32 loss, cudnn.benchmark",
+              done["sdpa_mha"] == 7 and done["plain_mha"] == 0 and done["fp32_loss"]
+              and done["cudnn_benchmark"] and torch.backends.cudnn.benchmark, str(done))
+        again = m.ensure_accel(worker, nc=18, fp32_loss=True, compile_blocks=True)
+        check("ensure_accel is idempotent", again == done, str(again))
+
 
 def main() -> int:
     enc = encoder_checks()

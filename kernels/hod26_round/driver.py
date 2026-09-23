@@ -1111,6 +1111,42 @@ def enable_transformer_accel(net, fp32_loss=True, nc=None):
     return {"mha_to_sdpa": n_mha, "fp32_loss": wrapped}
 
 
+S3T_COMPILE_UNITS = ("SpectralBlock", "SpatialMix", "SpectralPool", "XCABlock")
+
+
+def ensure_accel(net, nc=None, fp32_loss=True, compile_blocks=False):
+    """(Re)apply every acceleration and report what is *actually* in effect.
+
+    Idempotent, and called where the training process sets its model up
+    (HOD26Trainer.setup_model), because under DDP that is not where the model
+    was built: ultralytics builds it in the parent with get_model and hands each
+    worker a cloudpickled copy. The SDPA class swap and the fp32 criterion
+    travel with the model; cudnn.benchmark is a per-process flag and
+    nn.Module.compile's compiled call is not pickled. The first S3T-X session
+    trained that way -- S3T blocks eager, cudnn not autotuning -- while its
+    table, which read a flag set in the parent, said nothing was wrong.
+    """
+    import torch
+    torch.backends.cudnn.benchmark = True
+    enable_transformer_accel(net, fp32_loss=fp32_loss, nc=nc)
+    front = getattr(getattr(net, "model", [None])[0], "front", None)
+    enc = getattr(front, "enc", None)
+    blocks = [m for m in enc.modules() if type(m).__name__ in S3T_COMPILE_UNITS] if enc is not None else []
+    if compile_blocks:
+        for m in blocks:
+            if m.__dict__.get("_compiled_call_impl") is None:
+                m.compile()
+    mods = list(net.modules())
+    return {
+        "sdpa_mha": sum(isinstance(m, SDPAMultiheadAttention) for m in mods),
+        "plain_mha": sum(type(m) is torch.nn.MultiheadAttention for m in mods),
+        "fp32_loss": isinstance(getattr(net, "criterion", None), FP32Criterion),
+        "compiled": sum(m.__dict__.get("_compiled_call_impl") is not None for m in blocks),
+        "blocks": len(blocks), "compile_wanted": bool(compile_blocks),
+        "cudnn_benchmark": bool(torch.backends.cudnn.benchmark),
+    }
+
+
 def install_spectral_adapter(net, n_bands, projection=None, ckpt_name=None,
                              srf_k=0, srf_width=2.0, stem_src=None, kind="mixer", **s3t):
     if kind == "s3t":
@@ -1393,6 +1429,16 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
     """
 
     class HOD26Trainer(base_cls):
+        def setup_model(self):
+            # Runs in the process that trains -- a DDP worker included, where
+            # get_model never ran (see ensure_accel).
+            ckpt = super().setup_model()
+            if accel:
+                self.__dict__["_hod26_accel"] = ensure_accel(
+                    self.model, nc=self.data["nc"], fp32_loss=accel.get("fp32_loss", True),
+                    compile_blocks=bool(adapter and adapter.get("compile_blocks")))
+            return ckpt
+
         def build_optimizer(self, *args, **kwargs):
             opt = super().build_optimizer(*args, **kwargs)
             if not accel or not accel.get("fused_optimizer"):
@@ -1409,15 +1455,21 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                 g["fused"], g["foreach"] = True, None
             fused = cls(opt.param_groups, lr=opt.defaults["lr"], fused=True)
             is_fused = all(g.get("fused") is True for g in fused.param_groups)
-            done = getattr(self, "_hod26_accel", {}) or {}
+            # What this process's model actually has (ensure_accel), not a flag.
+            done = ensure_accel(self.model, nc=self.data["nc"], fp32_loss=accel.get("fp32_loss", True),
+                                compile_blocks=bool(adapter and adapter.get("compile_blocks")))
+            sdpa_ok = done["sdpa_mha"] > 0 and done["plain_mha"] == 0
+            comp_ok = done["compiled"] == done["blocks"] > 0 if done["compile_wanted"] else None
             table = [
                 ("AMP fp16 (+GradScaler)", bool(getattr(self, "amp", False)),
                  "ultralytics check_amp result" if not getattr(self, "amp", False) else ""),
-                ("loss + Hungarian matching in fp32", bool(done.get("fp32_loss")), ""),
-                ("RT-DETR attention via SDPA", done.get("mha_to_sdpa", 0) > 0,
-                 f"{done.get('mha_to_sdpa', 0)} nn.MultiheadAttention swapped"),
+                ("loss + Hungarian matching in fp32", done["fp32_loss"], ""),
+                ("RT-DETR attention via SDPA", sdpa_ok,
+                 f"{done['sdpa_mha']} SDPA, {done['plain_mha']} plain nn.MultiheadAttention"),
+                ("S3T blocks torch.compile", bool(comp_ok),
+                 f"{done['compiled']}/{done['blocks']} blocks" if comp_ok is not None else "not requested"),
                 (f"fused {cls.__name__}", is_fused, "" if is_fused else "a group is not fused"),
-                ("cudnn.benchmark", bool(torch.backends.cudnn.benchmark), ""),
+                ("cudnn.benchmark", done["cudnn_benchmark"], ""),
                 ("non-deterministic kernels (fastest cudnn / grid_sample)",
                  not bool(torch.backends.cudnn.deterministic),
                  "deterministic=True in the candidate" if torch.backends.cudnn.deterministic else ""),
@@ -1429,6 +1481,11 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                     log(f"    {'ON ' if on else 'off'}  {name}" + (f"  ({why})" if why else ""))
             if not is_fused:
                 raise RuntimeError("fused optimizer requested but a parameter group is not fused")
+            missing = [n for n, ok in (("fp32 loss", done["fp32_loss"] or not accel.get("fp32_loss", True)),
+                                       ("SDPA attention", sdpa_ok), ("cudnn.benchmark", done["cudnn_benchmark"]),
+                                       ("S3T torch.compile", comp_ok is not False)) if not ok]
+            if missing:
+                raise RuntimeError(f"accelerations requested but not in effect in this process: {missing}")
             if accel.get("require_amp") and not getattr(self, "amp", False):
                 raise RuntimeError("AMP was requested but ultralytics turned it off "
                                    "(check_amp failed); stopping instead of training in fp32")
