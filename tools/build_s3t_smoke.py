@@ -67,7 +67,10 @@ def run(tag, nproc, extra):
                PYTORCH_ALLOC_CONF="expandable_segments:True")
     rc = subprocess.run(cmd, env=env).returncode
     rep = OUT / f"{tag}_report.json"
-    return rc, (json.loads(rep.read_text()) if rep.exists() else None)
+    r = json.loads(rep.read_text()) if rep.exists() else None
+    if r and r.get("error"):
+        say(f"{tag} STOPPED: {r['error']}")
+    return rc, r
 
 
 cpus = os.cpu_count() or 4
@@ -83,7 +86,9 @@ if MODE == "smoke":
                         ("graphs", ["--compile", "1", "--compile-mode", "reduce-overhead"])):
         variants[name] = run(f"dual_{name}", 2, CONFIG + flags + [
             "--minutes", str(VARIANT_MINUTES), "--workers", W2])
-    ok = {k: v for k, v in variants.items() if v[0] == 0 and v[1]}
+    # A variant that failed stays failed: no fallback, so every number below is
+    # the speed of the mode it is labelled with.
+    ok = {k: v for k, v in variants.items() if v[0] == 0 and v[1] and not v[1].get("error")}
     best = max(ok, key=lambda k: ok[k][1].get("crops_per_s") or 0) if ok else None
     TAG = f"dual_{best}" if best else "dual_eager"
     rc_b, b = variants.get(best, (1, None))
@@ -123,6 +128,8 @@ if b:
                 f"peak {r.get('peak_mem_gb')} GB  batch {r.get('batch_per_gpu')}/GPU")
         else:
             say(f"variant {name:7s}: rc={rc} (no report)")
+        if r and r.get("error"):
+            say(f"variant {name:7s}: FAILED -- {r['error']}")
     if variants:
         say(f"fastest: {TAG} -> use its --compile/--compile-mode for the pretrain")
     if a and a.get("crops_per_s") and b.get("crops_per_s"):

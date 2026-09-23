@@ -150,8 +150,8 @@ def main() -> int:
         loss.backward()
         opt.step()
         first = first if first is not None else float(loss.detach())
-    check("loss falls when overfitting one batch", float(loss) < 0.7 * first,
-          f"{first:.3f} -> {float(loss):.3f}")
+    check("loss falls when overfitting one batch", float(loss.detach()) < 0.7 * first,
+          f"{first:.3f} -> {float(loss.detach()):.3f}")
 
     blob = pickle.dumps(mae)
     check("model pickles (DDP / checkpoints)", isinstance(pickle.loads(blob), S3TMAE))

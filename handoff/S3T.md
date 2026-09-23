@@ -93,12 +93,12 @@ kaggle kernels push -p kernels/s3t_smoke/build
 | `fused` | 用 `torch.compile` 逐个 block 编译，把 LayerNorm、GELU、残差相加这些小 kernel 合并成少数几个 Triton kernel |
 | `graphs` | 在 `fused` 的基础上再加 CUDA Graphs（`mode="reduce-overhead"`），把每个 block 录成一张图，省掉逐个 kernel 启动的开销 |
 
-日志末尾会给出每种方案的吞吐（crops/s）、GPU 利用率和显存，并写出 `fastest: dual_xxx`。
+日志末尾会给出每种方案的吞吐（crops/s）、GPU 利用率和显存，并写出 `fastest: dual_xxx`（只在成功的方案里选）。
 
 **背景**：这个模型只有 0.25M 参数，每一步是大量很小的 kernel。第一轮双卡只比单卡快约 1.2 倍，而 `torch.compile` 两次都在 DDP 下触发 inductor 的 stride 断言，退回了不编译的普通模式。新代码做了三处改动：
 - 改为逐个 block 原地编译，DDP 包装的仍然是普通模型；
 - 关掉 dynamo 的 `optimize_ddp`；
-- 前 3 步编译失败时自动退回普通模式。
+- **不自动回退**：编译失败或配置的 batch 放不下，都会直接停下，并在日志和报告里写明原因（`STOPPED -- ...`）。所以每个方案报出来的速度，都是它自己的真实速度，不会混进别的方案的数字。某个方案在冒烟里失败，就在总结里标 `FAILED` 并附上原因，其他方案照常跑。
 
 CPU 上两进程 DDP 已验证逐 block 编译能正常训练、checkpoint 能完整存取；**GPU 上的效果还没测过**，冒烟测试就是为了测这个。
 

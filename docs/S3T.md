@@ -78,7 +78,7 @@ x ← x + γ2 · MLP(LN(x))       # 4D 中间维度
   - SDPA 实际走 mem-efficient 后端。FlashAttention 需要 sm80 以上，T4 是 sm75，用不了。
   - 编码器只计算可见位置。
   - fused AdamW、channels_last、pin_memory 并常驻 DataLoader worker。
-  - `torch.compile`：第一轮对 DDP 包装后的整个模型编译，两次都触发了 inductor 的 stride 断言，退回普通模式（退回后吞吐约 51 crops/s，冒烟测试中编译模式约 54 crops/s）。现已改为逐个 block 原地编译，并关掉 dynamo 的 `optimize_ddp`，可选再加 CUDA Graphs（`--compile-mode reduce-overhead`）来合并小 kernel、省掉 kernel 启动开销；冒烟测试 kernel 会在双卡上对比不编译、编译融合、编译融合加 CUDA Graphs 这三种方案的吞吐和 GPU 利用率。
+  - `torch.compile`：第一轮对 DDP 包装后的整个模型编译，两次都触发了 inductor 的 stride 断言，退回普通模式（退回后吞吐约 51 crops/s，冒烟测试中编译模式约 54 crops/s）。现已改为逐个 block 原地编译，并关掉 dynamo 的 `optimize_ddp`，可选再加 CUDA Graphs（`--compile-mode reduce-overhead`）来合并小 kernel、省掉 kernel 启动开销；冒烟测试 kernel 会在双卡上对比不编译、编译融合、编译融合加 CUDA Graphs 这三种方案的吞吐和 GPU 利用率。编译失败不会自动回退，直接报错停止，保证测到的速度就是所选方案的速度；batch 放不下同样直接报错，并给出能放下的大小。
 
 ### 5.2 检测微调
 

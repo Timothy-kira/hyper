@@ -46,6 +46,17 @@ def log(msg):
         print(f"[{time.time() - T0:7.1f}s] {msg}", flush=True)
 
 
+def die(report, out, tag, what, detail):
+    """Stop the run, loudly, with the reason written where the summary reads it."""
+    msg = f"{what}: {detail}"
+    log(f"STOPPED -- {msg}")
+    if RANK == 0:
+        report["error"] = msg
+        Path(out).mkdir(parents=True, exist_ok=True)
+        (Path(out) / f"{tag}_report.json").write_text(json.dumps(report, indent=1, default=str))
+    raise SystemExit(3)
+
+
 def find_root(given):
     if given:
         return Path(given)
@@ -192,6 +203,12 @@ def main():
     ap.add_argument("--compile-mode", default="default",
                     choices=["default", "reduce-overhead", "max-autotune-no-cudagraphs"],
                     help="reduce-overhead adds CUDA graphs on top of kernel fusion")
+    ap.add_argument("--compile-fallback", type=int, default=0,
+                    help="0 (default): a compile failure stops the run with the reason, so a "
+                         "measured speed is always the requested mode's; 1: continue eagerly")
+    ap.add_argument("--auto-batch", type=int, default=0,
+                    help="0 (default): stop if --batch does not fit, naming the size that does; "
+                         "1: halve until it fits")
     ap.add_argument("--compile-scope", default="blocks", choices=["blocks", "whole"],
                     help="blocks: compile each block in place (DDP-safe); "
                          "whole: torch.compile(DDP(model)), the form that failed on 2x T4")
@@ -306,6 +323,14 @@ def main():
             if fits or bs <= args.crops_per_frame:
                 break
             bs = max(args.crops_per_frame, (bs // 2) // args.crops_per_frame * args.crops_per_frame)
+            if not args.auto_batch:
+                # Keep probing only to say what would fit, then stop: a
+                # silently smaller batch is a different speed than the one asked for.
+                continue
+        if not args.auto_batch and bs != args.batch:
+            die(report, out, args.tag, "batch does not fit",
+                f"--batch {args.batch} exceeds 75% of GPU memory; {bs} crops/GPU fits. "
+                f"Rerun with --batch {bs} (or --auto-batch 1)")
         t = torch.tensor([bs], device=device)
         if WORLD > 1:
             dist.all_reduce(t, op=dist.ReduceOp.MIN)
@@ -342,6 +367,9 @@ def main():
                 log(f"torch.compile: whole model, mode={args.compile_mode}, optimize_ddp=off")
             compiled = True
         except Exception as e:                                   # noqa: BLE001
+            if not args.compile_fallback:
+                die(report, out, args.tag, f"torch.compile setup failed (mode={args.compile_mode})",
+                    f"{type(e).__name__}: {e}")
             uncompile(model)
             run = net
             log(f"torch.compile: off ({e})")
@@ -398,7 +426,11 @@ def main():
                 # recording, which re-records on step 1-2) happens.
                 if not (compiled and step < 3):
                     raise
-                failed = f"{type(e).__name__}: {str(e).splitlines()[0][:160]}"
+                failed = f"{type(e).__name__}: {str(e).splitlines()[0][:300]}"
+                if not args.compile_fallback:
+                    die(report, out, args.tag,
+                        f"torch.compile failed at step {step} (mode={args.compile_mode}, "
+                        f"scope={args.compile_scope})", failed)
             if failed:
                 # Retried outside the except block: inside it the traceback
                 # keeps the failed attempt's activations alive, and the eager
