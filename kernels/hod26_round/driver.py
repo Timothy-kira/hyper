@@ -2025,6 +2025,9 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
         fliplr=tr["fliplr"], scale=tr["scale"], cos_lr=tr.get("cos_lr", True),
         multi_scale=tr.get("multi_scale", False),
         warmup_epochs=tr.get("warmup_epochs", 3.0), nbs=int(tr.get("nbs") or 64),
+        # None: ultralytics' own default, which on CUDA converts the whole
+        # model to channels_last; the S3T probe measures both.
+        channels_last=tr.get("channels_last"),
         project=str(RUNS), name=tag, exist_ok=True,
         verbose=False, plots=False, val=True, seed=0,
         amp=tr.get("amp", True), deterministic=tr.get("deterministic", True),
