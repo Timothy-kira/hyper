@@ -787,6 +787,9 @@ if _RTDETRLoss is not None:
         # beyond the truth's is charged: max(0, IoG(pred, g') - IoG(gt, g')).
         # The true box costs nothing; a box that swallows part of a neighbour
         # (two people in one box, a drift toward the next car) is pushed back.
+        # Same-class neighbours only: the measured crowding is people x people,
+        # e-bike x e-bike, car x car; a rider and the e-bike under them are two
+        # different objects whose boxes are meant to overlap.
         box_cls_gain: dict = {}
         rep_gain: float = 0.0
         rep_sigma: float = 0.5
@@ -870,7 +873,7 @@ if _RTDETRLoss is not None:
             Excess over the pair's own ground truth: zero, with zero gradient,
             for a prediction equal to its target however much the targets overlap.
             """
-            bidx, gidx, gt_all, _, groups = ctx
+            bidx, gidx, gt_all, gt_cls, groups = ctx
             if gt_all.shape[0] < 2:
                 return pred_bboxes.sum() * 0.0
             img = _torch.repeat_interleave(_torch.arange(len(groups), device=gt_all.device),
@@ -884,7 +887,8 @@ if _RTDETRLoss is not None:
             inter = (rb - lt).clamp_min(0).prod(-1)                       # (n, m)
             area_g = (g[:, 2:] - g[:, :2]).clamp_min(1e-9).prod(-1)
             area_p = (p[:, 2:] - p[:, :2]).clamp_min(1e-9).prod(-1)
-            other = (bidx[:, None] == img[None, :])
+            cls = gt_cls.view(-1).to(gt_all.device)
+            other = (bidx[:, None] == img[None, :]) & (cls[gidx][:, None] == cls[None, :])
             other[_torch.arange(len(gidx), device=other.device), gidx] = False
             # how much of each other gt the prediction covers, beyond what its
             # own ground truth covers
@@ -1736,7 +1740,7 @@ def install_bbox_loss(net, nc: int, kind: str = "GIoU", alpha: float = 1.0,
         + (", log-space wh" if log_size else "")
         + (f", gains {loss_gain}" if loss_gain else "")
         + (f", box loss x{sorted(set(box_cls_gain.values()))} for {sorted(box_cls_gain)}" if box_cls_gain else "")
-        + (f", repulsion {rep_gain} (smooth-ln of IoG beyond the truth's own overlap)" if rep_gain else ""))
+        + (f", repulsion {rep_gain} (same-class neighbours, smooth-ln of IoG beyond the truth's own overlap)" if rep_gain else ""))
     return True
 
 

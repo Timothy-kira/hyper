@@ -154,6 +154,14 @@ def main() -> int:
         gr = torch.autograd.grad(r, exact, allow_unused=True)[0]
         check("C2: overlapping ground truths predicted exactly -> no repulsion, no gradient",
               float(r) == 0.0 and (gr is None or float(gr.abs().sum()) == 0.0), f"{float(r)}")
+        ebike = m.CLASSES.index("e-bike")
+        drift = (gt + torch.tensor([[0.02, 0.0, 0.03, 0.0], [-0.02, 0.0, 0.03, 0.0]])).requires_grad_(True)
+        r_same = crit._rep_gt(drift, (torch.tensor([0, 0]), torch.tensor([0, 1]), gt,
+                                      torch.tensor([people, people]), [2]))
+        r_cross = crit._rep_gt(drift, (torch.tensor([0, 0]), torch.tensor([0, 1]), gt,
+                                       torch.tensor([people, ebike]), [2]))
+        check("C2: same-class neighbours only -- a rider over an e-bike is never repelled",
+              float(r_same) > 0 and float(r_cross) == 0.0, f"{float(r_same)} {float(r_cross)}")
 
         # ---- B2 crowd paste
         rng_src = np.random.default_rng(0)
@@ -181,6 +189,11 @@ def main() -> int:
                              np.random.default_rng(3), {pid}, lambda k: src_cube)
         check("B2: a frame without a crowded-class anchor is untouched (tabletop scenes)",
               np.array_equal(c3, dst_cube) and len(b3) == 1)
+        car_anchor = Box(m.CLASSES.index("car"), 40, 20, 60, 35)
+        c4, b4 = crowd_paste(dst_cube, [car_anchor], pool, np.random.default_rng(3),
+                             {pid, m.CLASSES.index("car")}, lambda k: src_cube, n_max=3)
+        check("B2: same class only -- a person is never pasted beside a car",
+              np.array_equal(c4, dst_cube) and b4 == [car_anchor])
         covered = [b for b in b1 if b == victim]
         overlap = (max(0, min(victim.x2, new[0].x2) - max(victim.x1, new[0].x1))
                    * max(0, min(victim.y2, new[0].y2) - max(victim.y1, new[0].y1)))

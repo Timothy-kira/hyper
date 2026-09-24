@@ -188,11 +188,13 @@ def crowd_paste(cube: np.ndarray, boxes: list[Box], pool: dict, rng: np.random.G
     """Paste instances of the crowded classes next to, and partly over, their own kind.
 
     stone_block / people / e-bike / car are the only classes whose boxes overlap
-    other boxes (10-32% of instances against 0-3%), and stone_block has only 42
-    scenes. Each paste takes a real instance from another street frame, with a
-    ``margin`` of its own background feathered into the destination, sets it
-    beside an anchor of those classes (bottoms roughly aligned, 15-45% of its
-    width overlapping the anchor) and scales it per band so its surrounding
+    other boxes (10-32% of instances against 0-3%) -- people x people, e-bike x
+    e-bike, car x car -- and stone_block has only 42 scenes. Each paste takes a
+    real instance from another street frame, with a ``margin`` of its own
+    background feathered into the destination, sets it beside an anchor *of the
+    same class* (a person by a person, an e-bike in a row of e-bikes; never a
+    car over a pedestrian) with bottoms roughly aligned and 15-45% of its width
+    overlapping the anchor and scales it per band so its surrounding
     background matches the destination's -- which keeps the object-to-background
     contrast, the only cue these grey classes carry, what it was. Existing boxes
     the paste covers by more than ``max_cover`` are dropped (they are no longer
@@ -202,8 +204,8 @@ def crowd_paste(cube: np.ndarray, boxes: list[Box], pool: dict, rng: np.random.G
     Frames without an anchor are returned unchanged (tabletop scenes).
     """
     anchors = [b for b in boxes if b.cls_id in anchor_classes]
-    classes = [c for c in pool if pool[c]]
-    if not anchors or not classes:
+    classes = sorted({b.cls_id for b in anchors} & {c for c in pool if pool[c]})
+    if not classes:
         return cube, boxes
     out = cube.astype(np.float32, copy=True)
     boxes = list(boxes)
@@ -218,7 +220,8 @@ def crowd_paste(cube: np.ndarray, boxes: list[Box], pool: dict, rng: np.random.G
         src = load(src_key)
         if y1 - m < 0 or x1 - m < 0 or y2 + m > src.shape[0] or x2 + m > src.shape[1]:
             continue
-        a = anchors[int(rng.integers(len(anchors)))]
+        same = [b for b in anchors if b.cls_id == c]
+        a = same[int(rng.integers(len(same)))]
         ov = int(round(float(rng.uniform(0.15, 0.45)) * w))
         nx1 = a.x2 - ov if rng.random() < 0.5 else a.x1 - w + ov
         jitter = max(1, h // 6)
