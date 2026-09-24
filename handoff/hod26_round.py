@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import json, subprocess, sys
-subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
-                'ultralytics==8.4.155', 'pycocotools'], check=False)
+if __name__ == '__main__':
+    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',
+                    'ultralytics==8.4.155', 'pycocotools'], check=False)
 
 # ---- inlined from src/hod26/cube.py ------------------------------
 """Hyperspectral cube decoding for HOD26.
@@ -925,7 +926,8 @@ ROUND_CONFIG = json.loads(r'''
     },
     "use_all_train": false,
     "predict": true,
-    "session_hours": 11.0
+    "session_hours": 11.0,
+    "require_gpus": 2
   }
 }
 ''')
@@ -1530,6 +1532,59 @@ if SpectralFront is not None:
             _c.__module__ = "hod26_kernel"
 
 
+def materialise_kernel_module():
+    """Give the DDP workers a real hod26_kernel.py to import.
+
+    The registration above pins SpectralFront and the loss overrides to a
+    synthetic module so a checkpoint names the same class wherever it is
+    loaded. cloudpickle -- which ultralytics uses to hand the trainer, the
+    model and the callbacks to its DDP workers -- resolves that name exactly
+    as pickle does: the module answers in sys.modules here, so the classes go
+    across *by reference*, and the worker, a fresh interpreter that never ran
+    this script, dies on ModuleNotFoundError before the first batch. Measured,
+    not assumed: pickling the same shape and loading it in a clean process
+    reproduces it every time.
+
+    Writing this file to disk under that name and putting it on sys.path makes
+    the reference resolvable in the worker, and the worker's sys.path is this
+    process's -- ultralytics bakes it into the file it generates. The import is
+    cheap because every expensive step in this script sits behind main(),
+    which only __main__ runs.
+
+    Returns False when the source cannot be located, which is the caller's cue
+    to stay on one GPU. A second card is worth a few hours; it is not worth
+    failing the session outright.
+    """
+    import sys as _s
+    src = None
+    for cand in (globals().get("__file__"), "/kaggle/src/script.py"):
+        try:
+            if cand and Path(cand).is_file():
+                src = Path(cand)
+                break
+        except OSError:
+            continue
+    if src is None:
+        return False
+    try:
+        target = SCRATCH / "hod26_kernel.py"
+        target.write_text(src.read_text())
+        if str(SCRATCH) not in _s.path:
+            _s.path.insert(0, str(SCRATCH))
+        return True
+    except OSError:
+        return False
+
+
+def visible_gpus():
+    """How many CUDA devices this session actually got, never more than asked."""
+    try:
+        import torch
+        return torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception:                                           # noqa: BLE001
+        return 0
+
+
 def install_spectral_adapter(net, n_bands, projection=None, ckpt_name=None,
                              srf_k=0, srf_width=2.0, stem_src=None):
     """Put a band mixer in front of an untouched pretrained first block.
@@ -1747,7 +1802,8 @@ def restore_state(net, src):
 
 def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                   bbox_loss="GIoU", loss_gain=None, is_rtdetr=True,
-                  bbox_alpha=1.0, vfl_beta=0.0, log_size_l1=False):
+                  bbox_alpha=1.0, vfl_beta=0.0, log_size_l1=False,
+                  reset_best_fitness=True):
     """A trainer that seeds the head from COCO by name and installs the adapter.
 
     Both have to happen inside get_model, and for the same reason: ultralytics
@@ -1786,6 +1842,31 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                 super()._setup_scheduler()
             finally:
                 self.epochs = real
+
+        def resume_training(self, ckpt):
+            """Resume the weights, but not the previous session's yardstick.
+
+            best.pt is only rewritten when an epoch beats self.best_fitness,
+            and _load_checkpoint_state restores that number from the
+            checkpoint. The session this run continues had folded the 600
+            validation frames into its training set, so the figure it recorded
+            -- 0.727 -- measures memorisation, while this run holds those
+            frames out and honestly scores about 0.69. Comparing the two picks
+            nothing: the bar sits above anything this run can print, best.pt
+            keeps the weights it arrived with, and eighteen epochs of training
+            end up predicting from the checkpoint they started from.
+
+            Clearing it restarts selection on this run's own scale, which is
+            the only one its epochs are measured against. last.pt is
+            unaffected, so a resume still continues from the right weights.
+            """
+            super().resume_training(ckpt)
+            if self.resume and reset_best_fitness:
+                previous = self.best_fitness
+                self.best_fitness = None
+                log(f"  best.pt selection restarts from this run's own scale "
+                    f"(the checkpoint's {previous} was measured on a "
+                    f"validation split it had trained on)")
 
         def check_resume(self, overrides):
             super().check_resume(overrides)
@@ -2013,6 +2094,91 @@ def stage_checkpoint(tag):
     return str(last)
 
 
+def is_main_rank():
+    """True in a single-GPU run, and in rank 0 of a DDP one.
+
+    torch.distributed.run sets RANK in every worker it spawns; nothing sets it
+    otherwise. The callbacks below run inside those workers, so without this
+    both ranks append to the same metrics file and copy the same 264 MB
+    checkpoint to the same path at the same time. Only rank 0 validates, so
+    rank 1's numbers are NaN anyway -- the guard drops a corruption risk and a
+    stream of misleading log lines together.
+    """
+    try:
+        return int(os.environ.get("RANK", -1)) in (-1, 0)
+    except ValueError:
+        return True
+
+
+def metrics_records(tag):
+    """Every epoch record rank 0 wrote, oldest first.
+
+    Under DDP the validator, the trainer's epoch counter and the callback
+    state all live in a subprocess the parent never sees, so this file is the
+    only place the parent can read what the run actually did.
+    """
+    out = []
+    try:
+        for line in (WORK / f"{tag}_metrics.jsonl").read_text().splitlines():
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                continue
+    except OSError:
+        pass
+    return out
+
+
+def metrics_tail(tag):
+    """The last record that is an epoch, or {}.
+
+    A cut-short run ends with ultralytics re-validating the best checkpoint,
+    which is not an epoch -- final_eval marks it, and it is skipped here for
+    the same reason the trainer's own counter is preferred when there is one.
+    """
+    return next((r for r in reversed(metrics_records(tag))
+                 if not r.get("final_eval") and r.get("per_class")), {})
+
+
+def scores_from_results(results, tag):
+    """mAP for the run, whichever shape ultralytics hands back.
+
+    On one GPU this is the validator's metrics object. Under DDP the parent's
+    validator never ran, so ultralytics falls back to the checkpoint's
+    train_metrics: a flat dict of the same numbers with no per-class
+    breakdown attached. Rank 0 wrote that breakdown to the metrics file epoch
+    by epoch, so multi-GPU runs keep their per-class scores instead of
+    silently reporting none.
+    """
+    box = getattr(results, "box", None)
+    if box is not None:
+        return {
+            "mAP": float(box.map),          # mAP@[.5:.95], the competition's primary
+            "mAP50": float(box.map50),
+            "per_class": {CLASSES[int(c)]: float(a)
+                          for c, a in zip(box.ap_class_index, box.maps[box.ap_class_index])}
+            if getattr(box, "ap_class_index", None) is not None else {},
+        }
+    # The dict ultralytics falls back to is best.pt's *stored* train_metrics,
+    # written by whichever session saved that checkpoint. A resumed run that
+    # never beats the checkpoint it inherited keeps the inherited best, and so
+    # reports the previous session's number as this run's holdout -- here,
+    # 0.7271 from a session that had folded the validation frames into
+    # training, for a run whose own re-validation said 0.6985. The single-GPU
+    # path reads the validator after its final pass over *this* run's split,
+    # and the final_eval record is that same pass, so preferring it keeps both
+    # paths reporting the same measurement.
+    final = next((r for r in reversed(metrics_records(tag))
+                  if r.get("final_eval")), {})
+    flat = final.get("metrics") or (results if isinstance(results, dict) else {})
+    nan = float("nan")
+    return {
+        "mAP": float(flat.get("metrics/mAP50-95(B)", nan)),
+        "mAP50": float(flat.get("metrics/mAP50(B)", nan)),
+        "per_class": final.get("per_class") or metrics_tail(tag).get("per_class", {}),
+    }
+
+
 def snapshot_for_resume(tag, run):
     """Copy last.pt out while it still carries optimizer state.
 
@@ -2022,6 +2188,8 @@ def snapshot_for_resume(tag, run):
     a normal run. So the copy is taken per epoch, from on_model_save, before the
     strip can reach it.
     """
+    if not is_main_rank():
+        return
     for src, dst in ((run / "weights" / "last.pt", WORK / f"{tag}_last.pt"),
                      (run / "results.csv", WORK / f"{tag}_results.csv")):
         if src.exists():
@@ -2064,8 +2232,17 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
     """
     path = WORK / f"{tag}_metrics.jsonl"
     state = {}
+    # Bound here, not read from the global at call time. Under DDP this
+    # callback is cloudpickled into a worker that imported this module minutes
+    # after the session began, so its own T0 is not the session's -- and a
+    # guard measuring from the wrong zero would sail past Kaggle's 12-hour cap
+    # and lose the checkpoint it exists to protect. A closure cell travels with
+    # the callback; a module global does not.
+    t0 = T0
 
     def record(trainer):
+        if not is_main_rank():
+            return
         try:
             _record(trainer)
         except Exception:
@@ -2127,7 +2304,7 @@ def attach_epoch_log(model, tag, budget_seconds=0, reserve_seconds=300):
         state["last_epoch"] = rec["epoch"]
         if not budget_seconds:
             return
-        elapsed = time.time() - T0
+        elapsed = time.time() - t0
         # 15% headroom: epochs are not identical, and the one that overruns is
         # the one that costs the whole session.
         need = (rec["seconds"] or 0) * 1.15
@@ -2204,9 +2381,25 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                                 bbox_alpha=float(tr.get("bbox_alpha", 1.0)),
                                 vfl_beta=float(tr.get("vfl_beta", 0.0)),
                                 log_size_l1=bool(tr.get("log_size_l1", False)))
+    # One card or both, decided by what the session actually has rather than by
+    # what the metadata asked for: a request for two that lands on one must not
+    # take the run down with it. Per-card batch stays at tr["batch"], so each
+    # GPU does exactly the work it did on a single-card run and the optimizer
+    # still steps at nbs=64 -- the wall clock changes, the schedule does not.
+    gpus = visible_gpus()
+    use_ddp = gpus > 1 and materialise_kernel_module()
+    if gpus > 1 and not use_ddp:
+        log("  WARNING: two GPUs are visible but this script's source could not "
+            "be found on disk, so the DDP workers could not import it. "
+            "Training on one card.")
+    ddp_args = {"device": list(range(gpus))} if use_ddp else {}
+    batch = tr["batch"] * (gpus if use_ddp else 1)
+    log(f"  {gpus} GPU(s) visible; "
+        + (f"DDP across {list(range(gpus))}" if use_ddp else "single card")
+        + f", batch {batch} ({tr['batch']}/card)")
     log_state = attach_epoch_log(model, tag, budget_seconds, reserve_seconds)
     results = model.train(
-        data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=tr["batch"],
+        data=str(yaml), epochs=tr["epochs"], imgsz=tr["imgsz"], batch=batch,
         lr0=tr["lr0"], mosaic=tr["mosaic"], close_mosaic=close_mosaic,
         hsv_h=tr["hsv_h"], hsv_s=tr["hsv_s"], hsv_v=tr["hsv_v"],
         fliplr=tr["fliplr"], scale=tr["scale"], cos_lr=tr.get("cos_lr", True),
@@ -2215,7 +2408,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
         project=str(RUNS), name=tag, exist_ok=True,
         verbose=False, plots=False, val=True, seed=0,
         amp=tr.get("amp", True), deterministic=tr.get("deterministic", True),
-        resume=bool(resume_from), trainer=trainer_cls,
+        resume=bool(resume_from), trainer=trainer_cls, **ddp_args,
     )
     keep_for_resume(tag)
 
@@ -2238,23 +2431,23 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
             log(f"  adapter trained: moved {drift['rel']:.4%} from its initialisation "
                 f"(L2 {drift['l2']:.4f} of {drift['init_norm']:.4f})")
 
-    box = results.box
-    scores = {
-        "mAP": float(box.map),          # mAP@[.5:.95], the competition's primary
-        "mAP50": float(box.map50),
-        "per_class": {CLASSES[int(c)]: float(a)
-                      for c, a in zip(results.box.ap_class_index, box.maps[box.ap_class_index])}
-        if getattr(box, "ap_class_index", None) is not None else {},
-    }
+    scores = scores_from_results(results, tag)
     scores["adapter"] = drift
     # The epoch the run actually reached, which the clock guard can cut short.
     # Read from the trainer rather than counted from the log: the log's last
     # record is ultralytics re-validating the best checkpoint, which is not an
     # epoch, and getting this one too high would let the orchestrator call an
     # unfinished run done and never produce a submission.
+    # Under DDP the parent's trainer never ran an epoch, so its counter reads
+    # the start of training rather than the end of it -- claiming epoch 1 of a
+    # run that reached 39. The metrics file is rank 0's own record and is the
+    # only honest source there; log_state is empty for the same reason.
     reached = getattr(getattr(model, "trainer", None), "epoch", None)
-    scores["last_epoch"] = (int(reached) + 1 if reached is not None
-                            else log_state.get("last_epoch", tr["epochs"]))
+    if use_ddp:
+        scores["last_epoch"] = metrics_tail(tag).get("epoch", tr["epochs"])
+    else:
+        scores["last_epoch"] = (int(reached) + 1 if reached is not None
+                                else log_state.get("last_epoch", tr["epochs"]))
     weights = RUNS / tag / "weights" / "best.pt"
     return scores, [], (str(weights) if weights.exists() else None)
 
@@ -2907,7 +3100,19 @@ def preflight(round_cfg):
             bad.append("no GPU visible: the notebook's accelerator is off. "
                        "Settings -> Accelerator -> GPU T4 x2 before running.")
         else:
-            note.append(f"GPU {torch.cuda.get_device_name(0)}")
+            n = torch.cuda.device_count()
+            note.append(f"{n}x GPU {torch.cuda.get_device_name(0)}")
+            # An accelerator that silently comes back smaller than the one
+            # asked for is the expensive failure here: the run works, so
+            # nothing raises, and the session spends its whole allowance at
+            # half speed. Cheaper to refuse in the first minute.
+            want = int((round_cfg.get("submit") or {}).get("require_gpus", 1))
+            if n < want:
+                bad.append(
+                    f"asked for {want} GPUs and got {n}. Set the kernel's "
+                    "machine_shape to NvidiaTeslaT4x2 (or the notebook's "
+                    "Accelerator to GPU T4 x2) and run again -- nothing has "
+                    "been spent.")
     except Exception as exc:                                    # noqa: BLE001
         bad.append(f"torch unavailable: {exc}")
 

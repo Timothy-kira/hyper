@@ -25,7 +25,7 @@ REPO = Path(__file__).resolve().parent.parent
 
 
 def _build(tmp: Path) -> str:
-    """Generate the kernel the way a real push does, then neuter its pip line."""
+    """Generate the kernel the way a real push does."""
     import json
     sys.path.insert(0, str(REPO))
     from tools.final_runs import full_candidate
@@ -44,9 +44,16 @@ def _build(tmp: Path) -> str:
     assert "ultralytics==8.4.155" in src, \
         "the generated kernel must pin ultralytics; an unpinned install lets a " \
         "release made between build and run change behaviour mid-session"
-    return src.replace(
-        "subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',\n"
-        "                'ultralytics==8.4.155', 'pycocotools'], check=False)", "pass")
+    # The install sits behind a __main__ guard, which is what keeps it from
+    # running here -- and, on Kaggle, what keeps each DDP worker from paying
+    # for pip again when it imports this file as a module. Asserting the guard
+    # rather than deleting the line keeps the two reasons in one place.
+    head = src[:src.index("# ---- inlined")]
+    assert "if __name__ == '__main__':" in head and \
+        head.index("if __name__ == '__main__':") < head.index("subprocess.run("), \
+        "the pip install must stay behind the __main__ guard: the DDP workers " \
+        "import this file, and an unguarded install would re-run per worker"
+    return src
 
 
 def _load(src: str, inp: Path, work: Path):

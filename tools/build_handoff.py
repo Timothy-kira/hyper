@@ -47,8 +47,18 @@ SESSION_HOURS = 11.0
 
 
 def main() -> None:
-    shutil.rmtree(OUT, ignore_errors=True)
-    OUT.mkdir(parents=True)
+    import argparse
+    ap = argparse.ArgumentParser()
+    # The packaged copy names TEAMMATE because a teammate imports it by hand.
+    # Pushing it ourselves needs the account that will be billed for the hours.
+    ap.add_argument("--slug", default="TEAMMATE/hod26-team")
+    args = ap.parse_args()
+    # Only the generated pair. The directory also holds README.md, which is
+    # the whole point of the handoff, and RUN.md, which is the record of the
+    # run in flight -- rmtree on the directory takes both with it.
+    OUT.mkdir(parents=True, exist_ok=True)
+    for stale in (OUT / "hod26_round.py", OUT / "kernel-metadata.json"):
+        stale.unlink(missing_ok=True)
 
     cand = full_candidate("transformer", TOTAL)
     cand["require_resume"] = True
@@ -62,12 +72,16 @@ def main() -> None:
         # kernel reserves thirty minutes for the prediction when predict is set.
         "predict": True,
         "session_hours": SESSION_HOURS,
+        # Refuse in the first minute rather than spend the whole allowance at
+        # half speed if the accelerator comes back as a single card.
+        "require_gpus": 2,
     }}, indent=2))
 
     subprocess.run(
         [sys.executable, str(REPO / "tools" / "build_kernel.py"),
          "--round-config", str(cfg), "--out-dir", str(OUT),
-         "--slug", "TEAMMATE/hod26-team", "--dataset-source", CKPT_DATASET],
+         "--slug", args.slug, "--dataset-source", CKPT_DATASET,
+         "--machine-shape", "NvidiaTeslaT4x2"],
         check=True, capture_output=True)
     cfg.unlink()
 

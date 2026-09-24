@@ -1,6 +1,6 @@
 {
-  "id": "TEAMMATE/hod26-team",
-  "title": "Hod26 Team",
+  "id": "TEAMMATE/hod26-s3t-detr",
+  "title": "Hod26 S3T Detr",
   "code_file": "hod26_round.py",
   "language": "python",
   "kernel_type": "script",
@@ -10,8 +10,10 @@
   "enable_internet": true,
   "competition_sources": [],
   "dataset_sources": [
-    "xishengfeng/hod26-planar",
-    "xishengfeng/hod26-ckpt-s4"
+    "xishengfeng/hod26-planar"
   ],
-  "kernel_sources": []
+  "kernel_sources": [
+    "zetaoxia/hod26-s3t-mae-pretrain3",
+    "zetaoxia/hod26-s3t-render"
+  ]
 }

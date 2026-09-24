@@ -15,7 +15,8 @@ import re
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-MODULES = ["cube.py", "voc.py", "spectral.py", "augment.py", "coco_eval.py", "submit.py"]   # order matters: voc feeds coco_eval
+MODULES = ["cube.py", "voc.py", "spectral.py", "augment.py", "coco_eval.py", "submit.py",
+           "s3t/preprocess.py", "s3t/spectral.py", "s3t/xca.py", "s3t/front.py"]   # order matters: voc feeds coco_eval
 DROP = re.compile(r"^\s*(from\s+\.|from\s+__future__\s+import)")
 
 
@@ -37,8 +38,13 @@ def build(round_cfg: dict) -> str:
         # ultralytics internals, so an unpinned install lets a release made
         # between building this kernel and running it change behaviour in the
         # middle of an eleven-hour session -- or, worse, not raise at all.
-        "subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',\n"
-        "                'ultralytics==8.4.155', 'pycocotools'], check=False)\n\n"
+        # Behind the __main__ guard because this file is also imported, as a
+        # module, by the DDP workers ultralytics spawns -- they inherit the
+        # install the session already paid for, and re-running pip once per
+        # worker would only add startup to every multi-GPU run.
+        "if __name__ == '__main__':\n"
+        "    subprocess.run([sys.executable, '-m', 'pip', 'install', '-q',\n"
+        "                    'ultralytics==8.4.155', 'pycocotools'], check=False)\n\n"
     )
     # Embed the config as JSON text rather than as a Python literal: json.dumps
     # emits true/false/null, which are not Python names and fail at import.
@@ -62,6 +68,13 @@ def main() -> None:
     ap.add_argument("--dataset-source", action="append", default=[],
                     help="an extra Kaggle dataset to mount beside the planar "
                          "frames, e.g. a checkpoint another account resumes from")
+    # enable_gpu is deprecated in favour of machine_shape, and the accelerator
+    # is the one setting a push cannot be talked into afterwards. The SDK
+    # docstring lists only NvidiaTeslaT4/P100/Tpu1VmV38, but the server does
+    # take NvidiaTeslaT4x2 -- verified by pushing a probe kernel that reported
+    # torch.cuda.device_count() == 2.
+    ap.add_argument("--machine-shape", default="NvidiaTeslaT4",
+                    help="Kaggle accelerator, e.g. NvidiaTeslaT4x2 for two T4s; 'cpu' for none")
     args = ap.parse_args()
 
     cfg = json.loads(args.round_config.read_text())
@@ -81,7 +94,8 @@ def main() -> None:
         "language": "python",
         "kernel_type": "script",
         "is_private": True,
-        "enable_gpu": True,
+        **({"enable_gpu": False} if args.machine_shape.lower() in ("cpu", "none") else
+           {"enable_gpu": True, "machine_shape": args.machine_shape}),
         "enable_internet": True,
         "competition_sources": [],
         "dataset_sources": ["xishengfeng/hod26-planar", *args.dataset_source],

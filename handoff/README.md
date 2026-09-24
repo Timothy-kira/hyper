@@ -1,33 +1,81 @@
-# HOD26 — one 11-hour run on your account
+# HOD26 — round two of the same run, on a fresh account
+
+> **New, separate line: S3T-DETR** (S3T-X cross-covariance spectral encoder
+> pretrained with MAE v3, in front of a COCO RT-DETR-L with D-FINE distribution
+> refinement and MAL, full augmentation, 2x T4, trained from COCO). Instructions
+> and current status in [`S3T.md`](S3T.md) (Chinese), design in
+> [`../docs/S3T.md`](../docs/S3T.md). It is an alternative to the epoch-21
+> resume below, not a step of it.
 
 You are on team **Tims** in the [Hyperspectral Object Detection Challenge 2026](https://www.kaggle.com/competitions/hyperspectral-object-detection-challenge-2026).
-Deadline **2026-09-24 16:00 UTC**.
+Deadline **2026-09-24 16:00 UTC** — about two days out as this is written.
 
 One notebook, one Run, about eleven hours. You do not need to read the code,
 and nobody needs your credentials — Kaggle charges GPU time to whoever starts
 the session, so it only works with you pressing the button.
 
-## What this is worth
+**This exact resume point (epoch 21 → 40) has already been run once**, on
+another teammate's account, on two T4s. Read this section before starting —
+it corrects a prediction the first version of this document made, and that
+prediction turned out to be wrong.
 
-Our best submission is **0.62613**, rank 58 of 251. First place is 0.67943.
+## What this is worth, and what we now know
 
-Every run so far restarted from scratch because of a bug in how sessions
-handed checkpoints to each other, so our best model is a single short run.
-Three independent runs give the curve:
+Our best submission is **0.62994**. Leaderboard first place is 0.67943.
 
-| epochs | leaderboard |
-| --- | --- |
-| 9 | 0.59680 |
-| 10 | 0.59783 |
-| 19 | 0.62584 |
+The original plan for this handoff extrapolated **+0.0031/epoch** from three
+early runs (9, 10, 19 epochs → 0.59680, 0.59783, 0.62584) and predicted that
+epoch 22 → 40 would land near **0.69**. It did not. The run happened, on two
+T4s, epoch 21 → 40, and the held-out mAP50-95 went **0.6938 at epoch 22 →
+0.6941 at epoch 40 — a net of 0.0003 over eighteen epochs**, against a
+measured run-to-run noise floor of about 0.0017. The curve had flattened well
+before epoch 21; the early slope was not representative of the epochs this
+handoff buys. **Do not expect this run to move the score much on its own.**
 
-**+0.0031 per epoch, and still not flattening at 19.** Reaching 40 extrapolates
-to roughly **0.69**, the top of the leaderboard.
+A follow-up twelve-epoch fine-tune from that same epoch-40 checkpoint, with
+four loss/sampling changes aimed at a diagnosed bottleneck (see below), landed
+at **0.62994** — a new team best, +0.0004 over the plain epoch-40 result.
+Its held-out score (pycocotools, repo code) was 0.69528 against epoch 40's
+0.6943. Both gains are inside the noise floor, so it is not proven to help —
+but **it did not lower anything**: leaderboard and held-out both moved up.
 
-**You are not training from scratch.** Our epoch-21 checkpoint is attached, so
-your eleven hours buy epochs **22 to 40** — half the compute for the finish.
-Our own allowance does not refresh until 09-26, two days after the deadline,
-which is why this cannot be run on our side.
+**The diagnostic behind that fine-tune is solid, even though the fine-tune's
+result is not.** A CPU-only error decomposition (`handoff/DIAGNOSIS.md`, no
+GPU quota, ~1 minute) on the held-out predictions found: 98.3% of ground truth
+is found, 99.9% of what is found is named correctly. The entire remaining gap
+is **box tightness** — median matched IoU 0.8697 — concentrated in four
+classes (`stone_block`, `people`, `e-bike`, `car`). A second CPU scan found
+why they box loosely: **they are spectrally inseparable from the background
+around them** — grey objects whose spectrum is the background's at a
+different brightness, with almost no spectral or brightness step at the box
+edge. They are the bottom four of eighteen classes for a class-wide spectral
+rule separating object from background. So spectral-side fixes (spectral
+augmentation, band selection, contrastive spectral losses) cannot help them;
+what is left is spatial — shape, edges, resolution, the box loss. Read
+`handoff/DIAGNOSIS.md` before trying anything past a plain resume.
+
+**The 0.58168 on the submission list is not from this pipeline.** After the
+fine-tune, an experimental branch (`hod26-supcon`: a spectral contrastive loss
+for the three hardest classes, a new `bg_residual` channel mode, hard-class
+SMOTE — never merged into this repo) was built, and the prediction kernel that
+produced submission 56460799 was built from *that* branch's driver, with
+TTA (`id`+`hflip`, WBF `iou=0.65`) on top. It scored **0.58168**. Which part
+of that branch did the damage — TTA/WBF, `bg_residual`, or something else it
+changed — was not isolated before quota ran out; what is certain is that none
+of it is in the script below, and the committed changes are not implicated.
+The supcon training run itself also crashed at its first validation with a
+loss-key mismatch after burning real training time. Do not reuse either
+without starting from a plain traceback on one card.
+
+**Why this needs a fresh account.** The account that ran epoch 22 → 40 and
+the follow-up fine-tune has 1.71 of its 30 GPU-hours left, and Kaggle's weekly
+allowance does not refresh until 09-26 — after the deadline. That account is
+done. This resumes from the **same epoch-21 checkpoint as the first handoff**,
+not the further-trained epoch-40/52 checkpoint that produced 0.62994 — that
+checkpoint is a private kernel output on the other account and was not
+repackaged as a shared dataset. If you would rather resume from it than redo
+epochs 22 → 40 (which, per above, does not move the score much by itself),
+ask before starting; it is a five-minute repackage, not a retraining.
 
 ## Before you start
 
@@ -48,7 +96,10 @@ which is why this cannot be run on our side.
 2. Get the script. It is 135 kB, so downloading beats pasting — a cell that
    large tends to lag the editor or truncate:
 
-   <https://raw.githubusercontent.com/Timothy-kira/hyper/claude/kaggle-cli-setup-ppjny1/handoff/hod26_round.py>
+   <https://raw.githubusercontent.com/Timothy-kira/hyper/claude/kaggle-cli-setup-handoff-9w0v7x/handoff/hod26_round.py>
+
+   (Not `-ppjny1` — that branch is frozen before the dual-GPU fixes below existed
+   and will silently hand you a single-card, un-fixed script.)
 
    Save it, then **File → Import Notebook** and upload it. (If import gives
    you trouble: one code cell, paste the whole file in, nothing else.)
@@ -59,7 +110,11 @@ which is why this cannot be run on our side.
    checkpoints and the run would resume from whichever sorts first, which is
    the wrong one. It refuses to start rather than guess, but it is simpler not
    to attach it.
-4. Right panel → **Session options → Accelerator → GPU T4 x2**.
+4. Right panel → **Session options → Accelerator → GPU T4 x2**. Both cards
+   are now used, not just one: the run trains under DDP at 4 images per card.
+   If the session comes up with a single T4 the preflight stops it in the
+   first minute rather than spending the whole allowance at half speed, so a
+   wrong accelerator costs nothing but a re-commit.
 5. Same panel → **Internet → On**. Required: the COCO pretrained weights are
    fetched at startup, and without them the model trains from random
    initialisation and the whole session is wasted.
@@ -71,10 +126,16 @@ which is why this cannot be run on our side.
 You want to see these two things:
 
 ```
+preflight ok: 2x GPU Tesla T4
 preflight passed
 resuming from /kaggle/input/hod26-ckpt-s4/final_last.pt -> ...
+2 GPU(s) visible; DDP across [0, 1], batch 8 (4/card)
+training starts at epoch 22 of 40 (resume=True)
 training starts at epoch 22 of 40 (resume=True)
 ```
+
+`training starts` appearing **twice is correct** — one line per card. Seeing it
+once means the run is on a single GPU.
 
 - If it prints `PREFLIGHT FAILED` lines instead, **nothing has been spent**.
   Each line names exactly what is wrong; fix it and commit again.
@@ -93,8 +154,12 @@ epoch 24/40  loss 0.201/0.275/0.044  mAP50 0.9438  mAP50-95 0.6903  lr 1.65e-04 
 own history. That drop is correct and you should not report it as a problem.**
 The previous session had folded the 600 validation frames into its training
 set, which inflates the score by construction; this run holds them out again,
-so the number goes back to measuring something real. From there it should
-climb.
+so the number goes back to measuring something real.
+
+**From there, expect it to barely move.** The last time this exact resume ran,
+epoch 22 read 0.6938 and epoch 40 read 0.6941 — see "What this is worth"
+above. A number that sits flat in the high 0.69x range for most of the run is
+the measured outcome, not a sign anything is broken.
 
 ### While it runs
 
@@ -124,6 +189,7 @@ holdout mAP=...` tells us where the run got to and what it is worth.
 | `PREFLIGHT FAILED: require_resume` | `hod26-ckpt-s4` not attached — step 3 |
 | `PREFLIGHT FAILED: more than one checkpoint` | both `-s2` and `-s4` attached; remove `-s2` |
 | `PREFLIGHT FAILED: no GPU visible` | accelerator still off |
+| `PREFLIGHT FAILED: asked for 2 GPUs and got 1` | accelerator is on but set to a single T4; switch it to **GPU T4 x2**. Nothing has been spent |
 | `could not fetch rtdetr-l.pt` | Internet off |
 | `expected 3000 train / 3000 xml / 1000 test` | the dataset mounted but is incomplete; tell us |
 | killed at ~12 hours | Kaggle's hard cap; the guard should have stopped it at 11. The checkpoint is lost. Tell us rather than re-running |
