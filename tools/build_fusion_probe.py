@@ -111,9 +111,10 @@ def _probe_mask(boxes, W, H, h, w):
 
 
 def _probe_rows(y, pid, W, H):
+    # ultralytics 8.4's RT-DETR head already selects top-k: rows are
+    # (cx, cy, w, h, score, label), normalised to the (stretched) input
     y = y[0].float()
-    boxes, scores = y[:, :4], y[:, 4:]
-    s, c = scores.max(-1)
+    boxes, s, c = y[:, :4], y[:, 4], y[:, 5]
     cx, cy, bw, bh = boxes.unbind(-1)
     out = []
     for k in range(len(s)):
