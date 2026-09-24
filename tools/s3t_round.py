@@ -194,6 +194,8 @@ def main() -> None:
     ap.add_argument("--extra-dataset", default=None,
                     help="Kaggle dataset with the HOT2024 frames (hot24_index.json), labelled "
                          "by the --finetune-from model and added to the training split")
+    ap.add_argument("--extra-index", default="hot24_index.json",
+                    help="the index file inside --extra-dataset (hod3k_index.json: fully labelled)")
     ap.add_argument("--extra-per-video", type=int, default=0,
                     help="frames per HOT video to use (0: all in the dataset)")
     args = ap.parse_args()
@@ -210,7 +212,7 @@ def main() -> None:
         "render_only": bool(args.render_only),
         "smoke_only": bool(args.smoke_only),
         "smoke": not args.no_smoke,
-        **({"extra_data": {"per_video": args.extra_per_video, "hi": 0.6, "lo": 0.3,
+        **({"extra_data": {"index": args.extra_index, "per_video": args.extra_per_video, "hi": 0.6, "lo": 0.3,
                            **({"limit": 16} if args.smoke_only else {})}}
            if args.extra_dataset else {}),
     }}, indent=2))
@@ -222,7 +224,8 @@ def main() -> None:
                     *(["--kernel-source", args.render_kernel] if args.render_kernel else []),
                     *(["--kernel-source", args.finetune_kernel]
                       if args.finetune_kernel and not args.render_only else []),
-                    *(["--dataset-source", args.extra_dataset] if args.extra_dataset else []),
+                    *(["--kernel-source" if "/" in args.extra_dataset and args.extra_dataset.startswith("kernel:") else "--dataset-source",
+                       args.extra_dataset.removeprefix("kernel:")] if args.extra_dataset else []),
                     "--machine-shape", "cpu" if args.render_only else "NvidiaTeslaT4x2"], check=True)
     cfg.unlink()
 

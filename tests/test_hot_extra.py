@@ -129,6 +129,26 @@ def main() -> int:
               index[m.EXTRA_OFFSET + 4] == root / "images" / "4.png"
               and anns[m.EXTRA_OFFSET + 4].boxes[0].cls_id == CAR)
 
+        # ---- fully labelled external frames (HOD3K): no teacher
+        lab = td / "input" / "hod3k"
+        (lab / "images").mkdir(parents=True)
+        cube = rng.integers(0, 300, (32, 64, 16)).astype(np.uint16)
+        Image.fromarray(to_planar(cube)).save(lab / "images" / "7.png")
+        Image.fromarray(to_planar(cube)).save(lab / "images" / "8.png")
+        (lab / "hod3k_index.json").write_text(json.dumps({"frames": [
+            {"id": 7, "w": 64, "h": 32, "boxes": [["people", 2, 2, 12, 20], ["e-bike", 20, 5, 40, 30]],
+             "ignore": [[50, 2, 60, 12]]},
+            {"id": 8, "w": 64, "h": 32, "boxes": []}]}))
+        m.build_model = lambda name, w: (_ for _ in ()).throw(AssertionError("no teacher for labelled data"))
+        anns, index = m.hot_extra({"extra_data": {"index": "hod3k_index.json"}}, cand)
+        k7 = m.EXTRA_OFFSET + 7
+        check("labelled: boxes taken as given, no teacher, empty frame dropped",
+              sorted(anns) == [k7] and [(b.cls_id, b.x1, b.y1, b.x2, b.y2) for b in anns[k7].boxes]
+              == [(P, 2, 2, 12, 20), (E, 20, 5, 40, 30)])
+        got = load_planar(index[k7])
+        check("labelled: ignore region blanked, labelled pixels intact",
+              (got[2:12, 50:60] == got[2, 50]).all() and (got[2:20, 2:12] == cube[2:20, 2:12]).all())
+
     print(f"\n{len(fails)} failure(s)" if fails else "\nall HOT extra-data checks passed")
     return 1 if fails else 0
 

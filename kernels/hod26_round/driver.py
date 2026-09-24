@@ -3569,6 +3569,39 @@ def find_extra_index(name="hot24_index.json"):
     return None
 
 
+def labelled_extra(man, frames):
+    """External frames that come fully annotated (HOD3K): no teacher. Each frame
+    carries boxes [[class name, x1, y1, x2, y2], ...] in cube pixels and optional
+    ignore regions, blanked like the teacher's uncertain ones."""
+    img_dir = man.parent / "images"
+    out_dir = SCRATCH / "extra_frames"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    anns, index, per_cls, n_ign = {}, {}, {}, 0
+    for f in frames:
+        pid = int(f["id"])
+        path = img_dir / f"{pid}.png"
+        H, W = int(f["h"]), int(f["w"])
+        boxes = [(CLASSES.index(c), int(max(0, round(x1))), int(max(0, round(y1))),
+                  int(min(W, round(x2))), int(min(H, round(y2)))) for c, x1, y1, x2, y2 in f["boxes"]]
+        boxes = [b for b in boxes if b[3] - b[1] >= 2 and b[4] - b[2] >= 2]
+        if not boxes:
+            continue
+        ignore = [tuple(b) for b in f.get("ignore", [])]
+        if ignore:
+            cube = blank_regions(load_planar(path), ignore, [b[1:] for b in boxes])
+            path = out_dir / f"{pid}.png"
+            cv2.imwrite(str(path), to_planar(cube))
+            n_ign += len(ignore)
+        key = EXTRA_OFFSET + pid
+        anns[key] = Annotation(key, W, H, 16, tuple(Box(*b) for b in boxes))
+        index[key] = path
+        for b in boxes:
+            per_cls[CLASSES[b[0]]] = per_cls.get(CLASSES[b[0]], 0) + 1
+    log(f"  extra data (labelled) from {man.parent}: {len(anns)} frames, {sum(per_cls.values())} boxes "
+        f"{dict(sorted(per_cls.items()))}, {n_ign} ignore regions blanked")
+    return anns, index
+
+
 def hot_extra(sub, cand):
     """HOT2024 frames labelled for detection by the model we fine-tune from.
 
@@ -3581,10 +3614,12 @@ def hot_extra(sub, cand):
     spec = sub.get("extra_data") or {}
     if not spec:
         return {}, {}
-    man = find_extra_index()
+    man = find_extra_index(spec.get("index", "hot24_index.json"))
     if man is None:
-        raise RuntimeError("extra_data is set but no hot24_index.json is attached")
+        raise RuntimeError(f"extra_data is set but no {spec.get('index', 'hot24_index.json')} is attached")
     frames = json.loads(man.read_text())["frames"]
+    if frames and all("boxes" in f for f in frames):
+        return labelled_extra(man, frames)
     per = int(spec.get("per_video", 0) or 0)
     if per:
         by_vid = {}
@@ -3895,14 +3930,18 @@ def preflight(round_cfg):
             note.append(f"fine-tune from {find_weights(init)}")
 
     if sub.get("extra_data") and not render_only:
-        man = find_extra_index()
+        iname = sub["extra_data"].get("index", "hot24_index.json")
+        man = find_extra_index(iname)
         if man is None:
-            bad.append("extra_data is set but no hot24_index.json (the HOT2024 dataset) is attached")
-        elif not init:
-            bad.append("extra_data labels its frames with train.init_from, which is not set")
+            bad.append(f"extra_data is set but no {iname} is attached")
         else:
-            n = len(json.loads(man.read_text())["frames"])
-            note.append(f"extra data {man.parent} ({n} frames)")
+            fr = json.loads(man.read_text())["frames"]
+            labelled = bool(fr) and all("boxes" in f for f in fr)
+            if not labelled and not init:
+                bad.append("extra_data labels its frames with train.init_from, which is not set")
+            else:
+                note.append(f"extra data {man.parent} ({len(fr)} frames, "
+                            f"{'labelled' if labelled else 'teacher-labelled'})")
 
     # Scratch. A full disk surfaces as a cryptic write error deep in training.
     try:
