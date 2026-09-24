@@ -433,3 +433,33 @@ Only stone_block's gain is outside the noise. The LB went down by 0.009.
 4. **No ablation.** Four changes in one run means none of their effects can
    be separated. On LB evidence the combination is net negative, so the
    parent stays the submission.
+
+## External data (2026-09-24): HOT2024, SAM3, HOD3K — and why the HOD3K fine-tune scored lower
+
+**HOT2024 (same XIMEA VIS camera, tracking).** 80 videos fetched (tools/hot_fetch.py). Single-object
+labels; the LB-best teacher recovers the tracked target at conf >= 0.6 for only people 0.19 / car 0.33,
+so teacher-completed labels would leave most people/cars as background. Dropped.
+
+**SAM3 (keras/sam3 on Kaggle) as a weak-class labeller, held-out 120 frames.** Text only: people
+P 0.47 R 0.75 tightness 0.43 (teacher@0.6: 0.87/0.51/0.65), e-bike never found. Text + the teacher's
+>= 0.6 boxes as exemplars (exemplars must be unpadded, int32 labels, or keras_hub silently drops them):
+recall up (people .51->.72, car .71->.87, stone_block .37->.76) at a large precision/tightness cost;
+useful only as ignore regions (GT taught as background: people .22->.15, stone .39->.15). Not used.
+
+**HOD3K (S2ADet): xishengfeng/hsidataraw (train) + hsidata (val/test).** 3239 raw frames, same X2Cube
+layout; classes 0,2 -> people (12144), 3 -> car (2188), 1 -> e-bike (817) — read off drawn boxes
+(the id->name order is NOT the paper's count order). Seven crop sizes; six need a non-zero mosaic
+phase (tools/build_hod3k_convert.py). No duplicates with the competition (max thumbnail cosine 0.928).
+A global per-band gain brings people 20->7 deg to the competition but pushes car/e-bike further,
+so none applied. Two-stage fine-tune from LB-best (4 ep comp+HOD3K, 2 ep comp only, band-gain 0.1):
+held-out 0.6864 (LB-best 0.6828), **LB 0.62844 (LB-best 0.63985)**.
+
+Why lower (boot_cmp over held-out, and test-set drift against LB-best's confident boxes):
+- Held-out gain is not HOD3K's: people -0.010, e-bike -0.006, car 0.000 (all n.s.); the +0.0035
+  overall ([-0.0024, +0.0073]) is stone_block +0.063 (58 boxes, absent from HOD3K) and noise.
+- Test: of LB-best's confident car boxes only 77% survive (140 vs 177; weak-class FT kept 97%),
+  while held-out car AP is unchanged -> HOD3K's cars (front/rear, far, dark) moved the car concept away
+  from the test set's cars. People +13% boxes with fewer tight ones (IoU>=.9 vs LB-best 68%).
+- Both fine-tunes from LB-best raised held-out and lowered LB (-0.009, -0.011): LB-best is epoch 30
+  of 44; more training on the train distribution fits held-out (same distribution) tighter and the
+  shifted test set (brighter material classes, see shift probe) worse. Held-out cannot rank models here.
