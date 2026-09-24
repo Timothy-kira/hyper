@@ -3470,6 +3470,185 @@ def pseudo_labels(root, conf: float, source: str = "submission.csv"):
     return anns, index
 
 
+# External frames from HOT2024 (same XIMEA 4x4 VIS camera) get their own id
+# range, clear of the competition's and of the pseudo-labelled test frames.
+EXTRA_OFFSET = 2_000_000
+
+
+def _iou(a, b):
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / ua if ua > 0 else 0.0
+
+
+def _iog(a, g):
+    """Share of box a that lies inside g."""
+    ix = max(0.0, min(a[2], g[2]) - max(a[0], g[0]))
+    iy = max(0.0, min(a[3], g[3]) - max(a[1], g[1]))
+    area = (a[2] - a[0]) * (a[3] - a[1])
+    return ix * iy / area if area > 0 else 0.0
+
+
+def merge_hot_labels(track_cls, track_box, preds, hi=0.6, lo=0.3):
+    """One HOT frame's detection labels: its tracked box merged with the teacher's.
+
+    HOT is single-object tracking, so the one annotated box is the video's
+    target and every other object in the frame is unlabelled. Left as it is,
+    each unlabelled person or car would be taught as background.
+
+    track_cls   our class name the video merges onto, or "rider" (a person on a
+                two-wheeler: the tracked box holds both, which our labels keep
+                apart as people + e-bike)
+    track_box   (x1, y1, x2, y2) or None when the target is out of view
+    preds       teacher rows (cls_id, score, x1, y1, x2, y2)
+
+    Returns (boxes [(cls_id, x1, y1, x2, y2)], ignore [(x1, y1, x2, y2)]):
+    the tracked box under its merged class, the teacher's other detections at
+    >= hi as labels, and those between lo and hi as regions to blank out --
+    neither taught as objects nor as background. A rider becomes the teacher's
+    best people and e-bike boxes on it (>= lo: the tracked box already says
+    something is there); if it finds neither, the whole tracked box is ignored.
+    """
+    boxes, ignore, used = [], [], set()
+    if track_box is not None:
+        if track_cls == "rider":
+            for name in ("people", "e-bike"):
+                c = CLASSES.index(name)
+                on = [k for k, p in enumerate(preds) if p[0] == c and p[1] >= lo
+                      and max(_iou(p[2:], track_box), _iog(p[2:], track_box)) >= 0.3]
+                used.update(on)
+                if on:
+                    k = max(on, key=lambda k: preds[k][1])
+                    boxes.append((c, *preds[k][2:]))
+            if not boxes:
+                ignore.append(tuple(track_box))
+        else:
+            boxes.append((CLASSES.index(track_cls), *track_box))
+            used.update(k for k, p in enumerate(preds) if _iou(p[2:], track_box) >= 0.5)
+    for k in sorted(range(len(preds)), key=lambda k: -preds[k][1]):
+        p = preds[k]
+        if k in used or p[1] < lo or any(_iou(p[2:], b[1:]) >= 0.5 for b in boxes):
+            continue
+        if p[1] >= hi:
+            boxes.append((p[0], *p[2:]))
+        else:
+            ignore.append(tuple(p[2:]))
+    return boxes, ignore
+
+
+def blank_regions(cube, ignore, keep):
+    """Fill the ignore boxes with the per-band median of the ring around each,
+    leaving every labelled box's pixels as they are."""
+    H, W, _ = cube.shape
+    out = cube.copy()
+    protect = np.zeros((H, W), bool)
+    for b in keep:
+        protect[max(0, int(b[1])):int(b[3]), max(0, int(b[0])):int(b[2])] = True
+    for (x1, y1, x2, y2) in ignore:
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(W, int(round(x2))), min(H, int(round(y2)))
+        if x2 <= x1 or y2 <= y1:
+            continue
+        r = 6
+        X1, Y1, X2, Y2 = max(0, x1 - r), max(0, y1 - r), min(W, x2 + r), min(H, y2 + r)
+        ring = np.ones((Y2 - Y1, X2 - X1), bool)
+        ring[y1 - Y1:y2 - Y1, x1 - X1:x2 - X1] = False
+        ring &= ~protect[Y1:Y2, X1:X2]
+        pix = cube[Y1:Y2, X1:X2][ring]
+        fill = np.median(pix if len(pix) else cube.reshape(-1, cube.shape[2]), 0)
+        m = ~protect[y1:y2, x1:x2]
+        out[y1:y2, x1:x2][m] = fill.astype(cube.dtype)
+    return out
+
+
+def find_extra_index(name="hot24_index.json"):
+    for p in sorted(INPUT.rglob(name)) if INPUT.exists() else []:
+        return p
+    return None
+
+
+def hot_extra(sub, cand):
+    """HOT2024 frames labelled for detection by the model we fine-tune from.
+
+    The attached dataset holds band-planar frames (images/<n>.png, the same
+    X2Cube phase and layout as the competition's) and hot24_index.json with each
+    frame's video, merged class and tracked box. The teacher is train.init_from
+    -- the leaderboard-best S3T-X -- run once here before training.
+    Returns (anns, index) keyed from EXTRA_OFFSET, for the training split only.
+    """
+    spec = sub.get("extra_data") or {}
+    if not spec:
+        return {}, {}
+    man = find_extra_index()
+    if man is None:
+        raise RuntimeError("extra_data is set but no hot24_index.json is attached")
+    frames = json.loads(man.read_text())["frames"]
+    per = int(spec.get("per_video", 0) or 0)
+    if per:
+        by_vid = {}
+        for f in frames:
+            by_vid.setdefault(f["video"], []).append(f)
+        frames = []
+        for v, fs in sorted(by_vid.items()):
+            fs = sorted(fs, key=lambda f: f["frame"])
+            pick = np.unique(np.linspace(0, len(fs) - 1, min(per, len(fs))).round().astype(int))
+            frames += [fs[i] for i in pick]
+    if spec.get("limit"):
+        frames = frames[:int(spec["limit"])]
+    img_dir = man.parent / "images"
+    ids = [int(f["id"]) for f in frames]
+    w = find_weights(cand["train"]["init_from"])
+    log(f"  extra data: {len(frames)} HOT frames from {man.parent}; teacher {w}")
+    teacher = build_model(cand["train"]["model"], str(w))
+    preds, sizes = predict_test(teacher, cand, img_dir, ids)
+    del teacher
+    try:
+        import gc, torch
+        gc.collect()
+        torch.cuda.empty_cache()
+    except Exception:                                            # noqa: BLE001
+        pass
+    shutil.rmtree(SCRATCH / "test_images", ignore_errors=True)
+    rows = {}
+    for (pid, c, s, x1, y1, x2, y2) in preds:
+        rows.setdefault(pid, []).append((int(c), float(s), x1, y1, x2, y2))
+
+    hi, lo = float(spec.get("hi", 0.6)), float(spec.get("lo", 0.3))
+    out_dir = SCRATCH / "extra_frames"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    anns, index, n_box, n_ign, n_skip, per_cls = {}, {}, 0, 0, 0, {}
+    for f in frames:
+        pid = int(f["id"])
+        W, H = sizes[pid]
+        tb = f.get("box")
+        tb = None if tb is None else (max(0, tb[0]), max(0, tb[1]), min(W, tb[2]), min(H, tb[3]))
+        boxes, ignore = merge_hot_labels(f["cls"], tb, rows.get(pid, []), hi, lo)
+        boxes = [(c, int(max(0, round(x1))), int(max(0, round(y1))), int(min(W, round(x2))),
+                  int(min(H, round(y2)))) for c, x1, y1, x2, y2 in boxes]
+        boxes = [b for b in boxes if b[3] - b[1] >= 2 and b[4] - b[2] >= 2]
+        if not boxes:
+            n_skip += 1
+            continue
+        path = img_dir / f"{pid}.png"
+        if ignore:
+            cube = load_planar(path)
+            cube = blank_regions(cube, ignore, [b[1:] for b in boxes])
+            path = out_dir / f"{pid}.png"
+            cv2.imwrite(str(path), to_planar(cube))
+        key = EXTRA_OFFSET + pid
+        anns[key] = Annotation(key, W, H, 16, tuple(Box(*b) for b in boxes))
+        index[key] = path
+        n_box += len(boxes)
+        n_ign += len(ignore)
+        for b in boxes:
+            per_cls[CLASSES[b[0]]] = per_cls.get(CLASSES[b[0]], 0) + 1
+    log(f"  extra data: {len(anns)} frames kept ({n_skip} without a box), {n_box} boxes, "
+        f"{n_ign} ignore regions blanked; per class {dict(sorted(per_cls.items()))}")
+    return anns, index
+
+
 def run_submission(round_cfg):
     """Train one candidate at full fidelity and write submission.csv."""
     cand = round_cfg["submit"]["candidate"]
@@ -3493,6 +3672,13 @@ def run_submission(round_cfg):
         train_ids = list(train_ids) + sorted(p_anns)
         log(f"  training set is now {len(train_ids)} frames "
             f"({len(train_ids) - len(p_anns)} labelled + {len(p_anns)} pseudo)")
+
+    if round_cfg["submit"].get("extra_data"):
+        e_anns, e_index = hot_extra(round_cfg["submit"], cand)
+        anns.update(e_anns)
+        index.update(e_index)
+        train_ids = list(train_ids) + sorted(e_anns)
+        log(f"  training set is now {len(train_ids)} frames ({len(e_anns)} from HOT2024)")
 
     # A chunked run does not know in advance which session will be the last one
     # -- the clock decides -- so "if_complete" lets the session that reaches the
@@ -3707,6 +3893,16 @@ def preflight(round_cfg):
                        f"under {INPUT}; attach the kernel that produced it")
         else:
             note.append(f"fine-tune from {find_weights(init)}")
+
+    if sub.get("extra_data") and not render_only:
+        man = find_extra_index()
+        if man is None:
+            bad.append("extra_data is set but no hot24_index.json (the HOT2024 dataset) is attached")
+        elif not init:
+            bad.append("extra_data labels its frames with train.init_from, which is not set")
+        else:
+            n = len(json.loads(man.read_text())["frames"])
+            note.append(f"extra data {man.parent} ({n} frames)")
 
     # Scratch. A full disk surfaces as a cryptic write error deep in training.
     try:

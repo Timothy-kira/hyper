@@ -87,6 +87,16 @@ def finetune_candidate(cand: dict, init_from: str, epochs: int = 15) -> dict:
     return cand
 
 
+def plain_finetune_candidate(cand: dict, init_from: str, epochs: int) -> dict:
+    """The S3T-X candidate unchanged, warm-started from a finished model: only
+    the data differs (the HOT2024 frames), so any change is the data's."""
+    tr = cand["train"]
+    tr.update(epochs=epochs, schedule_epochs=epochs, init_from=init_from,
+              unfreeze={k: list(v) for k, v in FT_UNFREEZE.items() if k != "stem_in"},
+              warmup_epochs=1.0, close_mosaic=2)
+    return cand
+
+
 def s3t_candidate(total: int = TOTAL, batch: int = 2, mae_file: str | None = None,
                   compile_blocks: bool = False, arch: str = "tokens") -> dict:
     cand = full_candidate("transformer", total, {
@@ -143,7 +153,9 @@ def _candidate(args) -> dict:
     cand = s3t_candidate(args.total, args.batch,
                          args.mae_file or ("pretrain3_mae.pt" if args.arch == "xca" else None),
                          args.compile_blocks, args.arch)
-    if args.finetune_from:
+    if args.finetune_from and args.plain_finetune:
+        cand = plain_finetune_candidate(cand, args.finetune_from, args.total)
+    elif args.finetune_from:
         cand = finetune_candidate(cand, args.finetune_from, args.total)
     return cand
 
@@ -177,6 +189,13 @@ def main() -> None:
                     help="fine-tune for the weak classes from this checkpoint file (e.g. final_best.pt)")
     ap.add_argument("--finetune-kernel", default=None,
                     help="the kernel whose output holds --finetune-from")
+    ap.add_argument("--plain-finetune", action="store_true",
+                    help="with --finetune-from: the S3T-X recipe as it is (no S1/C1/C2/B2)")
+    ap.add_argument("--extra-dataset", default=None,
+                    help="Kaggle dataset with the HOT2024 frames (hot24_index.json), labelled "
+                         "by the --finetune-from model and added to the training split")
+    ap.add_argument("--extra-per-video", type=int, default=0,
+                    help="frames per HOT video to use (0: all in the dataset)")
     args = ap.parse_args()
     if args.finetune_from and not (args.finetune_kernel or args.render_only):
         ap.error("--finetune-from needs --finetune-kernel (the kernel whose output holds it)")
@@ -191,6 +210,9 @@ def main() -> None:
         "render_only": bool(args.render_only),
         "smoke_only": bool(args.smoke_only),
         "smoke": not args.no_smoke,
+        **({"extra_data": {"per_video": args.extra_per_video, "hi": 0.6, "lo": 0.3,
+                           **({"limit": 16} if args.smoke_only else {})}}
+           if args.extra_dataset else {}),
     }}, indent=2))
     subprocess.run([sys.executable, str(REPO / "tools" / "build_kernel.py"),
                     "--round-config", str(cfg), "--out-dir", str(args.out_dir),
@@ -200,6 +222,7 @@ def main() -> None:
                     *(["--kernel-source", args.render_kernel] if args.render_kernel else []),
                     *(["--kernel-source", args.finetune_kernel]
                       if args.finetune_kernel and not args.render_only else []),
+                    *(["--dataset-source", args.extra_dataset] if args.extra_dataset else []),
                     "--machine-shape", "cpu" if args.render_only else "NvidiaTeslaT4x2"], check=True)
     cfg.unlink()
 
