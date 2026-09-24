@@ -382,3 +382,54 @@ Rejected:
   separately in the test set too;
 - ignoring unmatched confident stone_block predictions as "missing labels":
   unverified, and it would teach the model to fire where annotators do not.
+
+### Result of the weak-class fine-tune, and where its bottleneck was
+`zetaoxia/hod26-s3t-ft`: 15 epochs, fine-tuned from the S3T-X best.pt.
+
+| | held-out (pycocotools) | LB |
+| --- | --- | --- |
+| parent (S3T-X) | 0.6835 | **0.63985** |
+| fine-tune | 0.6862 | 0.63083 |
+
+Bootstrap over frames (40 resamples) of the held-out difference:
+
+| | Δ | 95% interval |
+| --- | --- | --- |
+| overall | +0.0026 | [−0.0006, +0.0062] |
+| stone_block | +0.027 | [+0.013, +0.055] |
+| people | +0.007 | [−0.005, +0.022] |
+| e-bike | −0.018 | [−0.049, +0.008] |
+| car | +0.013 | [−0.003, +0.031] |
+| car_toy | −0.012 | [−0.028, +0.003] |
+
+Only stone_block's gain is outside the noise. The LB went down by 0.009.
+
+1. **S1 barely engaged.** The 16 new stem channels ended at 2% of the RGB
+   channels' weight norm (0.136 vs 6.93). The direction was right: 95% of
+   what they learned lies along the uniform (brightness) direction, the cue
+   the grey classes carry. The amount was not.
+   - Zero init, at 0.5 × 4.55e-4 over about 1100 optimizer steps, is too
+     little.
+   - Accordingly the low-contrast tertile did not improve (tight share):
+     - people 33 → 31%
+     - e-bike 37 → 37%
+     - car 62 → 60%
+   - It would need a much higher LR for that part, or a non-zero init along
+     the brightness direction.
+2. **The ruler cannot resolve these classes.** The held-out set has 57
+   e-bike, 58 stone_block and 41 orange instances. From epoch to epoch,
+   e-bike AP swung 0.23–0.42 and stone_block 0.21–0.28. The
+   per-class gate "all four weak classes up, no other class down more than
+   0.005" is well inside that noise. The overall +0.0027 had an interval
+   that includes 0. A 600-frame held-out cannot select per-class
+   interventions, and the LB (1000 frames) disagreed.
+3. **Crowd paste and repulsion helped some crowds and hurt e-bike rows.**
+   - people touching another box: tight 38 → 44%, missed 18 → 11%.
+   - car touching or overlapping: improved.
+   - e-bike overlapping > 0.1: tight 37 → 32%, missed 21 → 26%, median
+     IoU 0.70 → 0.61.
+   - Pasting e-bikes into rows of e-bikes (and repelling them) may make
+     parked rows less learnable. n = 19, so this is a hint, not a result.
+4. **No ablation.** Four changes in one run means none of their effects can
+   be separated. On LB evidence the combination is net negative, so the
+   parent stays the submission.
