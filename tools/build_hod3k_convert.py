@@ -12,7 +12,12 @@ identical). Per frame the kernel
   - de-mosaics with X2Cube at phase (0, 0) (the scan found every other phase
     10+ degrees further from the competition's spectra), stores band-planar PNG,
   - maps the classes: 0 and 2 -> people (11937 + 207 = the paper's 12144),
-    1 -> car, 3 -> e-bike, and converts YOLO centre/size to cube-pixel corners.
+    3 -> car, 1 -> e-bike (read off the drawn boxes, not the paper's counts),
+    and converts YOLO centre/size to cube-pixel corners,
+  - decodes each crop size at its own mosaic phase: the frames come in seven
+    sizes, and a crop whose origin is not a multiple of 4 shifts the pattern;
+    each size's phase is the one whose background spectrum best matches the
+    full 1024x2048 frames'.
 
 Output: /kaggle/working/hod3k/images/<n>.png and hod3k_index.json, mounted by
 the training kernel as a kernel source (train.extra_data index hod3k_index.json).
@@ -36,7 +41,7 @@ from PIL import Image
 T0 = time.time()
 def log(*a): print(f"[{time.time()-T0:6.0f}s]", *a, flush=True)
 OUT = Path("/kaggle/working/hod3k")
-MAP = {0: "people", 2: "people", 1: "car", 3: "e-bike"}
+MAP = {0: "people", 2: "people", 1: "e-bike", 3: "car"}   # checked on the drawn boxes: 3 sits on cars, 1 on e-bikes/scooters
 
 def x2cube(img, cell=4):
     m, n = img.shape
@@ -46,6 +51,14 @@ def x2cube(img, cell=4):
 def to_planar(cube):
     h, w, b = cube.shape
     return np.ascontiguousarray(cube.transpose(2, 0, 1).reshape(b * h, w))
+
+PHASE = {}
+
+def decode(a):
+    dy, dx = PHASE.get(a.shape, (0, 0))
+    a = a[dy:, dx:]
+    a = a[:a.shape[0] // 4 * 4, :a.shape[1] // 4 * 4]
+    return x2cube(a)
 
 def fix_hot(a):
     bad = np.argwhere(a > 4095)
@@ -118,9 +131,9 @@ def read_boxes(lab, W, H):
 def stats_job(args):
     n, split, stem, src, lab = args
     a = np.array(Image.open(src))
-    if a.ndim != 2 or a.shape[0] % 4 or a.shape[1] % 4:
+    if a.ndim != 2:
         return None
-    cube = x2cube(fix_hot(a)).astype(np.float32)
+    cube = decode(fix_hot(a)).astype(np.float32)
     H, W = cube.shape[:2]
     bx = read_boxes(lab, W, H)
     cs = [(b[0], core(cube, b[1:])) for b in bx]
@@ -130,12 +143,12 @@ def job(args):
     n, split, stem, src, lab = args
     try:
         a = np.array(Image.open(src))
-        if a.ndim != 2 or a.dtype != np.uint16 or a.shape[0] % 4 or a.shape[1] % 4:
+        if a.ndim != 2 or a.dtype != np.uint16:
             return None, f"{split}/{stem}: shape {a.shape} {a.dtype}"
         nh = int((a > 4095).sum())
         if nh > 0.001 * a.size:
             return None, f"{split}/{stem}: {nh} pixels above 10 bit"
-        cube = x2cube(fix_hot(a))
+        cube = decode(fix_hot(a))
         if GAIN is not None:
             cube = np.clip(np.rint(cube.astype(np.float32) * GAIN), 0, 65535).astype(np.uint16)
         H, W = cube.shape[:2]
@@ -161,8 +174,31 @@ def main():
             jobs.append((n, split, f.stem, f, lab)); n += 1
     log(f"{len(jobs)} frames with labels; {len(missing)} raw frames without a label file: {missing[:10]}")
 
+    # Mosaic phase per crop size, against the full frames at phase (0, 0).
+    global GAIN, PHASE
+    from collections import defaultdict
+    by_shape = defaultdict(list)
+    for j in jobs:
+        with Image.open(j[3]) as im:
+            by_shape[(im.size[1], im.size[0])].append(j)
+    log("frame sizes:", {k: len(v) for k, v in by_shape.items()})
+    def bg_sig(js, dy, dx):
+        out = []
+        for j in js[:40]:
+            a = fix_hot(np.array(Image.open(j[3]))).astype(np.float32)[dy:, dx:]
+            a = a[:a.shape[0] // 4 * 4, :a.shape[1] // 4 * 4]
+            out.append(background_shape(x2cube(a), []))
+        return np.median(out, 0)
+    ref = bg_sig(by_shape[(1024, 2048)], 0, 0)
+    for shp, js in by_shape.items():
+        if shp == (1024, 2048):
+            PHASE[shp] = (0, 0); continue
+        cand = {(dy, dx): ang(bg_sig(js, dy, dx), ref) for dy in range(4) for dx in range(4)}
+        best = min(cand, key=cand.get)
+        PHASE[shp] = best
+        log(f"  size {shp}: phase {best} ({cand[best]:.1f} deg; (0,0) {cand[(0, 0)]:.1f} deg)")
+
     # Per-band gain: HOD3K street background shape -> the competition's.
-    global GAIN
     comp = next(p.parent.parent for p in inp.rglob("train/annotations") if p.is_dir())
     c_bg, c_core = comp_street_stats(comp)
     rng = np.random.default_rng(0)
@@ -195,6 +231,7 @@ def main():
                 log(f"  {k}/{len(jobs)}")
     frames.sort(key=lambda f: f["id"])
     (OUT / "hod3k_index.json").write_text(json.dumps({"frames": frames, "gain": None if GAIN is None else GAIN.tolist(),
+                                                      "phase": {f"{k[0]}x{k[1]}": v for k, v in PHASE.items()},
                                                       "angles_before": before, "angles_after": after}))
     from collections import Counter
     cnt = Counter(b[0] for f in frames for b in f["boxes"])
