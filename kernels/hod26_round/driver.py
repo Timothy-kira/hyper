@@ -2264,6 +2264,23 @@ def build_model(name, weights=None):
 # epoch 0 looks like a slow run rather than a failure, which is why the starting
 # epoch is logged explicitly.
 
+def resume_checkpoint(cand, tag):
+    """The checkpoint this session continues from, or None for a fresh start.
+
+    A fine-tune (train.init_from) mounts the finished run it starts from, and
+    that run's output holds final_last.pt -- which stage_checkpoint would take
+    for this session's own previous chunk and resume, 44 epochs done, into the
+    widened model. A fine-tune only resumes when require_resume says so.
+    """
+    if (cand.get("train") or {}).get("init_from") and not cand.get("require_resume"):
+        found = find_checkpoint(tag)          # a lookup only: staging would copy its files in
+        if found is not None:
+            log(f"  not resuming from {found}: this is a fine-tune from train.init_from "
+                f"(set require_resume to continue a fine-tune session)")
+        return None
+    return stage_checkpoint(tag)
+
+
 def find_checkpoint(tag):
     """The previous session's last.pt, attached as another kernel's output.
 
@@ -2746,7 +2763,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
     # not burn a GPU session on an argument ultralytics will reject.
     close_mosaic = min(tr.get("close_mosaic", 5), max(0, tr["epochs"] - 1))
 
-    resume_from = stage_checkpoint(tag)
+    resume_from = resume_checkpoint(cand, tag)
     if cand.get("require_resume") and resume_from is None:
         # The expensive failure mode this run actually hit: no checkpoint found
         # looks exactly like a first session, so the run restarts from COCO and

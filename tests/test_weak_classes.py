@@ -102,6 +102,21 @@ def main() -> int:
             refused = True
         check("warm start refuses a model it cannot fully fill", refused)
 
+        # ---- a fine-tune never resumes the parent run it mounts
+        real, real_find = m.stage_checkpoint, m.find_checkpoint
+        m.stage_checkpoint = lambda tag: Path("/kaggle/input/parent/final_last.pt")
+        m.find_checkpoint = lambda tag: Path("/kaggle/input/parent/final_last.pt")
+        try:
+            plain = s3t_candidate(total=2, arch="xca")
+            ft_resume = copy.deepcopy(cand)
+            ft_resume["require_resume"] = True
+            check("fine-tune: the parent's final_last.pt is not taken for a resume",
+                  m.resume_checkpoint(cand, "final") is None
+                  and m.resume_checkpoint(plain, "final") is not None
+                  and m.resume_checkpoint(ft_resume, "final") is not None)
+        finally:
+            m.stage_checkpoint, m.find_checkpoint = real, real_find
+
         # ---- C1 / C2
         crit = net.criterion
         check("fine-tune candidate installs the weak-class gain and RepGT",
