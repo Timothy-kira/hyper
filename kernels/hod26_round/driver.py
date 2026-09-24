@@ -3735,8 +3735,17 @@ def run_two_stage(cand, index, train_ids, val_ids, anns, n_final, budget, reserv
     c2 = copy.deepcopy(cand)
     c2["train"].update(epochs=n_final, schedule_epochs=n_final, init_from=w1, warmup_epochs=0.3,
                        lr0=float(cand["train"]["lr0"]) * 0.5, close_mosaic=min(1, n_final))
-    s2, _, w2 = run_candidate(c2, index, [p for p in train_ids if int(p) < EXTRA_OFFSET], val_ids, anns,
-                              "final", budget_seconds=budget, reserve_seconds=reserve, data_yaml=yaml2)
+    try:
+        s2, _, w2 = run_candidate(c2, index, [p for p in train_ids if int(p) < EXTRA_OFFSET], val_ids, anns,
+                                  "final", budget_seconds=budget, reserve_seconds=reserve, data_yaml=yaml2)
+    except Exception:                                          # noqa: BLE001
+        # A submission from stage 1 beats none: stage 2 is the untested half.
+        log("!! stage 2 failed; predicting with stage 1's weights\n" + traceback.format_exc())
+        s1["stage2_failed"] = True
+        return s1, w1
+    if w2 is None:
+        log("!! stage 2 left no best.pt; predicting with stage 1's weights")
+        return s1, w1
     s2["stage1_mAP"] = s1.get("mAP")
     return s2, w2
 
