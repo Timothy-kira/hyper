@@ -260,3 +260,125 @@ what S3T feeds its encoder (level, shape, contrast per band). The gains are
 real but modest: a fixed per-pixel transform moves the deficit classes by
 ~0.02 AUC, which is why S3T learns the spectral-spatial mapping instead of
 hand-picking one.
+
+
+## S3T-X model (LB 0.63985): why stone_block / people / e-bike / car are still last (2026-09-24)
+
+Held-out AP (pycocotools, `zetaoxia/hod26-s3tx-diag` re-scored the 600 frames
+at 0.6834):
+
+| class | AP |
+| --- | --- |
+| stone_block | 0.234 |
+| people | 0.379 |
+| e-bike | 0.395 |
+| car | 0.551 |
+| the other 14 | 0.719–0.794 |
+
+Per-instance data: `spectral_scan.jsonl`, all 10063 annotated instances, with
+core/ring spectra and the box of each.
+
+### Not rare: crowded
+Counted by instance, none of these classes is rare. people has 1095 instances,
+the second most of any class. stone_block has 270, which is more than egg_wood
+(258, AP 0.78). What is rare is **scenes**: stone_block appears in only 42
+frames.
+
+What sets these four apart is **density and occlusion**:
+
+| class | instances / frame (max) | overlapping another box (IoU > 0.1) | > 30% covered |
+| --- | --- | --- | --- |
+| stone_block | 6.4 (19) | 10.0% | 5.9% |
+| people | 3.1 (15) | 17.2% | 10.3% |
+| e-bike | 2.6 (15) | **32.2%** | **23.7%** |
+| car | 2.9 (11) | 12.7% | 7.4% |
+| the other 14 | 1.0–2.3 (≤ 5) | 0–3.3% | 0–2.2% |
+
+The pairs are mostly same-class (people×people 128, e-bike×e-bike 118,
+car×car 64). There are also 60 e-bike×people pairs: riders, i.e. two different
+objects that are meant to overlap.
+
+Small size is not the cause: 60–65% of table_tennis and egg_wood boxes have a
+side under 16 px, and those classes still reach AP 0.72–0.78.
+
+### Spectrally: grey, dark, and a projection blind to it
+
+| class | class-mean object-vs-ring spectral angle ÷ within-class spread | per-band contrast (core − ring)/ring | darker than surroundings |
+| --- | --- | --- | --- |
+| stone_block | 1.16 | −0.06 to −0.14, **flat over all 16 bands** | 80% |
+| people | 0.58 | −0.27 to −0.36, flat | 80% |
+| e-bike | **0.21** | −0.29 to −0.34, flat | 84% |
+| car | 0.83; within-class spread 7.2° (paint colours) | +0.2 in bands 0–12, −0.1 in 13–15; sign agrees for only 55–67% of instances | 41% |
+| orange_plastic (for contrast) | 9.71 | −0.85 to +2.15, 91–100% same sign | 14% |
+
+Three of the four differ from the background only by a **uniform darkening**:
+of the 16 bands, the only information they carry is brightness. All 14
+tabletop classes are *brighter* than their background (86–100% of instances).
+
+The 16 → 3 LDA projection that feeds the COCO stem has rows that **sum to
+exactly 0**. That makes it orthogonal to a uniform change, so the pretrained
+path received nothing from these classes at initialisation. After training,
+the mixer had learned a small brightness component (cos 0.07–0.11 with the
+uniform direction). A grey object's input signal is still about 1/8 of a
+spectral object's.
+
+### Better than LDA? The bottleneck is the three channels
+
+Object-vs-background SNR is the Mahalanobis distance against the
+between-instance covariance of the background rings. Projections were fitted
+on train instances and evaluated on held-out ones.
+
+| stem input | stone_block | people | e-bike | car | class separation (median / min) |
+| --- | --- | --- | --- | --- | --- |
+| LDA 3 (current) | 0.24 | 0.62 | 0.52 | 0.64 | 3.40 / 0.12 |
+| contrast-LDA 3 | 0.28 | 0.70 | 0.55 | 1.55 | 1.73 / **0.04** |
+| LDA 3 + mean level | 0.29 | 0.74 | 0.57 | 0.76 | 3.62 / 0.12 |
+| LDA 3 + all 16 bands | **0.79** | **2.12** | **1.59** | **3.00** | **5.71 / 0.98** |
+
+- Re-choosing the 3 channels trades one side against the other: a better SNR
+  costs class separation.
+- Keeping the 3 LDA channels and also giving the stem all 16 bands recovers
+  3–4.7× the SNR.
+
+### On the model (step 0)
+Confident predictions (score ≥ 0.3):
+
+| class | tight (IoU ≥ 0.75) | missed | tight when isolated | tight when overlapping > 0.1 |
+| --- | --- | --- | --- | --- |
+| stone_block | 36% | 24% | 30% | (n = 3) |
+| people | 43% | 8% | **51%** | **15%** |
+| e-bike | 47% | 9% | 52% | 37% (missed 21%) |
+| car | 71% | 9% | 72% | 60% |
+| badminton / rubik | 96–97% | 0% | | |
+
+- **Brightness contrast predicts tightness.** From the lowest to the highest
+  |log brightness| tertile, the tight share rises: people 33 → 53%, e-bike
+  37 → 63%, car 62 → 90%. stone_block stays flat at about 36%.
+- **Confident false positives** per 100 ground-truth boxes: 12.6–20.7 for these
+  four classes, against 0–3.6 for the others.
+- **Box bias:**
+  - stone_block boxes are 8% too wide.
+  - Correcting that post hoc does **not** survive cross-validation: fitted on
+    one half of the frames and tested on the other, it gave −0.080 and +0.018.
+    With 13–23 matched boxes the bias is not stable, so the correction is not
+    used.
+
+### What was done about it: fine-tune from the S3T-X best.pt
+Kernel `zetaoxia/hod26-s3t-ft`, 15 epochs.
+
+- **S1:** the stem's first conv reads the 3 LDA channels plus all 16 bands.
+  The extra channels are zero-initialised, so step 0 is unchanged.
+- **C1:** box loss ×2 on these four classes' matched pairs.
+- **C2:** repulsion from same-class neighbouring ground truth, charging only
+  the IoG *beyond* the truth's own overlap. Ground-truth boxes here overlap
+  each other, so plain RepGT would charge the exact answer.
+- **B2:** crowd copy-paste of real instances beside a same-class anchor in
+  street frames. Each instance brings a feathered background margin and is
+  scaled per band to the destination's surroundings.
+
+Rejected:
+- post-hoc box correction (above);
+- rewriting e-bike/rider boxes: they are two different objects, labelled
+  separately in the test set too;
+- ignoring unmatched confident stone_block predictions as "missing labels":
+  unverified, and it would teach the model to fire where annotators do not.
