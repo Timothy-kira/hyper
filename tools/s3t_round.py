@@ -155,6 +155,8 @@ def _candidate(args) -> dict:
                          args.compile_blocks, args.arch)
     if args.finetune_from and args.plain_finetune:
         cand = plain_finetune_candidate(cand, args.finetune_from, args.total)
+        if args.band_gain:
+            cand["augment"]["band_gain"] = args.band_gain
     elif args.finetune_from:
         cand = finetune_candidate(cand, args.finetune_from, args.total)
     return cand
@@ -196,6 +198,10 @@ def main() -> None:
                          "by the --finetune-from model and added to the training split")
     ap.add_argument("--extra-index", default="hot24_index.json",
                     help="the index file inside --extra-dataset (hod3k_index.json: fully labelled)")
+    ap.add_argument("--final-comp-epochs", type=int, default=0,
+                    help="with --extra-dataset: train the last N epochs on the competition's frames only")
+    ap.add_argument("--band-gain", type=float, default=0.0,
+                    help="per-band gain jitter (+-) on the augmented copies")
     ap.add_argument("--extra-per-video", type=int, default=0,
                     help="frames per HOT video to use (0: all in the dataset)")
     args = ap.parse_args()
@@ -213,6 +219,7 @@ def main() -> None:
         "smoke_only": bool(args.smoke_only),
         "smoke": not args.no_smoke,
         **({"extra_data": {"index": args.extra_index, "per_video": args.extra_per_video, "hi": 0.6, "lo": 0.3,
+                           "final_comp_epochs": args.final_comp_epochs,
                            **({"limit": 16} if args.smoke_only else {})}}
            if args.extra_dataset else {}),
     }}, indent=2))

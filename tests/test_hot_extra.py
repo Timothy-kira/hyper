@@ -149,6 +149,29 @@ def main() -> int:
         check("labelled: ignore region blanked, labelled pixels intact",
               (got[2:12, 50:60] == got[2, 50]).all() and (got[2:20, 2:12] == cube[2:20, 2:12]).all())
 
+        # ---- band gain jitter
+        rng2 = np.random.default_rng(1)
+        c0 = np.full((8, 8, 16), 1000, np.uint16)
+        c1, _ = m.augment_cube(c0, [], {"band_gain": 0.1}, {}, [], rng2)
+        ratio = c1[0, 0].astype(float) / 1000
+        check("band_gain: one gain per band within +-10%, spatially uniform, dtype kept",
+              c1.dtype == np.uint16 and (np.abs(ratio - 1) <= 0.1 + 1e-3).all() and ratio.std() > 0.01
+              and (c1 == c1[0, 0]).all())
+
+        # ---- stage-2 list: competition frames only, from the same render
+        root = td / "ds"
+        for sub_ in ("images/train", "labels/train", "images/val"):
+            (root / sub_).mkdir(parents=True)
+        names = ["12.png", "12_a0.png", "12_r0.png", f"{m.EXTRA_OFFSET + 3}.png", f"{m.EXTRA_OFFSET + 4}.png"]
+        for nme in names:
+            (root / "images/train" / nme).write_bytes(b"")
+        (root / "data.yaml").write_text(f"path: {root}\ntrain: images/train\nval: images/val\nnc: 18\n")
+        y2, n2 = m.comp_only_yaml(root / "data.yaml")
+        listed = [Path(q).name for q in (root / "train_comp.txt").read_text().split()]
+        check("stage 2 yaml lists the competition's frames, copies and repeats, no external frame",
+              n2 == 3 and sorted(listed) == ["12.png", "12_a0.png", "12_r0.png"]
+              and f"train: {root / 'train_comp.txt'}" in y2.read_text() and "val: images/val" in y2.read_text())
+
     print(f"\n{len(fails)} failure(s)" if fails else "\nall HOT extra-data checks passed")
     return 1 if fails else 0
 

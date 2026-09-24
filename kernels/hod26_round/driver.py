@@ -286,6 +286,12 @@ def augment_cube(cube, boxes, aug, donors, pool, rng, paste=None):
         other = load_planar(pool[int(rng.integers(0, len(pool)))])
         cube, boxes = superpixel_cutmix(cube, boxes, other, aug["cutmix_prob"],
                                         aug["cutmix_blocks"], rng)
+    if aug.get("band_gain"):
+        # Per-band gain jitter: a different white balance / illuminant per copy,
+        # so the model does not key on one camera calibration (HOD3K's differs
+        # from the competition's, and the test set's material classes shifted).
+        g = rng.uniform(1 - float(aug["band_gain"]), 1 + float(aug["band_gain"]), cube.shape[-1])
+        cube = np.clip(cube.astype(np.float32) * g.astype(np.float32), 0, 65535).astype(cube.dtype)
     if paste and aug.get("crowd_paste") and rng.random() < float(aug.get("crowd_paste_p", 1.0)):
         anchors = {CLASSES.index(n) for n in aug["paste_classes"]}
         cube, boxes = crowd_paste(cube, boxes, paste, rng, anchors,
@@ -362,7 +368,9 @@ def _render_frame(job):
         # images. Re-rendering it would only add our own spectral augmentation
         # on top, which is what the copies setting is for.
         rng = np.random.default_rng((0, int(pid)))
-        for k in range(m["copies"]):
+        # External frames (EXTRA_OFFSET) are written once: they are already
+        # more numerous than the competition's, and a copy would double them.
+        for k in range(m["copies"] if int(pid) < EXTRA_OFFSET else 0):
             c2, b2 = augment_cube(cube, list(a.boxes), m["aug"], m["donors"], m["pool"], rng,
                                   paste=m.get("paste"))
             _emit(root, split, f"{pid}_a{k}", build_channels(c2, m["channels"]), b2, a)
@@ -425,7 +433,7 @@ def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
     for split, ids in (("train", train_ids), ("val", val_ids)):
         n = len(list((root / "images" / split).glob("*.png"))) + \
             len(list((root / "images" / split).glob("*.tiff")))
-        expect = (sum(reps[p] + (copies if wants_aug else 0) for p in ids)
+        expect = (sum(reps[p] + (copies if wants_aug and int(p) < EXTRA_OFFSET else 0) for p in ids)
                   if split == "train" else len(ids))
         if n == 0 or n != expect:
             raise RuntimeError(f"{split}: wrote {n} images, expected {expect}")
@@ -2749,14 +2757,18 @@ def run_smoke_only(round_cfg, cand, index, train_ids, val_ids, anns, test_dir):
 
 
 def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
-                  reserve_seconds=300, root=None, prerendered=True, speed_file=None):
+                  reserve_seconds=300, root=None, prerendered=True, speed_file=None,
+                  data_yaml=None):
 
     root = root or SCRATCH / f"ds_{channels_key(cand)}"
     log(f"  scratch {SCRATCH} ({free_gb(SCRATCH):.1f} GB free), "
         f"output {WORK} ({free_gb(WORK):.1f} GB free)")
-    pre = find_prerendered(cand, train_ids, val_ids) if prerendered else None
-    yaml = (adopt_prerendered(pre, root) if pre is not None
-            else materialize(cand, index, train_ids, val_ids, anns, root))
+    if data_yaml is not None:
+        yaml = Path(data_yaml)
+    else:
+        pre = find_prerendered(cand, train_ids, val_ids) if prerendered else None
+        yaml = (adopt_prerendered(pre, root) if pre is not None
+                else materialize(cand, index, train_ids, val_ids, anns, root))
     tr, inf = cand["train"], cand["infer"]
 
     # Defensive clamp: a candidate that reached here without normalization must
@@ -3248,7 +3260,10 @@ def tta_sweep(model, cand, root, spec):
 
 
 def find_weights(name):
-    """A checkpoint left behind by another kernel, mounted under /kaggle/input."""
+    """A checkpoint left behind by another kernel, mounted under /kaggle/input
+    (or an absolute path: the first stage of a two-stage run)."""
+    if Path(name).is_absolute() and Path(name).exists():
+        return Path(name)
     for base in sorted(INPUT.glob("*")):
         if _looks_like_dataset(base):
             continue
@@ -3684,6 +3699,48 @@ def hot_extra(sub, cand):
     return anns, index
 
 
+def comp_only_yaml(yaml):
+    """A data.yaml over the same rendered dataset whose train split lists only
+    the competition's frames (and their copies/repeats): no re-rendering."""
+    yaml = Path(yaml)
+    root = yaml.parent
+    imgs = sorted(p for p in (root / "images" / "train").iterdir()
+                  if int(p.stem.split("_")[0]) < EXTRA_OFFSET)
+    lst = root / "train_comp.txt"
+    lst.write_text("\n".join(str(p) for p in imgs) + "\n")
+    lines = [f"train: {lst}" if ln.startswith("train:") else ln for ln in yaml.read_text().splitlines()]
+    out = root / "data_comp.yaml"
+    out.write_text("\n".join(lines) + "\n")
+    for c in (root / "labels").glob("*.cache"):
+        c.unlink()
+    return out, len(imgs)
+
+
+def run_two_stage(cand, index, train_ids, val_ids, anns, n_final, budget, reserve):
+    """Stage 1 on competition + external frames; stage 2 the last n_final epochs
+    on the competition's frames only, from stage 1's best, so the boxes end on
+    the competition's annotation convention and distribution."""
+    import copy
+    total = int(cand["train"]["epochs"])
+    c1 = copy.deepcopy(cand)
+    c1["train"].update(epochs=total - n_final, schedule_epochs=total - n_final)
+    log(f"two-stage: {total - n_final} epochs with the external frames, then {n_final} on the competition's only")
+    root = SCRATCH / f"ds_{channels_key(cand)}"
+    s1, _, w1 = run_candidate(c1, index, train_ids, val_ids, anns, "stage1",
+                              budget_seconds=budget, reserve_seconds=reserve, root=root, prerendered=False)
+    w1 = w1 or str(RUNS / "stage1" / "weights" / "last.pt")
+    log(f"stage 1 done: held-out mAP {s1.get('mAP', float('nan')):.4f}; stage 2 from {w1}")
+    yaml2, n2 = comp_only_yaml(root / "data.yaml")
+    log(f"stage 2 train list: {n2} competition images")
+    c2 = copy.deepcopy(cand)
+    c2["train"].update(epochs=n_final, schedule_epochs=n_final, init_from=w1, warmup_epochs=0.3,
+                       lr0=float(cand["train"]["lr0"]) * 0.5, close_mosaic=min(1, n_final))
+    s2, _, w2 = run_candidate(c2, index, [p for p in train_ids if int(p) < EXTRA_OFFSET], val_ids, anns,
+                              "final", budget_seconds=budget, reserve_seconds=reserve, data_yaml=yaml2)
+    s2["stage1_mAP"] = s1.get("mAP")
+    return s2, w2
+
+
 def run_submission(round_cfg):
     """Train one candidate at full fidelity and write submission.csv."""
     cand = round_cfg["submit"]["candidate"]
@@ -3727,8 +3784,12 @@ def run_submission(round_cfg):
         return run_smoke_only(round_cfg, cand, index, train_ids, val_ids, anns, test_dir)
     if round_cfg["submit"].get("smoke", True) and visible_gpus() > 0:
         run_smoke(cand, index, train_ids, val_ids, anns, round_cfg["submit"])
-    scores, _, weights = run_candidate(cand, index, train_ids, val_ids, anns, "final",
-                                       budget_seconds=budget, reserve_seconds=reserve)
+    n_final = int((round_cfg["submit"].get("extra_data") or {}).get("final_comp_epochs", 0) or 0)
+    if n_final and any(int(p) >= EXTRA_OFFSET for p in train_ids):
+        scores, weights = run_two_stage(cand, index, train_ids, val_ids, anns, n_final, budget, reserve)
+    else:
+        scores, _, weights = run_candidate(cand, index, train_ids, val_ids, anns, "final",
+                                           budget_seconds=budget, reserve_seconds=reserve)
     note = " (optimistic: seen in training)" if round_cfg["submit"].get("use_all_train", True) else ""
     reached = int(scores.get("last_epoch") or 0)
     log(f"fit done at epoch {reached}/{target}; holdout mAP={scores['mAP']:.4f}{note}")

@@ -61,6 +61,71 @@ def fix_hot(a):
         a[y, x] = int(np.median(nb)) if len(nb) else 0
     return a
 
+GAIN = None
+
+def comp_street_stats(comp, k=400):
+    """Per-band median shape of the competition's street backgrounds, and its people/car/e-bike cores."""
+    import re
+    shapes, cores = [], {"people": [], "car": [], "e-bike": []}
+    files = sorted((comp / "train" / "annotations").glob("*.xml"))
+    for f in files:
+        x = f.read_text()
+        bb = [(m.group(1), *map(int, m.group(2, 3, 4, 5))) for m in re.finditer(
+            r"<name>(.*?)</name>.*?<xmin>(-?\d+)</xmin>\s*<ymin>(-?\d+)</ymin>\s*<xmax>(-?\d+)</xmax>\s*<ymax>(-?\d+)</ymax>", x, re.S)]
+        if not any(n in cores for n, *_ in bb):
+            continue
+        p = np.array(Image.open(comp / "train" / "images" / f"{f.stem}.png"))
+        cube = p.reshape(16, p.shape[0] // 16, p.shape[1]).transpose(1, 2, 0).astype(np.float32)
+        shapes.append(background_shape(cube, [b[1:] for b in bb]))
+        for n, x1, y1, x2, y2 in bb:
+            if n in cores:
+                c = core(cube, (x1, y1, x2, y2))
+                if c is not None: cores[n].append(c)
+        if len(shapes) >= k:
+            break
+    return np.median(shapes, 0), {n: unit(np.mean(v, 0)) for n, v in cores.items() if v}
+
+def unit(v):
+    v = np.asarray(v, np.float64); return v / (np.linalg.norm(v) + 1e-12)
+
+def ang(a, b):
+    return float(np.degrees(np.arccos(np.clip(unit(a) @ unit(b), -1, 1))))
+
+def background_shape(cube, boxes):
+    m = np.ones(cube.shape[:2], bool)
+    for x1, y1, x2, y2 in boxes:
+        m[max(0, int(y1)):int(y2), max(0, int(x1)):int(x2)] = False
+    v = np.median(cube[m] if m.sum() > 100 else cube.reshape(-1, 16), 0)
+    return v / (v.mean() + 1e-9)
+
+def core(cube, b):
+    x1, y1, x2, y2 = b; w, h = x2 - x1, y2 - y1
+    if w < 6 or h < 6: return None
+    sub = cube[int(y1 + .15*h):int(y2 - .15*h), int(x1 + .15*w):int(x2 - .15*w)].reshape(-1, 16)
+    return unit(sub.mean(0)) if len(sub) else None
+
+def read_boxes(lab, W, H):
+    boxes = []
+    for line in lab.read_text().split("\n"):
+        v = line.split()
+        if len(v) < 5:
+            continue
+        c, cx, cy, w, h = int(v[0]), *map(float, v[1:5])
+        if c in MAP:
+            boxes.append([MAP[c], (cx - w / 2) * W, (cy - h / 2) * H, (cx + w / 2) * W, (cy + h / 2) * H])
+    return boxes
+
+def stats_job(args):
+    n, split, stem, src, lab = args
+    a = np.array(Image.open(src))
+    if a.ndim != 2 or a.shape[0] % 4 or a.shape[1] % 4:
+        return None
+    cube = x2cube(fix_hot(a)).astype(np.float32)
+    H, W = cube.shape[:2]
+    bx = read_boxes(lab, W, H)
+    cs = [(b[0], core(cube, b[1:])) for b in bx]
+    return background_shape(cube, [b[1:] for b in bx]), [(c, v.tolist()) for c, v in cs if v is not None]
+
 def job(args):
     n, split, stem, src, lab = args
     try:
@@ -71,17 +136,11 @@ def job(args):
         if nh > 0.001 * a.size:
             return None, f"{split}/{stem}: {nh} pixels above 10 bit"
         cube = x2cube(fix_hot(a))
+        if GAIN is not None:
+            cube = np.clip(np.rint(cube.astype(np.float32) * GAIN), 0, 65535).astype(np.uint16)
         H, W = cube.shape[:2]
         Image.fromarray(to_planar(cube)).save(OUT / "images" / f"{n}.png")
-        boxes = []
-        for line in lab.read_text().split("\n"):
-            v = line.split()
-            if len(v) < 5:
-                continue
-            c, cx, cy, w, h = int(v[0]), *map(float, v[1:5])
-            if c not in MAP:
-                continue
-            boxes.append([MAP[c], (cx - w / 2) * W, (cy - h / 2) * H, (cx + w / 2) * W, (cy + h / 2) * H])
+        boxes = read_boxes(lab, W, H)
         return {"id": n, "split": split, "stem": stem, "w": W, "h": H, "hot": nh, "boxes": boxes}, None
     except Exception as e:                                   # noqa: BLE001
         return None, f"{split}/{stem}: {e!r}"
@@ -101,6 +160,33 @@ def main():
                 continue
             jobs.append((n, split, f.stem, f, lab)); n += 1
     log(f"{len(jobs)} frames with labels; {len(missing)} raw frames without a label file: {missing[:10]}")
+
+    # Per-band gain: HOD3K street background shape -> the competition's.
+    global GAIN
+    comp = next(p.parent.parent for p in inp.rglob("train/annotations") if p.is_dir())
+    c_bg, c_core = comp_street_stats(comp)
+    rng = np.random.default_rng(0)
+    sample = [jobs[i] for i in rng.choice(len(jobs), min(600, len(jobs)), replace=False)]
+    with Pool(4) as pool:
+        st = [r for r in pool.map(stats_job, sample, chunksize=8) if r is not None]
+    h_bg = np.median([r[0] for r in st], 0)
+    h_core = {}
+    for _, cs in st:
+        for c, v in cs:
+            h_core.setdefault(c, []).append(v)
+    gain = c_bg / h_bg
+    gain = gain / np.exp(np.mean(np.log(gain)))
+    before = {c: ang(np.mean(h_core[c], 0), c_core[c]) for c in c_core if c in h_core}
+    after = {c: ang(np.mean(h_core[c], 0) * gain, c_core[c]) for c in c_core if c in h_core}
+    log("background shape  HOD3K :", " ".join(f"{v:.2f}" for v in h_bg))
+    log("background shape  COMP  :", " ".join(f"{v:.2f}" for v in c_bg))
+    log("per-band gain           :", " ".join(f"{v:.2f}" for v in gain))
+    log("core angle to competition class (deg), before -> after gain:",
+        {c: f"{before[c]:.1f} -> {after[c]:.1f}" for c in before})
+    gain_on = bool(before) and np.mean(list(after.values())) <= np.mean(list(before.values())) - 1.5
+    GAIN = gain.astype(np.float32) if gain_on else None
+    log(f"GAIN {'APPLIED' if gain_on else 'NOT applied (does not bring the objects closer)'}")
+
     frames, errs = [], []
     with Pool(4) as pool:
         for k, (fr, err) in enumerate(pool.imap(job, jobs, chunksize=8)):
@@ -108,7 +194,8 @@ def main():
             if k % 500 == 0:
                 log(f"  {k}/{len(jobs)}")
     frames.sort(key=lambda f: f["id"])
-    (OUT / "hod3k_index.json").write_text(json.dumps({"frames": frames}))
+    (OUT / "hod3k_index.json").write_text(json.dumps({"frames": frames, "gain": None if GAIN is None else GAIN.tolist(),
+                                                      "angles_before": before, "angles_after": after}))
     from collections import Counter
     cnt = Counter(b[0] for f in frames for b in f["boxes"])
     log(f"wrote {len(frames)} frames ({Counter(f['split'] for f in frames)}), boxes {dict(cnt)}, "
@@ -130,7 +217,7 @@ def main() -> None:
         "id": args.slug, "title": args.slug.split("/")[-1].replace("-", " ").title(),
         "code_file": "hod3k_convert.py", "language": "python", "kernel_type": "script",
         "is_private": True, "enable_gpu": False, "enable_internet": False,
-        "competition_sources": [], "dataset_sources": ["xishengfeng/hsidata", "xishengfeng/hsidataraw"],
+        "competition_sources": [], "dataset_sources": ["xishengfeng/hsidata", "xishengfeng/hsidataraw", "xishengfeng/hod26-planar"],
         "kernel_sources": [],
     }, indent=2))
     print(f"wrote {args.out_dir / 'hod3k_convert.py'} (CPU only)")
