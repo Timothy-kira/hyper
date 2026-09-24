@@ -262,7 +262,18 @@ def class_donors(index, anns, ids, limit=200):
     return {c: acc[c] / n[c] for c in acc}
 
 
-def augment_cube(cube, boxes, aug, donors, pool, rng):
+def paste_pool(index, anns, ids, names):
+    """{cls_id: [(frame path, box)]} of the named classes' instances, for crowd_paste."""
+    want = {CLASSES.index(n) for n in names}
+    out = {c: [] for c in want}
+    for pid in ids:
+        for b in anns[pid].boxes:
+            if b.cls_id in want:
+                out[b.cls_id].append((str(index[pid]), (b.x1, b.y1, b.x2, b.y2)))
+    return out
+
+
+def augment_cube(cube, boxes, aug, donors, pool, rng, paste=None):
     """Apply the spectral and spatial operators a candidate asked for."""
     if aug.get("sg_window"):
         # Smoothing is along wavelength, which is not mosaic order (bands 4 and
@@ -275,6 +286,12 @@ def augment_cube(cube, boxes, aug, donors, pool, rng):
         other = load_planar(pool[int(rng.integers(0, len(pool)))])
         cube, boxes = superpixel_cutmix(cube, boxes, other, aug["cutmix_prob"],
                                         aug["cutmix_blocks"], rng)
+    if paste and aug.get("crowd_paste") and rng.random() < float(aug.get("crowd_paste_p", 1.0)):
+        anchors = {CLASSES.index(n) for n in aug["paste_classes"]}
+        cube, boxes = crowd_paste(cube, boxes, paste, rng, anchors,
+                                  lambda path: load_planar(Path(path)),
+                                  n_max=int(aug["crowd_paste"]),
+                                  margin=int(aug.get("paste_margin", 4)))
     return cube, boxes
 
 
@@ -346,7 +363,8 @@ def _render_frame(job):
         # on top, which is what the copies setting is for.
         rng = np.random.default_rng((0, int(pid)))
         for k in range(m["copies"]):
-            c2, b2 = augment_cube(cube, list(a.boxes), m["aug"], m["donors"], m["pool"], rng)
+            c2, b2 = augment_cube(cube, list(a.boxes), m["aug"], m["donors"], m["pool"], rng,
+                                  paste=m.get("paste"))
             _emit(root, split, f"{pid}_a{k}", build_channels(c2, m["channels"]), b2, a)
         for k in range(m["reps"][pid] - 1):
             for src, dst in ((frame, frame.with_name(f"{pid}_r{k}{frame.suffix}")),
@@ -374,7 +392,8 @@ def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
 
     aug = cand.get("augment", {})
     copies = int(aug.get("copies", 0))
-    wants_aug = bool(aug.get("sg_window") or aug.get("smote_alpha") or aug.get("cutmix_prob"))
+    wants_aug = bool(aug.get("sg_window") or aug.get("smote_alpha") or aug.get("cutmix_prob")
+                     or aug.get("crowd_paste"))
     donors = class_donors(index, anns, train_ids) if aug.get("smote_alpha") else {}
     pool = [index[p] for p in train_ids] if aug.get("cutmix_prob") else []
     reps = repeat_factors(train_ids, anns, float(cand["train"].get("repeat_threshold", 0.0)))
@@ -383,8 +402,13 @@ def materialize(cand, index, train_ids, val_ids, anns, root):  # noqa: C901
     # pickling it. Each frame's augmentation draws from its own generator,
     # seeded by the frame id, so the result does not depend on scheduling.
     _MAT.clear()
+    paste = (paste_pool(index, anns, train_ids, aug["paste_classes"])
+             if aug.get("crowd_paste") else None)
+    if paste:
+        log(f"  crowd paste: up to {aug['crowd_paste']} per augmented street frame from "
+            + ", ".join(f"{CLASSES[c]} {len(v)}" for c, v in sorted(paste.items())))
     _MAT.update(index=index, anns=anns, channels=cand["channels"], aug=aug, donors=donors,
-                pool=pool, copies=copies if wants_aug else 0, reps=reps, root=root)
+                pool=pool, copies=copies if wants_aug else 0, reps=reps, root=root, paste=paste)
     jobs = [("train", p) for p in train_ids] + [("val", p) for p in val_ids]
     workers = max(1, min(os.cpu_count() or 1, 8))
     t_r = time.time()
@@ -749,10 +773,28 @@ if _RTDETRLoss is not None:
         fdr: bool = False
         fgl_gain: float = 0.15
         ddf_gain: float = 1.5
+        # Per-class weight on a matched pair's L1 and overlap terms ({cls_id:
+        # gain}; others 1), and a repulsion from neighbouring ground truth
+        # (after RepGT, Repulsion Loss, Wang et al. CVPR 2018), at rep_gain x
+        # the overlap term's gain. Both aimed at the crowded, mutually
+        # occluding classes -- stone_block / people / e-bike / car are the only
+        # ones whose boxes overlap other boxes at all (10-32% vs 0-3%).
+        #
+        # Plain RepGT would be wrong here: it charges any overlap with another
+        # box, and these ground-truth boxes overlap *each other* (a rider's
+        # box and the e-bike's, neighbours in a crowd), so the exact answer
+        # would be charged and pushed off its own target. Only the overlap
+        # beyond the truth's is charged: max(0, IoG(pred, g') - IoG(gt, g')).
+        # The true box costs nothing; a box that swallows part of a neighbour
+        # (two people in one box, a drift toward the next car) is pushed back.
+        box_cls_gain: dict = {}
+        rep_gain: float = 0.0
+        rep_sigma: float = 0.5
 
         def __getstate__(self):
             state = self.__dict__.copy()
             state.pop("_fdr_calls", None)
+            state.pop("_box_ctx", None)
             return state
 
         def _get_loss(self, pred_bboxes, pred_scores, gt_bboxes, gt_cls, gt_groups, masks=None,
@@ -764,9 +806,15 @@ if _RTDETRLoss is not None:
             calls = self.__dict__.get("_fdr_calls")
             if calls is not None:
                 calls.append((match_indices, pred_bboxes, pred_scores))
-            return super()._get_loss(pred_bboxes, pred_scores, gt_bboxes, gt_cls, gt_groups,
-                                     masks=masks, gt_mask=gt_mask, postfix=postfix,
-                                     match_indices=match_indices)
+            # What the per-pair terms need and _get_loss_bbox is not given: the
+            # matched pairs' classes and images, and every box of the batch.
+            self.__dict__["_box_ctx"] = (match_indices, gt_bboxes, gt_cls, gt_groups)
+            try:
+                return super()._get_loss(pred_bboxes, pred_scores, gt_bboxes, gt_cls, gt_groups,
+                                         masks=masks, gt_mask=gt_mask, postfix=postfix,
+                                         match_indices=match_indices)
+            finally:
+                self.__dict__.pop("_box_ctx", None)
 
         def forward(self, preds, batch, dn_bboxes=None, dn_scores=None, dn_meta=None):
             dec = self.__dict__.get("_fdr_decoder")
@@ -783,16 +831,80 @@ if _RTDETRLoss is not None:
             return loss
 
         def _l1(self, pred_bboxes, gt_bboxes):
+            """Per matched pair (summed over the four coordinates)."""
             if not self.log_size:
-                return _F.l1_loss(pred_bboxes, gt_bboxes, reduction="sum")
+                return _F.l1_loss(pred_bboxes, gt_bboxes, reduction="none").sum(-1)
             # Centres stay linear; only the sizes move to log space. Sizes come
             # out of a sigmoid, so a width near zero would send log to -inf --
             # the clamp is what keeps that from surfacing as a NaN epochs later.
-            ctr = _F.l1_loss(pred_bboxes[..., :2], gt_bboxes[..., :2], reduction="sum")
+            ctr = _F.l1_loss(pred_bboxes[..., :2], gt_bboxes[..., :2], reduction="none").sum(-1)
             wh = _F.l1_loss(pred_bboxes[..., 2:].clamp_min(self.EPS).log(),
                             gt_bboxes[..., 2:].clamp_min(self.EPS).log(),
-                            reduction="sum")
+                            reduction="none").sum(-1)
             return ctr + wh
+
+        def _pair_ctx(self, n):
+            """(image of each matched pair, gt index of each, all gt boxes, classes, groups) or None."""
+            ctx = self.__dict__.get("_box_ctx")
+            if ctx is None:
+                return None
+            match_indices, gt_all, gt_cls, groups = ctx
+            bidx = _torch.cat([_torch.full_like(src, i) for i, (src, _) in enumerate(match_indices)])
+            gidx = _torch.cat([dst for (_, dst) in match_indices])
+            if len(gidx) != n:
+                return None
+            return bidx.to(gt_all.device), gidx.to(gt_all.device), gt_all, gt_cls, groups
+
+        def _pair_weights(self, n, ctx, device):
+            if not self.box_cls_gain or ctx is None:
+                return None
+            cls = ctx[3][ctx[1]].view(-1).long()
+            w = _torch.ones(n, device=device)
+            for c, g in self.box_cls_gain.items():
+                w = _torch.where(cls == int(c), _torch.full_like(w, float(g)), w)
+            return w
+
+        def _rep_gt(self, pred_bboxes, ctx):
+            """Sum over matched pairs of smooth-ln(excess IoG) against the worst other gt.
+
+            Excess over the pair's own ground truth: zero, with zero gradient,
+            for a prediction equal to its target however much the targets overlap.
+            """
+            bidx, gidx, gt_all, _, groups = ctx
+            if gt_all.shape[0] < 2:
+                return pred_bboxes.sum() * 0.0
+            img = _torch.repeat_interleave(_torch.arange(len(groups), device=gt_all.device),
+                                           _torch.as_tensor(groups, device=gt_all.device))
+            p = _torch.cat([pred_bboxes[:, :2] - pred_bboxes[:, 2:] / 2,
+                            pred_bboxes[:, :2] + pred_bboxes[:, 2:] / 2], -1).float()
+            g = _torch.cat([gt_all[:, :2] - gt_all[:, 2:] / 2,
+                            gt_all[:, :2] + gt_all[:, 2:] / 2], -1).float()
+            lt = _torch.maximum(p[:, None, :2], g[None, :, :2])
+            rb = _torch.minimum(p[:, None, 2:], g[None, :, 2:])
+            inter = (rb - lt).clamp_min(0).prod(-1)                       # (n, m)
+            area_g = (g[:, 2:] - g[:, :2]).clamp_min(1e-9).prod(-1)
+            area_p = (p[:, 2:] - p[:, :2]).clamp_min(1e-9).prod(-1)
+            other = (bidx[:, None] == img[None, :])
+            other[_torch.arange(len(gidx), device=other.device), gidx] = False
+            # how much of each other gt the prediction covers, beyond what its
+            # own ground truth covers
+            t = g[gidx]
+            lt_t = _torch.maximum(t[:, None, :2], g[None, :, :2])
+            rb_t = _torch.minimum(t[:, None, 2:], g[None, :, 2:])
+            true_iog = (rb_t - lt_t).clamp_min(0).prod(-1) / area_g[None, :]
+            excess = inter / area_g[None, :] - true_iog
+            excess = _torch.where(other, excess, _torch.full_like(excess, -1.0))
+            best = excess.detach().argmax(1)
+            ex = excess.gather(1, best[:, None])[:, 0]
+            valid = ex.detach() > 0
+            if not bool(valid.any()):
+                return pred_bboxes.sum() * 0.0
+            iog = ex.clamp(0.0, 1.0 - 1e-4)
+            sig = self.rep_sigma
+            import math as _m
+            smooth = _torch.where(iog <= sig, -_torch.log1p(-iog),
+                                  (iog - sig) / (1.0 - sig) - _m.log(1.0 - sig))
+            return (smooth * valid).sum()
 
         def _get_loss_bbox(self, pred_bboxes, gt_bboxes, postfix=""):
             name_bbox, name_giou = f"loss_bbox{postfix}", f"loss_giou{postfix}"
@@ -800,6 +912,8 @@ if _RTDETRLoss is not None:
                 z = _torch.tensor(0.0, device=self.device)
                 return {name_bbox: z, name_giou: z.clone()}
             n = len(gt_bboxes)
+            ctx = self._pair_ctx(n) if (self.box_cls_gain or self.rep_gain) else None
+            w = self._pair_weights(n, ctx, pred_bboxes.device)
             variant = _bbox_iou(pred_bboxes, gt_bboxes, xywh=True, **self.iou_flag)
             if self.alpha_iou == 1.0:
                 overlap = 1.0 - variant
@@ -809,9 +923,19 @@ if _RTDETRLoss is not None:
                 # construction, whatever the variant.
                 plain = _bbox_iou(pred_bboxes, gt_bboxes, xywh=True)
                 overlap = (1.0 - plain.clamp_min(0).pow(self.alpha_iou)) + (plain - variant)
+            l1 = self._l1(pred_bboxes, gt_bboxes)
+            overlap = overlap.view(-1)
+            if w is not None:
+                l1, overlap = l1 * w, overlap * w
+            giou = self.loss_gain["giou"] * overlap.sum()
+            if self.rep_gain and ctx is not None:
+                # Folded into the overlap term: ultralytics' aux-layer sum keeps
+                # only the three stock keys, so a separate key would be dropped
+                # for every layer but the last.
+                giou = giou + self.rep_gain * self.loss_gain["giou"] * self._rep_gt(pred_bboxes, ctx)
             return {
-                name_bbox: (self.loss_gain["bbox"] * self._l1(pred_bboxes, gt_bboxes) / n).squeeze(),
-                name_giou: (self.loss_gain["giou"] * overlap.sum() / n).squeeze(),
+                name_bbox: (self.loss_gain["bbox"] * l1.sum() / n).squeeze(),
+                name_giou: (giou / n).squeeze(),
             }
 
     def fdr_weighting(reg_max=32, up=0.5, reg_scale=4.0):
@@ -1100,7 +1224,7 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
                       inject=(19, 14, 10), dim=64, depth=4, heads=4, widen=True,
                       context=True, ctx_layer=11, ckpt_chunks=8, compile_blocks=False,
                       fast_kernels=False, train_encoder=True, arch="tokens", grad_ckpt=True,
-                      windows=(16, 16, None, None), upsample=1, **_):
+                      windows=(16, 16, None, None), upsample=1, stem_bands=False, **_):
     """S3T encoder in front of the pretrained first block, plus side injections.
 
     The encoder is loaded from the MAE checkpoint when one is given; its config
@@ -1136,8 +1260,18 @@ def install_s3t_front(net, n_bands=16, projection=None, mae_ckpt=None, scale=0.5
     if xca:
         stem_ch = [m for m in block.modules() if isinstance(m, torch.nn.Conv2d)][-1].out_channels
         front = S3TXFront(enc, projection=projection, scale=scale, grad_ckpt=grad_ckpt,
-                          stem_ch=stem_ch, train_encoder=train_encoder, upsample=upsample)
+                          stem_ch=stem_ch, train_encoder=train_encoder, upsample=upsample,
+                          stem_bands=stem_bands)
         widen = False
+        if stem_bands:
+            # 3 projected channels + all 16 bands into the stem's first conv;
+            # the 16 new input channels start at zero (identical output at
+            # step 0). Marked so staged unfreezing can train it (part stem_in)
+            # while the rest of the stem stays frozen.
+            conv = widen_first_conv(block, n_bands)
+            conv.__dict__["_hod26_widened"] = True
+            log(f"  stem input: 3 projected + {n_bands} band channels "
+                f"(first conv {conv.in_channels} in, the {n_bands} new ones zero-initialised)")
     else:
         front = S3TFront(enc, projection=projection, scale=scale, widen=widen,
                          ckpt_chunks=ckpt_chunks, fast_kernels=fast_kernels,
@@ -1557,7 +1691,8 @@ def install_fdr(net, reg_max: int = 32, reg_scale: float = 4.0, up: float = 0.5)
 
 def install_bbox_loss(net, nc: int, kind: str = "GIoU", alpha: float = 1.0,
                       beta: float = 0.0, log_size: bool = False,
-                      loss_gain: dict | None = None, fdr: bool = False, mal: bool = False):
+                      loss_gain: dict | None = None, fdr: bool = False, mal: bool = False,
+                      box_cls_gain: dict | None = None, rep_gain: float = 0.0):
     """Condition RT-DETR's box and class losses on how good each match is.
 
     Every default reproduces the stock loss exactly, which is what makes an A/B
@@ -1586,6 +1721,12 @@ def install_bbox_loss(net, nc: int, kind: str = "GIoU", alpha: float = 1.0,
         crit.__dict__["_fdr_decoder"] = install_fdr(net)
     if loss_gain:
         crit.loss_gain.update(loss_gain)
+    if box_cls_gain:
+        # names -> ids, so the candidate can say what it means
+        crit.box_cls_gain = {int(CLASSES.index(c) if isinstance(c, str) else c): float(g)
+                             for c, g in box_cls_gain.items()}
+    if rep_gain:
+        crit.rep_gain = float(rep_gain)
     net.criterion = crit
     log(f"  box loss: {kind}"
         + (f", alpha={alpha}" if alpha != 1.0 else "")
@@ -1593,7 +1734,9 @@ def install_bbox_loss(net, nc: int, kind: str = "GIoU", alpha: float = 1.0,
         + (f", vfl_beta={beta}" if beta and not mal else "")
         + (", D-FINE FDR (+FGL 0.15, GO-LSD/DDF 1.5) on the pretrained decoder" if fdr else "")
         + (", log-space wh" if log_size else "")
-        + (f", gains {loss_gain}" if loss_gain else ""))
+        + (f", gains {loss_gain}" if loss_gain else "")
+        + (f", box loss x{sorted(set(box_cls_gain.values()))} for {sorted(box_cls_gain)}" if box_cls_gain else "")
+        + (f", repulsion {rep_gain} (smooth-ln of IoG beyond the truth's own overlap)" if rep_gain else ""))
     return True
 
 
@@ -1621,6 +1764,46 @@ def restore_state(net, src):
     return len(ok)
 
 
+def warm_start(net, path):
+    """Load a trained checkpoint's weights into a freshly built model, schedule reset.
+
+    Not a resume: the optimizer, EMA and epoch counter start over; only the
+    weights come across. Every tensor of the new model must be found, with one
+    allowance -- a conv the new model widened (more input channels, e.g. the
+    stem reading the 16 bands too) takes the checkpoint's weights on its first
+    channels and keeps its zero-initialised extra ones. Anything else missing
+    or mis-shaped is an error, not a silent partial load.
+    """
+    import torch
+    ck = torch.load(str(path), map_location="cpu", weights_only=False)
+    src = (ck.get("ema") or ck.get("model")) if isinstance(ck, dict) else ck
+    if src is None:
+        raise RuntimeError(f"warm start: no model in {path}")
+    sd, own = src.float().state_dict(), net.state_dict()
+    new, widened, bad = {}, [], []
+    for k, v in own.items():
+        t = sd.get(k)
+        if t is None:
+            bad.append(k)
+        elif t.shape == v.shape:
+            new[k] = t
+        elif (t.dim() == 4 and v.dim() == 4 and t.shape[0] == v.shape[0]
+              and t.shape[2:] == v.shape[2:] and t.shape[1] < v.shape[1]):
+            w = torch.zeros_like(v, dtype=t.dtype)
+            w[:, :t.shape[1]] = t
+            new[k] = w
+            widened.append(f"{k} {tuple(t.shape)}->{tuple(v.shape)}")
+        else:
+            bad.append(f"{k} {tuple(t.shape)} vs {tuple(v.shape)}")
+    if bad:
+        raise RuntimeError(f"warm start from {path}: {len(bad)} tensors not found or "
+                           f"mis-shaped, first: {bad[:5]}")
+    net.load_state_dict(new, strict=True)
+    log(f"  warm start: {len(new)}/{len(own)} tensors from {path}"
+        + (f"; widened: {widened}" if widened else ""))
+    return len(new)
+
+
 def freeze_batchnorm(net):
     """Every BatchNorm2d in the model to FrozenBatchNorm2d (eval mode for good)."""
     n = 0
@@ -1645,11 +1828,13 @@ def freeze_batchnorm(net):
 #   s3t_enc     the MAE-pretrained S3T-X encoder;
 #   backbone    HGNetv2 stages 1-4 (COCO);
 #   stem        HGNetv2's stem (COCO);
+#   stem_in     the stem's first conv when widened to also read all 16 bands
+#               (s3t_stem_bands): its new input channels start at zero;
 #   frozen_norm BatchNorm scale/shift in the stem and backbone.
 UNFREEZE_HEAD_KEYS = ("dec_score_head", "dec_bbox_head", "enc_score_head",
                       "enc_bbox_head", "denoising_class_embed")
 UNFREEZE_PARTS = ("head", "new", "mixer", "decoder", "neck", "s3t_enc",
-                  "backbone", "stem", "frozen_norm")
+                  "backbone", "stem", "stem_in", "frozen_norm")
 
 
 def param_parts(net):
@@ -1659,6 +1844,8 @@ def param_parts(net):
     last = len(net.model) - 1
     norms = {id(p) for m in net.model[:n_bb] for mm in m.modules()
              if isinstance(mm, _nn.BatchNorm2d) for p in mm.parameters(recurse=False)}
+    widened = {id(p) for mm in net.model[0].modules() if mm.__dict__.get("_hod26_widened")
+               for p in mm.parameters(recurse=False)}
     out = {}
     for name, p in net.named_parameters():
         bits = name.split(".")
@@ -1667,6 +1854,8 @@ def param_parts(net):
         i, rest = int(bits[1]), ".".join(bits[2:])
         if id(p) in norms:
             part = "frozen_norm"
+        elif id(p) in widened:
+            part = "stem_in"
         elif i == 0:
             part = ("s3t_enc" if rest.startswith("front.enc.") else
                     "mixer" if rest.startswith("front.base.") else
@@ -1763,7 +1952,8 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                   bbox_loss="GIoU", loss_gain=None, is_rtdetr=True,
                   bbox_alpha=1.0, vfl_beta=0.0, log_size_l1=False,
                   reset_best_fitness=True, accel=None, fdr=False, mal=False,
-                  unfreeze=None, frozen_bn=False):
+                  unfreeze=None, frozen_bn=False, box_cls_gain=None, rep_gain=0.0,
+                  init_from=None):
     """A trainer that seeds the head from COCO by name and installs the adapter.
 
     Both have to happen inside get_model, and for the same reason: ultralytics
@@ -1959,15 +2149,21 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
             # RTDETRDetectionLoss only: the YOLO head computes its box loss
             # somewhere else entirely, so this override would silently miss.
             if is_rtdetr and any((bbox_loss not in ("", "GIoU"), loss_gain,
-                                  bbox_alpha != 1.0, vfl_beta, log_size_l1, fdr, mal)):
+                                  bbox_alpha != 1.0, vfl_beta, log_size_l1, fdr, mal,
+                                  box_cls_gain, rep_gain)):
                 install_bbox_loss(net, self.data["nc"], bbox_loss or "GIoU",
-                                  bbox_alpha, vfl_beta, log_size_l1, loss_gain, fdr=fdr, mal=mal)
+                                  bbox_alpha, vfl_beta, log_size_l1, loss_gain, fdr=fdr, mal=mal,
+                                  box_cls_gain=box_cls_gain, rep_gain=rep_gain)
             if adapter:
                 install_spectral_adapter(net, **adapter)
             if frozen_bn:
                 n_bn = freeze_batchnorm(net)
                 log(f"  BatchNorm: {n_bn} layers frozen to COCO's running statistics "
                     f"(eval mode throughout; 2 images/card, no SyncBN)")
+            if init_from and not resuming:
+                # A fine-tune: the finished model's weights into this freshly
+                # built one (widened layers keep their zero extra channels).
+                warm_start(net, init_from)
             if accel:
                 done = enable_transformer_accel(net, fp32_loss=accel.get("fp32_loss", True),
                                                 nc=self.data["nc"])
@@ -2589,13 +2785,20 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                        "train_encoder": bool(tr.get("s3t_train_encoder", True)),
                        "arch": tr.get("s3t_arch", "tokens"),
                        "grad_ckpt": bool(tr.get("s3t_grad_ckpt", True)),
-                       "upsample": int(tr.get("s3t_upsample", 1))}
+                       "upsample": int(tr.get("s3t_upsample", 1)),
+                       "stem_bands": bool(tr.get("s3t_stem_bands", False))}
         elif tr.get("spectral_stem", "adapter") == "adapter":
             adapter = {"n_bands": tr["in_channels"], "projection": proj,
                        "ckpt_name": tr["model"], "srf_k": tr.get("srf_k", 0),
                        "srf_width": tr.get("srf_width", 2.0)}
         else:
             attach_spectral_stem_init(model, tr["model"], tr["in_channels"], proj)
+    init_path = None
+    if tr.get("init_from") and not resume_from:
+        init_path = find_weights(tr["init_from"])
+        if init_path is None:
+            raise RuntimeError(f"train.init_from={tr['init_from']} not found under {INPUT}")
+        init_path = str(init_path)
     trainer_cls = hod26_trainer(base_trainer(tr["model"]), adapter=adapter,
                                 coco_prior=tr.get("coco_prior", True),
                                 schedule_epochs=int(tr.get("schedule_epochs", 0)),
@@ -2608,6 +2811,9 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                                 fdr=bool(tr.get("fdr", False)), mal=bool(tr.get("mal", False)),
                                 unfreeze=tr.get("unfreeze") or None,
                                 frozen_bn=bool(tr.get("frozen_bn", False)),
+                                box_cls_gain=tr.get("box_cls_gain") or None,
+                                rep_gain=float(tr.get("rep_gain", 0.0)),
+                                init_from=init_path,
                                 accel=({"fp32_loss": bool(tr.get("amp_fp32_loss", True)),
                                         "fused_optimizer": True,
                                         "require_amp": bool(tr.get("amp", False))}
@@ -3473,6 +3679,13 @@ def preflight(round_cfg):
         if find_weights(sub["weights_from"]) is None:
             bad.append(f"weights_from={sub['weights_from']} not found under "
                        f"{INPUT}")
+    init = ((cand or {}).get("train") or {}).get("init_from")
+    if init and not sub.get("weights_from") and not render_only:
+        if find_weights(init) is None:
+            bad.append(f"train.init_from={init} (the checkpoint to fine-tune from) not found "
+                       f"under {INPUT}; attach the kernel that produced it")
+        else:
+            note.append(f"fine-tune from {find_weights(init)}")
 
     # Scratch. A full disk surfaces as a cryptic write error deep in training.
     try:

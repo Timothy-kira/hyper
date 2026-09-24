@@ -163,3 +163,81 @@ def superpixel_cutmix(cube: np.ndarray, boxes: list[Box], other: np.ndarray,
             continue
         out[region] = donor[region]
     return out, boxes
+
+
+def _feather(h: int, w: int, margin: int) -> np.ndarray:
+    """1 over the inner (h - 2m) x (w - 2m) box, falling linearly to 0 across the margin."""
+    if margin <= 0:
+        return np.ones((h, w), np.float32)
+    ys = np.minimum(np.arange(h), np.arange(h)[::-1]).astype(np.float32)
+    xs = np.minimum(np.arange(w), np.arange(w)[::-1]).astype(np.float32)
+    ry = np.clip((ys + 0.5) / margin, 0.0, 1.0)
+    rx = np.clip((xs + 0.5) / margin, 0.0, 1.0)
+    return np.minimum(ry[:, None], rx[None, :])
+
+
+def _covered(b: Box, by: Box) -> float:
+    ix = max(0, min(b.x2, by.x2) - max(b.x1, by.x1))
+    iy = max(0, min(b.y2, by.y2) - max(b.y1, by.y1))
+    return ix * iy / max(1, (b.x2 - b.x1) * (b.y2 - b.y1))
+
+
+def crowd_paste(cube: np.ndarray, boxes: list[Box], pool: dict, rng: np.random.Generator,
+                anchor_classes, load, n_max: int = 3, margin: int = 4,
+                max_cover: float = 0.7) -> tuple[np.ndarray, list[Box]]:
+    """Paste instances of the crowded classes next to, and partly over, their own kind.
+
+    stone_block / people / e-bike / car are the only classes whose boxes overlap
+    other boxes (10-32% of instances against 0-3%), and stone_block has only 42
+    scenes. Each paste takes a real instance from another street frame, with a
+    ``margin`` of its own background feathered into the destination, sets it
+    beside an anchor of those classes (bottoms roughly aligned, 15-45% of its
+    width overlapping the anchor) and scales it per band so its surrounding
+    background matches the destination's -- which keeps the object-to-background
+    contrast, the only cue these grey classes carry, what it was. Existing boxes
+    the paste covers by more than ``max_cover`` are dropped (they are no longer
+    visible); partly covered ones stay, as in the real crowds.
+
+    pool: {cls_id: [(source, (x1, y1, x2, y2)), ...]}; load(source) -> cube.
+    Frames without an anchor are returned unchanged (tabletop scenes).
+    """
+    anchors = [b for b in boxes if b.cls_id in anchor_classes]
+    classes = [c for c in pool if pool[c]]
+    if not anchors or not classes:
+        return cube, boxes
+    out = cube.astype(np.float32, copy=True)
+    boxes = list(boxes)
+    H, W = cube.shape[:2]
+    m = int(margin)
+    for _ in range(int(rng.integers(1, n_max + 1))):
+        c = classes[int(rng.integers(len(classes)))]
+        src_key, (x1, y1, x2, y2) = pool[c][int(rng.integers(len(pool[c])))]
+        w, h = x2 - x1, y2 - y1
+        if w < 4 or h < 4:
+            continue
+        src = load(src_key)
+        if y1 - m < 0 or x1 - m < 0 or y2 + m > src.shape[0] or x2 + m > src.shape[1]:
+            continue
+        a = anchors[int(rng.integers(len(anchors)))]
+        ov = int(round(float(rng.uniform(0.15, 0.45)) * w))
+        nx1 = a.x2 - ov if rng.random() < 0.5 else a.x1 - w + ov
+        jitter = max(1, h // 6)
+        ny2 = a.y2 + int(rng.integers(-jitter, jitter + 1))
+        ny1 = ny2 - h
+        if nx1 - m < 0 or ny1 - m < 0 or nx1 + w + m > W or ny2 + m > H:
+            continue
+        patch = src[y1 - m:y2 + m, x1 - m:x2 + m].astype(np.float32)
+        dst = out[ny1 - m:ny2 + m, nx1 - m:nx1 + w + m]
+        ring = np.ones(patch.shape[:2], bool)
+        ring[m:m + h, m:m + w] = False
+        if m > 0 and ring.any():
+            ratio = (dst[ring].mean(0) + 1e-3) / (patch[ring].mean(0) + 1e-3)
+            patch = patch * np.clip(ratio, 0.5, 2.0)[None, None, :]
+        alpha = _feather(h + 2 * m, w + 2 * m, m)[:, :, None]
+        out[ny1 - m:ny2 + m, nx1 - m:nx1 + w + m] = alpha * patch + (1.0 - alpha) * dst
+        new = Box(c, nx1, ny1, nx1 + w, ny2)
+        boxes = [b for b in boxes if _covered(b, new) <= max_cover] + [new]
+    if np.issubdtype(cube.dtype, np.integer):
+        info = np.iinfo(cube.dtype)
+        out = np.clip(np.rint(out), info.min, info.max)
+    return out.astype(cube.dtype), boxes

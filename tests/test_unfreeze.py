@@ -75,7 +75,8 @@ def main() -> int:
         parts = m.param_parts(net)
         names = {pt: [n for _, (p_, n) in parts.items() if p_ == pt] for pt in m.UNFREEZE_PARTS}
         check("every parameter has a part", len(parts) == len(list(net.parameters())))
-        check("every part is non-empty", all(names[pt] for pt in m.UNFREEZE_PARTS),
+        check("every part is non-empty (stem_in only exists with s3t_stem_bands)",
+              all(names[pt] for pt in m.UNFREEZE_PARTS if pt != "stem_in") and not names["stem_in"],
               str({k: len(v) for k, v in names.items()}))
         check("heads: score/bbox heads and the denoising class embedding",
               all(any(k in n for n in names["head"]) for k in m.UNFREEZE_HEAD_KEYS)
@@ -141,10 +142,10 @@ def main() -> int:
         for epoch in (0, 2, 5, 7):
             moved = step_at(epoch)
             want = {pt: m.unfreeze_mult(sched_uf, pt, epoch) for pt in m.UNFREEZE_PARTS}
-            frozen_ok = all(moved[pt] == 0.0 for pt in m.UNFREEZE_PARTS if want[pt] == 0)
-            live_ok = all(moved[pt] > 0.0 for pt in m.UNFREEZE_PARTS if want[pt] > 0)
+            frozen_ok = all(moved.get(pt, 0.0) == 0.0 for pt in m.UNFREEZE_PARTS if want[pt] == 0)
+            live_ok = all(moved[pt] > 0.0 for pt in m.UNFREEZE_PARTS if want[pt] > 0 and pt in moved)
             # Adam moves a parameter by at most ~lr x (1 - b1) / sqrt(1 - b2) ~ 3.2 lr per step.
-            bound_ok = all(moved[pt] <= 3.3 * lr * want[pt] + 1e-9 for pt in m.UNFREEZE_PARTS)
+            bound_ok = all(moved.get(pt, 0.0) <= 3.3 * lr * want[pt] + 1e-9 for pt in m.UNFREEZE_PARTS)
             check(f"epoch {epoch + 1}: exactly the live parts move, frozen ones by 0.0",
                   frozen_ok and live_ok, str({k: f"{v:.1e}" for k, v in moved.items()}))
             check(f"epoch {epoch + 1}: each part within its share of the LR", bound_ok,

@@ -281,10 +281,18 @@ class S3TXFront(nn.Module):
     applied first and only its 3 channels are resized (a 1x1 conv commutes with
     bilinear interpolation), and the encoder, which wants native scale, reads
     the loader's input directly (scale * upsample = 1: no resize at all).
+
+    stem_bands: the pretrained stem also receives all 16 bands, beside the 3
+    projected channels, through extra input channels of its first conv that
+    start at zero (widen_first_conv). Any 3-channel projection keeps only ~30%
+    of the object-vs-background contrast of stone_block / people / e-bike / car
+    (handoff/DIAGNOSIS.md), and the LDA one is exactly blind to a uniform
+    darkening -- the only cue three of them carry -- because its rows sum to 0.
     """
 
     def __init__(self, encoder, projection=None, scale: float = 0.5, grad_ckpt: bool = True,
-                 amp: bool = True, stem_ch: int = 48, train_encoder: bool = True, upsample: int = 1):
+                 amp: bool = True, stem_ch: int = 48, train_encoder: bool = True, upsample: int = 1,
+                 stem_bands: bool = False):
         super().__init__()
         n, d = encoder.n_bands, encoder.dim
         self.enc, self.scale, self.amp = encoder, scale, amp
@@ -294,7 +302,8 @@ class S3TXFront(nn.Module):
         if not self.train_encoder:
             for p_ in encoder.parameters():
                 p_.requires_grad_(False)
-        self.out_channels = 3
+        self.stem_bands = bool(stem_bands)
+        self.out_channels = 3 + (n if self.stem_bands else 0)
         self.base = nn.Conv2d(n, 3, 1, bias=False)
         with torch.no_grad():
             if projection is not None:
@@ -364,6 +373,8 @@ class S3TXFront(nn.Module):
         f, pyr = self._encode(x)
         self.__dict__["_side"], self.__dict__["_pyr"] = f, pyr
         y = self.base(x)
+        if getattr(self, "stem_bands", False):
+            y = torch.cat([y, x.to(y.dtype)], 1)
         u = getattr(self, "upsample", 1)
         if u > 1:
             y = F.interpolate(y, scale_factor=u, mode="bilinear", align_corners=False)

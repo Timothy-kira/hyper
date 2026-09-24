@@ -58,6 +58,35 @@ UNFREEZE = {
 }
 
 
+# The four classes that score lowest (0.23-0.55 against 0.72-0.79), and why
+# (handoff/DIAGNOSIS.md, "S3T-X"): grey -- their spectrum is the background's,
+# uniformly darker -- which a 3-channel projection mostly discards; and the only
+# classes that crowd and occlude one another.
+WEAK = ["stone_block", "people", "e-bike", "car"]
+# Fine-tune from the finished S3T-X model: everything trains from the first
+# epoch, at a third of the from-COCO LR (backbone at a tenth of that); the
+# stem's widened first conv (its 16 new band channels start at zero) at half.
+FT_UNFREEZE = {**{pt: [0, 0, 0.33] for pt in ("head", "new", "mixer", "decoder", "neck", "s3t_enc")},
+               "backbone": [0, 0, 0.033], "stem_in": [0, 0, 0.5]}
+
+
+def finetune_candidate(cand: dict, init_from: str, epochs: int = 15) -> dict:
+    """The S3T-X candidate as a fine-tune aimed at the four weak classes.
+
+    S1  the stem reads all 16 bands beside the 3 projected channels;
+    C1  box loss x2 on those classes' matched boxes;
+    C2  RepGT repulsion off neighbouring ground truth;
+    B2  crowd copy-paste of their instances into street frames.
+    """
+    tr = cand["train"]
+    tr.update(epochs=epochs, schedule_epochs=epochs, init_from=init_from, s3t_stem_bands=True,
+              box_cls_gain={c: 2.0 for c in WEAK}, rep_gain=0.5,
+              unfreeze={k: list(v) for k, v in FT_UNFREEZE.items()},
+              warmup_epochs=1.0, close_mosaic=3)
+    cand["augment"].update(crowd_paste=3, crowd_paste_p=0.7, paste_classes=list(WEAK), paste_margin=4)
+    return cand
+
+
 def s3t_candidate(total: int = TOTAL, batch: int = 2, mae_file: str | None = None,
                   compile_blocks: bool = False, arch: str = "tokens") -> dict:
     cand = full_candidate("transformer", total, {
@@ -110,6 +139,15 @@ def s3t_candidate(total: int = TOTAL, batch: int = 2, mae_file: str | None = Non
     return cand
 
 
+def _candidate(args) -> dict:
+    cand = s3t_candidate(args.total, args.batch,
+                         args.mae_file or ("pretrain3_mae.pt" if args.arch == "xca" else None),
+                         args.compile_blocks, args.arch)
+    if args.finetune_from:
+        cand = finetune_candidate(cand, args.finetune_from, args.total)
+    return cand
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--slug", default="TEAMMATE/hod26-s3t-detr")
@@ -135,13 +173,17 @@ def main() -> None:
                          "--smoke-only run has just proven")
     ap.add_argument("--render-kernel", default=None,
                     help="a render notebook to mount; its dataset is used instead of rendering")
+    ap.add_argument("--finetune-from", default=None,
+                    help="fine-tune for the weak classes from this checkpoint file (e.g. final_best.pt)")
+    ap.add_argument("--finetune-kernel", default=None,
+                    help="the kernel whose output holds --finetune-from")
     args = ap.parse_args()
+    if args.finetune_from and not (args.finetune_kernel or args.render_only):
+        ap.error("--finetune-from needs --finetune-kernel (the kernel whose output holds it)")
     args.out_dir.mkdir(parents=True, exist_ok=True)
     cfg = args.out_dir / "round-config.json"
     cfg.write_text(json.dumps({"round": "hod26-s3t-detr", "candidates": [], "submit": {
-        "candidate": s3t_candidate(args.total, args.batch,
-                                   args.mae_file or ("pretrain3_mae.pt" if args.arch == "xca" else None),
-                                   args.compile_blocks, args.arch),
+        "candidate": _candidate(args),
         "use_all_train": False,          # keep the 600 held out: they are the ruler
         "predict": True,                 # a submission comes out wherever the clock stops
         "session_hours": SESSION_HOURS,
@@ -156,6 +198,8 @@ def main() -> None:
                     *([] if args.render_only else
                       [a for k in (args.mae_kernel or [MAE_KERNEL]) for a in ("--kernel-source", k)]),
                     *(["--kernel-source", args.render_kernel] if args.render_kernel else []),
+                    *(["--kernel-source", args.finetune_kernel]
+                      if args.finetune_kernel and not args.render_only else []),
                     "--machine-shape", "cpu" if args.render_only else "NvidiaTeslaT4x2"], check=True)
     cfg.unlink()
 
