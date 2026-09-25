@@ -63,6 +63,27 @@ def main() -> int:
           all(p.grad is not None and p.grad.abs().sum() > 0
               for n, p in g.named_parameters() if not n.startswith("layer.")))
 
+    # Flat regions (the letterbox padding): atan2's backward is 0/0 there. Every
+    # gradient must stay finite, or AMP's GradScaler skips the optimizer step.
+    g2 = DEGGate(torch.nn.Identity(), 8)
+    with torch.no_grad():
+        g2.gamma.fill_(0.1)
+    xf = torch.zeros(2, 8, 20, 28)
+    xf[:, :, 5:12, 6:15] = torch.randn(2, 8, 7, 9)
+    xf.requires_grad_(True)
+    g2(xf).square().sum().backward()
+    grads = [xf.grad] + [p.grad for p in g2.parameters()]
+    check("flat regions: every gradient finite (fp32)",
+          all(t is not None and torch.isfinite(t).all() for t in grads))
+    g3 = DEGGate(torch.nn.Conv2d(8, 8, 1), 8)
+    with torch.no_grad():
+        g3.gamma.fill_(0.1)
+    with torch.autocast("cpu", dtype=torch.float16):
+        out = g3(xf.detach())
+    out.float().square().sum().backward()
+    check("flat regions under fp16 autocast: every gradient finite (the first run's bug)",
+          all(p.grad is not None and torch.isfinite(p.grad).all() for p in g3.parameters()))
+
     img = torch.zeros(1, 32, 16, 16)
     img[..., :, 8:] = 1.0                       # vertical edge: gradient along x -> theta 0
     hv = g.direction_hist(img)[0].sum((1, 2))

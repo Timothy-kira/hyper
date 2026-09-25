@@ -481,9 +481,23 @@ class DEGGate(nn.Module):
             if hasattr(layer, attr):
                 setattr(self, attr, getattr(layer, attr))
 
+    @torch.no_grad()
     def direction_hist(self, y):
-        """(B, bins, ceil(H/cell), ceil(W/cell)) normalised orientation histograms, fp32."""
-        g = y.float().mean(1, keepdim=True)
+        """(B, bins, ceil(H/cell), ceil(W/cell)) normalised orientation histograms, fp32.
+
+        A fixed feature, not a learned one, so no gradient flows through it --
+        and none may: atan2's backward is 0/0 wherever the map is flat (the
+        letterbox padding is flat), and a single NaN makes AMP's GradScaler skip
+        the whole optimizer step. The first DEGConv run trained nothing for
+        three epochs exactly so: under fp16 autocast the Sobel conv ran in half
+        precision, the 1e-12 under the sqrt underflowed, and sqrt(0)'s backward
+        is inf. Computed in fp32 with autocast off, and detached.
+        """
+        with torch.autocast(device_type=y.device.type, enabled=False):
+            return self._hist(y.detach().float())
+
+    def _hist(self, y):
+        g = y.mean(1, keepdim=True)
         d = F.conv2d(F.pad(g, (1, 1, 1, 1), mode="replicate"), self.sobel.float())
         gx, gy = d[:, 0], d[:, 1]
         mag = torch.sqrt(gx * gx + gy * gy + 1e-12)

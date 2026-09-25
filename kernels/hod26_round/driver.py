@@ -1959,6 +1959,24 @@ def split_groups_by_part(groups, net, schedule):
     return out
 
 
+def _training_health(trainer):
+    """AMP loss scale and DEGConv's |gamma|: a scale collapsing towards 0 means
+    NaN/inf gradients are making GradScaler skip steps -- the model then does
+    not train at all while every log line looks normal."""
+    out = []
+    try:
+        sc = getattr(trainer, "scaler", None)
+        if sc is not None and sc.is_enabled():
+            out.append(f"amp scale {sc.get_scale():.3g}")
+        net = getattr(getattr(trainer, "model", None), "module", getattr(trainer, "model", None))
+        gam = [float(m.gamma.detach().abs().max()) for m in net.modules() if type(m).__name__ == "DEGGate"]
+        if gam:
+            out.append("DEGConv |gamma| max " + "/".join(f"{g:.2e}" for g in gam))
+    except Exception:                                           # noqa: BLE001
+        pass
+    return ("; " + "; ".join(out)) if out else ""
+
+
 def attach_unfreeze(opt, trainer, schedule):
     """Scale each group's LR by its part's multiplier for the step, then put it back.
 
@@ -1977,7 +1995,8 @@ def attach_unfreeze(opt, trainer, schedule):
             state["epoch"] = e
             if is_main_rank():
                 log(f"  unfreeze epoch {e + 1}: " + ", ".join(
-                    f"{pt} {unfreeze_mult(schedule, pt, e):g}" for pt in UNFREEZE_PARTS))
+                    f"{pt} {unfreeze_mult(schedule, pt, e):g}" for pt in UNFREEZE_PARTS)
+                    + _training_health(trainer))
         state["saved"] = [g["lr"] for g in o.param_groups]
         for g in o.param_groups:
             g["lr"] = g["lr"] * unfreeze_mult(schedule, g.get("part"), e)
