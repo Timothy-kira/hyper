@@ -77,6 +77,15 @@ def main() -> int:
         g.gamma.fill_(0.1)
         yb = g(x)
     check("bf16 autocast: finite", torch.isfinite(yb.float()).all())
+    import copy
+    gd = copy.deepcopy(g).double()
+    try:
+        with torch.no_grad():
+            ok = torch.isfinite(gd(x.double())).all() and gd(x.double()).dtype == torch.float64
+    except Exception as e:  # noqa: BLE001
+        ok = False
+        print(e)
+    check("model cast whole (.double(), like ultralytics' .half() final eval) runs", bool(ok))
 
     # ---- on the S3T-X detector
     cand = plain_finetune_candidate(s3t_candidate(total=2, arch="xca"), "final_best.pt", 12)

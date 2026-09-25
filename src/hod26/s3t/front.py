@@ -499,7 +499,9 @@ class DEGGate(nn.Module):
     def forward(self, x):
         y = self.layer(x)
         hist = self.direction_hist(y)                               # (B, bins, h', w')
-        eps = self.emb(hist.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        # The histogram is computed in fp32; the model may have been cast whole
+        # (ultralytics' fp16 final eval calls .half()), so match emb's dtype.
+        eps = self.emb(hist.to(self.emb.weight.dtype).permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         eps = F.interpolate(eps, size=y.shape[-2:], mode="nearest").to(y.dtype)
         g = torch.sigmoid(self.gate(y + eps))
         return y + self.gamma.view(1, -1, 1, 1).to(y.dtype) * g * self.edge(y)
