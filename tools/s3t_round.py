@@ -87,6 +87,18 @@ def finetune_candidate(cand: dict, init_from: str, epochs: int = 15) -> dict:
     return cand
 
 
+# DEGConv fine-tune from the finished model, curriculum unfreezing at a small LR
+# (the base LR x the multiplier ~ 9e-6 for the pretrained parts, the order of
+# the original run's last epochs -- the 0.33 of FT_UNFREEZE (~1.5e-4) threw the
+# two earlier fine-tunes out of the LB-best basin): DEGConv alone for 2
+# epochs on frozen features, then heads and the other new modules, decoder and
+# neck, the S3T encoder, and last the backbone at a tenth of that.
+DEG_UNFREEZE = {"deg": [0, 0, 0.33],
+                "head": [2, 1, 0.02], "new": [2, 1, 0.02], "mixer": [2, 1, 0.02],
+                "decoder": [3, 1, 0.02], "neck": [3, 1, 0.02],
+                "s3t_enc": [4, 1, 0.02], "backbone": [6, 2, 0.002]}
+
+
 def plain_finetune_candidate(cand: dict, init_from: str, epochs: int) -> dict:
     """The S3T-X candidate unchanged, warm-started from a finished model: only
     the data differs (the HOT2024 frames), so any change is the data's."""
@@ -155,6 +167,9 @@ def _candidate(args) -> dict:
                          args.compile_blocks, args.arch)
     if args.finetune_from and args.plain_finetune:
         cand = plain_finetune_candidate(cand, args.finetune_from, args.total)
+        if args.degconv:
+            cand["train"].update(degconv=True, warmup_epochs=0.3,
+                                 unfreeze={k: list(v) for k, v in DEG_UNFREEZE.items()})
         if args.band_gain:
             cand["augment"]["band_gain"] = args.band_gain
     elif args.finetune_from:
@@ -198,6 +213,9 @@ def main() -> None:
                          "by the --finetune-from model and added to the training split")
     ap.add_argument("--extra-index", default="hot24_index.json",
                     help="the index file inside --extra-dataset (hod3k_index.json: fully labelled)")
+    ap.add_argument("--degconv", action="store_true",
+                    help="with --plain-finetune: DEGConv around the decoder inputs, curriculum "
+                         "unfreezing at a small LR (DEG_UNFREEZE)")
     ap.add_argument("--final-comp-epochs", type=int, default=0,
                     help="with --extra-dataset: train the last N epochs on the competition's frames only")
     ap.add_argument("--band-gain", type=float, default=0.0,

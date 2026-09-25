@@ -1776,6 +1776,22 @@ def restore_state(net, src):
     return len(ok)
 
 
+def install_degconv(net):
+    """DEGConv (DEGGate) around each level the RT-DETR decoder reads (P3/P4/P5)."""
+    import torch
+    dec = net.model[-1]
+    levels = list(dec.f) if isinstance(dec.f, (list, tuple)) else [dec.f]
+    dev = next(net.parameters()).device
+    for i in levels:
+        layer = net.model[i]
+        ch = [m for m in layer.modules() if isinstance(m, torch.nn.Conv2d)][-1].out_channels
+        net.model[i] = DEGGate(layer, ch).to(dev)
+    n = sum(p.numel() for i in levels for nm, p in net.model[i].named_parameters()
+            if not nm.startswith("layer."))
+    log(f"  DEGConv around decoder inputs {levels}: {n / 1e6:.2f}M new parameters, gamma zero-init")
+    return levels
+
+
 def warm_start(net, path):
     """Load a trained checkpoint's weights into a freshly built model, schedule reset.
 
@@ -1792,9 +1808,21 @@ def warm_start(net, path):
     if src is None:
         raise RuntimeError(f"warm start: no model in {path}")
     sd, own = src.float().state_dict(), net.state_dict()
-    new, widened, bad = {}, [], []
+    new, widened, bad, fresh = {}, [], [], []
+    wrapped = {i for i, m in enumerate(getattr(net, "model", [])) if type(m).__name__ == "DEGGate"}
     for k, v in own.items():
         t = sd.get(k)
+        bits = k.split(".")
+        if t is None and len(bits) > 2 and bits[0] == "model" and bits[1].isdigit() \
+                and int(bits[1]) in wrapped:
+            if bits[2] == "layer":
+                # A layer this model wraps in DEGConv: the checkpoint has it bare.
+                t = sd.get(".".join(bits[:2] + bits[3:]))
+            else:
+                # DEGConv's own weights start from their initialisation (gamma 0).
+                new[k] = v
+                fresh.append(k)
+                continue
         if t is None:
             bad.append(k)
         elif t.shape == v.shape:
@@ -1811,8 +1839,9 @@ def warm_start(net, path):
         raise RuntimeError(f"warm start from {path}: {len(bad)} tensors not found or "
                            f"mis-shaped, first: {bad[:5]}")
     net.load_state_dict(new, strict=True)
-    log(f"  warm start: {len(new)}/{len(own)} tensors from {path}"
-        + (f"; widened: {widened}" if widened else ""))
+    log(f"  warm start: {len(new) - len(fresh)}/{len(own)} tensors from {path}"
+        + (f"; widened: {widened}" if widened else "")
+        + (f"; {len(fresh)} DEGConv tensors at their initialisation" if fresh else ""))
     return len(new)
 
 
@@ -1842,11 +1871,12 @@ def freeze_batchnorm(net):
 #   stem        HGNetv2's stem (COCO);
 #   stem_in     the stem's first conv when widened to also read all 16 bands
 #               (s3t_stem_bands): its new input channels start at zero;
-#   frozen_norm BatchNorm scale/shift in the stem and backbone.
+#   frozen_norm BatchNorm scale/shift in the stem and backbone;
+#   deg         DEGConv wrapped around the decoder's input levels (train.degconv).
 UNFREEZE_HEAD_KEYS = ("dec_score_head", "dec_bbox_head", "enc_score_head",
                       "enc_bbox_head", "denoising_class_embed")
 UNFREEZE_PARTS = ("head", "new", "mixer", "decoder", "neck", "s3t_enc",
-                  "backbone", "stem", "stem_in", "frozen_norm")
+                  "backbone", "stem", "stem_in", "frozen_norm", "deg")
 
 
 def param_parts(net):
@@ -1875,8 +1905,10 @@ def param_parts(net):
         elif i < n_bb:
             part = "backbone"
         elif i < last:
-            wrapped = type(net.model[i]).__name__ in ("Inject", "ContextInject", "Tap")
-            part = "new" if wrapped and not rest.startswith("layer.") else "neck"
+            kind = type(net.model[i]).__name__
+            wrapped = kind in ("Inject", "ContextInject", "Tap", "DEGGate")
+            part = (("deg" if kind == "DEGGate" else "new")
+                    if wrapped and not rest.startswith("layer.") else "neck")
         elif rest.startswith("decoder.fdr."):
             part = "new"
         else:
@@ -1965,7 +1997,7 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                   bbox_alpha=1.0, vfl_beta=0.0, log_size_l1=False,
                   reset_best_fitness=True, accel=None, fdr=False, mal=False,
                   unfreeze=None, frozen_bn=False, box_cls_gain=None, rep_gain=0.0,
-                  init_from=None):
+                  init_from=None, degconv=False):
     """A trainer that seeds the head from COCO by name and installs the adapter.
 
     Both have to happen inside get_model, and for the same reason: ultralytics
@@ -2168,6 +2200,8 @@ def hod26_trainer(base_cls, adapter=None, coco_prior=True, schedule_epochs=0,
                                   box_cls_gain=box_cls_gain, rep_gain=rep_gain)
             if adapter:
                 install_spectral_adapter(net, **adapter)
+            if degconv:
+                install_degconv(net)
             if frozen_bn:
                 n_bn = freeze_batchnorm(net)
                 log(f"  BatchNorm: {n_bn} layers frozen to COCO's running statistics "
@@ -2847,6 +2881,7 @@ def run_candidate(cand, index, train_ids, val_ids, anns, tag, budget_seconds=0,
                                 box_cls_gain=tr.get("box_cls_gain") or None,
                                 rep_gain=float(tr.get("rep_gain", 0.0)),
                                 init_from=init_path,
+                                degconv=bool(tr.get("degconv", False)),
                                 accel=({"fp32_loss": bool(tr.get("amp_fp32_loss", True)),
                                         "fused_optimizer": True,
                                         "require_amp": bool(tr.get("amp", False))}

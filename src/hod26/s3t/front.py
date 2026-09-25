@@ -31,6 +31,8 @@ the average pooling for the side injections.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -428,6 +430,79 @@ class Inject(nn.Module):
             return y
         return y + self.proj(f.to(y.dtype))
 
+
+
+class _Strip(nn.Module):
+    """Depthwise 1xk and kx1 strip convolutions, summed: horizontal and vertical structure."""
+
+    def __init__(self, ch: int, k: int):
+        super().__init__()
+        self.h = nn.Conv2d(ch, ch, (1, k), padding=(0, k // 2), groups=ch)
+        self.v = nn.Conv2d(ch, ch, (k, 1), padding=(k // 2, 0), groups=ch)
+
+    def forward(self, x):
+        return self.h(x) + self.v(x)
+
+
+def _edge_conv(ch: int, red: int, k: int) -> nn.Sequential:
+    m = max(8, ch // red)
+    return nn.Sequential(nn.Conv2d(ch, m, 1), nn.GELU(), _Strip(m, k),
+                         nn.Conv2d(m, m, 3, padding=1, groups=m), nn.GELU(), nn.Conv2d(m, ch, 1))
+
+
+class DEGGate(nn.Module):
+    """DEGConv (MixerCSeg, arXiv 2603.01361) wrapped around one detector layer.
+
+    Direction-guided edge gated convolution on the layer's output y:
+      DEG   fixed Sobel gradients of y's channel mean -> orientation in [0, pi),
+            magnitude-weighted histogram over `bins` directions (linear
+            interpolation between the two nearest bin centres) pooled per
+            cell x cell block, normalised, embedded to C channels (eps);
+      edge  1x1 reduce -> 1xk + kx1 depthwise strips -> 3x3 depthwise -> 1x1;
+      gate  g = sigmoid(edge_g(y + eps)).
+    Output y + gamma * g * edge(y), gamma per channel and zero-initialised, so
+    the wrapped detector is exactly the pretrained one at step 0.
+    """
+
+    def __init__(self, layer: nn.Module, ch: int, bins: int = 18, cell: int = 4,
+                 k: int = 7, red: int = 4):
+        super().__init__()
+        self.layer = layer
+        self.bins, self.cell = bins, cell
+        self.emb = nn.Linear(bins, ch)
+        self.edge = _edge_conv(ch, red, k)
+        self.gate = _edge_conv(ch, red, k)
+        self.gamma = nn.Parameter(torch.zeros(ch))
+        sob = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]])
+        self.register_buffer("sobel", torch.stack([sob, sob.t()])[:, None], persistent=False)
+        self.register_buffer("centres", (torch.arange(bins) + 0.5) * math.pi / bins,
+                             persistent=False)
+        for attr in ("i", "f", "type", "np"):
+            if hasattr(layer, attr):
+                setattr(self, attr, getattr(layer, attr))
+
+    def direction_hist(self, y):
+        """(B, bins, ceil(H/cell), ceil(W/cell)) normalised orientation histograms, fp32."""
+        g = y.float().mean(1, keepdim=True)
+        d = F.conv2d(F.pad(g, (1, 1, 1, 1), mode="replicate"), self.sobel.float())
+        gx, gy = d[:, 0], d[:, 1]
+        mag = torch.sqrt(gx * gx + gy * gy + 1e-12)
+        theta = torch.remainder(torch.atan2(gy, gx), math.pi)
+        diff = theta[:, None] - self.centres.float()[None, :, None, None]
+        circ = torch.remainder(diff + math.pi / 2, math.pi) - math.pi / 2
+        w = torch.clamp(1.0 - circ.abs() / (math.pi / self.bins), min=0.0)
+        h, wd = y.shape[-2:]
+        size = (-(-h // self.cell), -(-wd // self.cell))
+        hist = F.adaptive_avg_pool2d(w * mag[:, None], size)
+        return hist / (hist.sum(1, keepdim=True) + 1e-6)
+
+    def forward(self, x):
+        y = self.layer(x)
+        hist = self.direction_hist(y)                               # (B, bins, h', w')
+        eps = self.emb(hist.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        eps = F.interpolate(eps, size=y.shape[-2:], mode="nearest").to(y.dtype)
+        g = torch.sigmoid(self.gate(y + eps))
+        return y + self.gamma.view(1, -1, 1, 1).to(y.dtype) * g * self.edge(y)
 
 
 def sincos_2d(h: int, w: int, dim: int, like: torch.Tensor) -> torch.Tensor:

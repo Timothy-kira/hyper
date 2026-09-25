@@ -75,8 +75,9 @@ def main() -> int:
         parts = m.param_parts(net)
         names = {pt: [n for _, (p_, n) in parts.items() if p_ == pt] for pt in m.UNFREEZE_PARTS}
         check("every parameter has a part", len(parts) == len(list(net.parameters())))
-        check("every part is non-empty (stem_in only exists with s3t_stem_bands)",
-              all(names[pt] for pt in m.UNFREEZE_PARTS if pt != "stem_in") and not names["stem_in"],
+        check("every part is non-empty (stem_in only with s3t_stem_bands, deg only with degconv)",
+              all(names[pt] for pt in m.UNFREEZE_PARTS if pt not in ("stem_in", "deg"))
+              and not names["stem_in"] and not names["deg"],
               str({k: len(v) for k, v in names.items()}))
         check("heads: score/bbox heads and the denoising class embedding",
               all(any(k in n for n in names["head"]) for k in m.UNFREEZE_HEAD_KEYS)
