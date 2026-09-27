@@ -57,6 +57,10 @@ def main() -> int:
         m.SCRATCH.mkdir(); m.WORK.mkdir()
 
         check("find_ranking_dir finds data_ranking", m.find_ranking_dir() == rdir)
+        flat = td / "flat" / "hod26-data-ranking"   # a Kaggle dataset flattens the folder
+        flat.mkdir(parents=True)
+        Image.fromarray(rng.integers(0, 1023, (64, 96)).astype(np.uint16)).save(flat / "5001.png")
+        check("find_ranking_dir finds a dataset named hod26-data-ranking", m.find_ranking_dir(td / "flat") == flat)
         out, ids = m.stage_ranking(rdir)
         check("stage_ranking: every mosaic, ids from the file names", ids == [5001, 5002, 5003])
         check("staged planar reads back to exactly load_cube's cube",

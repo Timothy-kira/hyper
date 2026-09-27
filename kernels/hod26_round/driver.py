@@ -3441,7 +3441,7 @@ def find_ranking_dir(base=None):
     base = Path(base) if base else INPUT
     best = None
     for d in sorted(base.rglob("*")) if base.exists() else []:
-        if d.is_dir() and "data_ranking" in str(d) and any(d.glob("*.png")):
+        if d.is_dir() and "data_ranking" in str(d).replace("-", "_") and any(d.glob("*.png")):
             n = sum(1 for _ in d.glob("*.png"))
             if best is None or n > best[1]:
                 best = (d, n)
