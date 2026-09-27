@@ -3414,7 +3414,35 @@ def sweep_inference(model, cand, root, variants):
     return out
 
 
-def predict_test_set(model, cand, root):
+def find_ranking_dir():
+    """The Phase-2 ranking images (raw 4x4 mosaics) of the attached competition data."""
+    best = None
+    for d in sorted(INPUT.rglob("*")) if INPUT.exists() else []:
+        if d.is_dir() and "data_ranking" in str(d) and any(d.glob("*.png")):
+            n = sum(1 for _ in d.glob("*.png"))
+            if best is None or n > best[1]:
+                best = (d, n)
+    return best[0] if best else None
+
+
+def _mosaic_to_planar(job):
+    src, dst = job
+    cv2.imwrite(str(dst), to_planar(load_cube(src)))
+    return int(Path(src).stem)
+
+
+def stage_ranking(src_dir):
+    """Raw ranking mosaics -> band-planar PNGs in scratch, the layout predict_test reads."""
+    out = SCRATCH / "ranking_planar"
+    out.mkdir(parents=True, exist_ok=True)
+    jobs = [(p, out / p.name) for p in sorted(src_dir.glob("*.png"))]
+    import multiprocessing as _mp
+    with _mp.get_context("fork").Pool(max(1, min(os.cpu_count() or 1, 8))) as pool:
+        ids = pool.map(_mosaic_to_planar, jobs, chunksize=8)
+    return out, sorted(ids)
+
+
+def predict_test_set(model, cand, root, ranking=False):
     """Predict the competition's test frames and write submission.csv.
 
     With `infer.tta_views` set, the frames go through the multi-view path and
@@ -3439,6 +3467,23 @@ def predict_test_set(model, cand, root):
     else:
         preds, sizes = predict_test(model, cand, test_dir, test_ids)
     shutil.rmtree(SCRATCH / "test_images", ignore_errors=True)
+    if ranking:
+        # Phase 2: one CSV holds the test set (public LB) and the ranking set
+        # (private LB, the Phase-2 score); the two id ranges do not overlap.
+        rdir = find_ranking_dir()
+        if rdir is None:
+            raise FileNotFoundError("ranking set (data_ranking) not found under /kaggle/input")
+        t = time.time()
+        pdir, rids = stage_ranking(rdir)
+        clash = set(rids) & set(test_ids)
+        if clash:
+            raise RuntimeError(f"ranking ids overlap the test ids: {sorted(clash)[:5]}")
+        log(f"ranking set {rdir}: {len(rids)} mosaics -> planar in {time.time() - t:.0f}s; predicting")
+        rpreds, rsizes = predict_test(model, cand, pdir, rids)
+        shutil.rmtree(SCRATCH / "test_images", ignore_errors=True)
+        preds = list(preds) + list(rpreds)
+        sizes = {**sizes, **rsizes}
+        log(f"  ranking: {len({p[0] for p in rpreds})} images with predictions")
     n = write(WORK / "submission.csv", preds, clip_to=sizes)
     log(f"wrote submission.csv: {n} rows over {len({p[0] for p in preds})} images")
     return {"rows": n, "images": len({p[0] for p in preds})}
@@ -3472,7 +3517,7 @@ def run_from_checkpoint(round_cfg):
     if sub.get("score_val", True):
         out["val"] = score_val_split(model, cand, root)
     if sub.get("predict_test", True):
-        out.update(predict_test_set(model, cand, root))
+        out.update(predict_test_set(model, cand, root, ranking=bool(sub.get("ranking"))))
         out["predicted"] = True
     (WORK / "results.json").write_text(json.dumps(out, indent=2))
 
