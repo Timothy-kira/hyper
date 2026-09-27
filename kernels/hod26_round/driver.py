@@ -3414,10 +3414,33 @@ def sweep_inference(model, cand, root, variants):
     return out
 
 
-def find_ranking_dir():
+COMPETITION = "hyperspectral-object-detection-challenge-2026"
+
+
+def fetch_competition_data():
+    """The competition's files inside the notebook, via kagglehub and the notebook's
+    own identity (competition_sources is dropped on an API push, so the data is
+    not mounted). Returns the local path, or None."""
+    import subprocess, sys
+    try:
+        import kagglehub
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "kagglehub"], check=False)
+        import kagglehub
+    try:
+        p = Path(kagglehub.competition_download(COMPETITION))
+        log(f"  kagglehub.competition_download -> {p}")
+        return p
+    except Exception as exc:                                    # noqa: BLE001
+        log(f"  kagglehub.competition_download failed: {exc!r}")
+        return None
+
+
+def find_ranking_dir(base=None):
     """The Phase-2 ranking images (raw 4x4 mosaics) of the attached competition data."""
+    base = Path(base) if base else INPUT
     best = None
-    for d in sorted(INPUT.rglob("*")) if INPUT.exists() else []:
+    for d in sorted(base.rglob("*")) if base.exists() else []:
         if d.is_dir() and "data_ranking" in str(d) and any(d.glob("*.png")):
             n = sum(1 for _ in d.glob("*.png"))
             if best is None or n > best[1]:
@@ -3472,7 +3495,11 @@ def predict_test_set(model, cand, root, ranking=False):
         # (private LB, the Phase-2 score); the two id ranges do not overlap.
         rdir = find_ranking_dir()
         if rdir is None:
-            raise FileNotFoundError("ranking set (data_ranking) not found under /kaggle/input")
+            fetched = fetch_competition_data()
+            rdir = find_ranking_dir(fetched) if fetched else None
+        if rdir is None:
+            tree = [str(d) for d in sorted(INPUT.glob("*/*"))][:30] if INPUT.exists() else []
+            raise FileNotFoundError(f"ranking set (data_ranking) not found; /kaggle/input: {tree}")
         t = time.time()
         pdir, rids = stage_ranking(rdir)
         clash = set(rids) & set(test_ids)
